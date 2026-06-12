@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Fake psql for end-to-end tests.
+
+Knobs (env vars):
+  FAKE_PSQL_TABLES     table count reported for information_schema (default 9)
+  FAKE_PSQL_ROWS       row count reported for the sanity table (default 1000)
+  FAKE_PSQL_MAX_CONN   simulate a pooler ceiling: pg_sleep connections beyond
+                       this count are refused with PgBouncer's error.
+                       Requires FAKE_PSQL_STATE (a writable directory).
+"""
+import fcntl
+import os
+import re
+import sys
+import time
+
+args = sys.argv[1:]
+
+if "--version" in args:
+    print("psql (PostgreSQL) 16.4 (Ubuntu 16.4-1)")
+    sys.exit(0)
+
+sql = ""
+for i, a in enumerate(args):
+    if a == "-c" and i + 1 < len(args):
+        sql = args[i + 1]
+
+if not os.environ.get("PGPASSWORD"):
+    print("psql: error: connection failed: fe_sendauth: no password supplied",
+          file=sys.stderr)
+    sys.exit(2)
+
+low = sql.lower()
+
+if "pg_sleep" in low:
+    max_conn = os.environ.get("FAKE_PSQL_MAX_CONN")
+    if max_conn:
+        state = os.environ["FAKE_PSQL_STATE"]
+        counter = os.path.join(state, "conn_counter")
+        with open(counter, "a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.seek(0)
+            n = int(fh.read().strip() or "0") + 1
+            fh.seek(0)
+            fh.truncate()
+            fh.write(str(n))
+        if n > int(max_conn):
+            print("psql: error: connection to server failed: FATAL:  "
+                  "no more connections allowed (max_client_conn)", file=sys.stderr)
+            sys.exit(2)
+    m = re.search(r"pg_sleep\((\d+)", low)
+    time.sleep(min(int(m.group(1)) if m else 1, 60))
+    print("")
+    sys.exit(0)
+
+if "select version()" in low:
+    print("PostgreSQL 16.4 on x86_64-pc-linux-gnu, compiled by gcc 13.2.0, 64-bit")
+elif "show server_version" in low:
+    print("16.4")
+elif "show max_connections" in low:
+    print("500")
+elif "show pool_mode" in low:
+    print('ERROR:  unrecognized configuration parameter "pool_mode"', file=sys.stderr)
+    sys.exit(1)
+elif "pg_extension" in low:
+    print("0")
+elif "information_schema.tables" in low:
+    print(os.environ.get("FAKE_PSQL_TABLES", "9"))
+elif "pg_stat_bgwriter" in low:
+    print('{"checkpoints_timed":12,"checkpoints_req":3,"buffers_clean":4567}')
+elif "pg_stat_statements" in low:
+    print("[]")
+elif "copy (select name, setting, unit, source from pg_settings" in low:
+    print("name,setting,unit,source")
+    rows = [
+        ("checkpoint_timeout", "300", "s", "default"),
+        ("effective_cache_size", "786432", "8kB", "configuration file"),
+        ("huge_pages", "try", "", "default"),
+        ("max_connections", "500", "", "configuration file"),
+        ("max_wal_size", "4096", "MB", "configuration file"),
+        ("random_page_cost", "1.1", "", "configuration file"),
+        ("shared_buffers", os.environ.get("FAKE_PSQL_SHARED_BUFFERS", "262144"), "8kB",
+         "configuration file"),
+        ("synchronous_commit", "on", "", "default"),
+        ("wal_buffers", "2048", "8kB", "default"),
+        ("work_mem", os.environ.get("FAKE_PSQL_WORK_MEM", "4096"), "kB", "default"),
+    ]
+    for r in rows:
+        print(",".join(r))
+elif re.search(r"select count\(\*\) from (warehouse1|sbtest1)", low):
+    print(os.environ.get("FAKE_PSQL_ROWS", "1000"))
+elif low.startswith("select count(*)"):
+    print("0")
+else:
+    print(f"fake psql: unhandled SQL: {sql}", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)

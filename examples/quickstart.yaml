@@ -1,0 +1,38 @@
+# 5-minute quickstart spec: tiny oltp_read_write sweep to validate the
+# whole pipeline end to end before committing to multi-hour runs.
+run:
+  label: "quickstart-oltp"
+  edition: standard
+  tshirt_size: 4c16g
+  notes: "quickstart smoke test"
+
+target:
+  host: private-mydb.db.ondigitalocean.com
+  port: 25060
+  database: sbtest
+  user: doadmin
+  password_env: PGB_TARGET_PASSWORD
+  sslmode: require
+
+workload:
+  type: oltp_read_write
+  tables: 4
+  table_size: 10000
+
+sweep:
+  threads: [1, 4]
+  duration_s: 60
+  warmup_s: 10
+  cooldown_s: 5
+  repetitions: 1
+
+capture:
+  pg_settings: true
+  pg_stat_statements: auto
+  bgwriter_stats: true
+  histogram: true
+
+report:
+  percentiles: [50, 95, 99]
+  timeseries_levels: [4]
+  variance_warn_pct: 10

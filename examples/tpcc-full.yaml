@@ -1,0 +1,40 @@
+# Full TPC-C sweep matching the prior Percona benchmark parameters
+# (--tables=10 --scale=30 --use_fk=0 --trx_level=RC, threads 1..512, 30-min runs).
+run:
+  label: "advanced-8c32g-tpcc-small"
+  edition: advanced
+  tshirt_size: 8c32g
+  notes: "baseline, operator defaults"
+
+target:
+  host: private-xyz.db.ondigitalocean.com
+  port: 5432
+  database: sbtest
+  user: doadmin
+  password_env: PGB_TARGET_PASSWORD
+  sslmode: require
+
+workload:
+  type: tpcc
+  tpcc_path: /opt/sysbench-tpcc
+  tables: 10
+  scale: 30
+  extra_args: ["--use_fk=0", "--trx_level=RC"]
+
+sweep:
+  threads: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+  duration_s: 1800
+  warmup_s: 300
+  cooldown_s: 120
+  repetitions: 2
+
+capture:
+  pg_settings: true
+  pg_stat_statements: auto
+  bgwriter_stats: true
+  histogram: true
+
+report:
+  percentiles: [50, 95, 99]
+  timeseries_levels: [8, 64, 256]
+  variance_warn_pct: 10
