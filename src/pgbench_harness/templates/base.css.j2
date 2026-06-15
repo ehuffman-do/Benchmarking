@@ -81,4 +81,10 @@ details summary { cursor: pointer; font-weight: 600; padding: 9px 0; color: var(
 details[open] summary { border-bottom: 1px solid var(--line); margin-bottom: 8px; }
 footer { margin: 64px 56px 28px; color: #8b95a3; font-size: 13px;
   border-top: 1px solid var(--line); padding-top: 16px; }
+table.settings { table-layout: fixed; }
+table.settings th:nth-child(1), table.settings td:nth-child(1) { width: 38%; }
+table.settings th:nth-child(2), table.settings td:nth-child(2) { width: 30%; }
+table.settings th:nth-child(3), table.settings td:nth-child(3) { width: 12%; }
+table.settings th:nth-child(4), table.settings td:nth-child(4) { width: 20%; }
+table.settings td { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
 @media print { html { background: #fff; } body { box-shadow: none; margin: 0; } }

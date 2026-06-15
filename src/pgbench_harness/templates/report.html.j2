@@ -170,7 +170,7 @@
 {# ── 7. Configuration appendix ──────────────────────────────────── #}
 <h2 id="config"><span class="secno">7</span>Configuration appendix</h2>
 <h3>Key settings</h3>
-<table>
+<table class="settings">
   <tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr>
   {% for s in key_settings %}
   <tr><td>{{ s.name }}</td><td>{{ s.setting }}</td><td>{{ s.unit or "" }}</td><td>{{ s.source or "" }}</td></tr>
@@ -179,7 +179,7 @@
 {% if all_settings %}
 <details>
   <summary>Full pg_settings dump ({{ all_settings | length }} rows)</summary>
-  <table>
+  <table class="settings">
     <tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr>
     {% for s in all_settings %}
     <tr><td>{{ s.name }}</td><td>{{ s.setting }}</td><td>{{ s.unit or "" }}</td><td>{{ s.source or "" }}</td></tr>
