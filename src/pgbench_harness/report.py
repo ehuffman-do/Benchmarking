@@ -21,7 +21,7 @@ from pgbench_harness.errors import ReportError  # noqa: E402
 from pgbench_harness.manifest import STATUS_OK, Manifest  # noqa: E402
 from pgbench_harness.spec import Spec, load_spec  # noqa: E402
 from pgbench_harness.summarize import write_parsed  # noqa: E402
-from pgbench_harness.util import fmt_duration  # noqa: E402
+from pgbench_harness.util import atomic_write_text, fmt_duration  # noqa: E402
 
 REP_COLORS = ["#7fb2f0", "#f0a37f", "#8fd6a5", "#c79fe0"]
 MEAN_COLOR = "#0061eb"
@@ -100,14 +100,15 @@ def chart_metric_vs_threads(summary: dict[str, Any], metric: str, title: str, yl
     ax.plot(*zip(*mean_pts), marker="o", linewidth=2.6, color=MEAN_COLOR,
             label="mean" if len(reps) > 1 else None, zorder=5)
     peak_t, peak_v = max(mean_pts, key=lambda p: p[1])
-    ax.annotate(f"peak {peak_v:,.0f}", xy=(peak_t, peak_v), xytext=(0, 12),
-                textcoords="offset points", ha="center", fontsize=12,
-                fontweight="bold", color=MEAN_COLOR)
+    if peak_v > 0:  # a level that ran but did zero work would give peak_v == 0
+        ax.annotate(f"peak {peak_v:,.0f}", xy=(peak_t, peak_v), xytext=(0, 12),
+                    textcoords="offset points", ha="center", fontsize=12,
+                    fontweight="bold", color=MEAN_COLOR)
     _style_ax(ax, title, "client threads (log scale)", ylabel)
     _log_x(ax, sorted(by_threads))
     if len(reps) > 1:
         ax.legend(fontsize=12)
-    ax.set_ylim(bottom=0, top=peak_v * 1.18)
+    ax.set_ylim(bottom=0, top=peak_v * 1.18 if peak_v > 0 else None)
     return fig_to_base64(fig)
 
 
@@ -309,6 +310,8 @@ def generate_report(run_dir: Path) -> Path:
         headline=headline,
         kpis=build_kpis(headline, summary),
         prepare_stats=load_prepare_stats(env_dir),
+        preflight=manifest.preflight,
+        dataset=manifest.preflight.get("dataset") or {},
         warnings=manifest.preflight.get("warnings", []),
         errors=build_error_sections(summary, samples),
         charts=charts,
@@ -326,5 +329,5 @@ def generate_report(run_dir: Path) -> Path:
         steady_window=f"{spec.sweep.warmup_s}s – {spec.sweep.duration_s}s",
     )
     out = run_dir / "report.html"
-    out.write_text(html, encoding="utf-8")
+    atomic_write_text(out, html)  # redacts the registered secret as a final safety net
     return out

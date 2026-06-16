@@ -19,7 +19,7 @@ from pgbench_harness import __version__
 from pgbench_harness.errors import PreflightError
 from pgbench_harness.spec import Spec
 from pgbench_harness.sysbench import child_env, sysbench_version
-from pgbench_harness.util import get_redactor
+from pgbench_harness.util import atomic_write_text, get_redactor
 
 PSQL_TIMEOUT_S = 30
 # How long the ceiling probe waits for all holders to establish before
@@ -59,7 +59,7 @@ class ProbeResult:
 class DatasetCheck:
     """Outcome of the dataset conformance check (presence AND size vs spec)."""
 
-    status: str = "error"  # ok | missing | incomplete | mismatch | error
+    status: str = "error"  # ok | missing | wrong_schema | incomplete | mismatch | error
     detail: str = ""
     expected_tables: int = 0
     present_tables: int = 0
@@ -67,6 +67,8 @@ class DatasetCheck:
     expected_size: int = 0
     actual_size: Optional[int] = None
     size_unit: str = ""
+    found_elsewhere: list[str] = field(default_factory=list)
+    search_path: str = ""
 
     @property
     def ok(self) -> bool:
@@ -198,13 +200,15 @@ def host_info() -> str:
 def connection_ceiling_probe(
     spec: Spec, password: str, count: int, logger: logging.Logger
 ) -> ProbeResult:
-    """Open *count* simultaneous connections (cheap SELECT pg_sleep holders).
+    """Open *count* simultaneous connections (cheap ``SELECT pg_sleep`` holders).
 
-    Connections are launched in order with a tiny stagger; after a grace
-    period every process still running is counted as an established holder
-    and any early exit is a refusal. The first failed launch index
-    approximates the connection count at which the target refused, and its
-    stderr is captured verbatim.
+    Connections are launched in order with a tiny stagger. We wait the *full*
+    grace period (a single fast refusal must not short-circuit the wait, or
+    slow-to-establish holders would be miscounted), then classify each holder:
+    a process still alive at the deadline is holding an established session
+    (success); a process that already exited was refused. The lowest exited
+    launch index approximates the connection count at which the target
+    refused, and its verbatim (redacted) stderr is captured.
     """
     logger.info("preflight: connection-ceiling probe with %d simultaneous connections", count)
     env = child_env(spec, password)
@@ -217,18 +221,14 @@ def connection_ceiling_probe(
             ))
             time.sleep(0.01)
         grace = float(os.environ.get("PGB_PROBE_GRACE_S", str(PROBE_CONNECT_GRACE_S)))
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            if any(p.poll() is not None for p in procs):
-                time.sleep(0.5)  # let the remaining refusals land
-                break
-            time.sleep(0.2)
+        time.sleep(grace)  # full wait — established holders sleep for 30s, refusals exit fast
         result = ProbeResult(requested=count, succeeded=0)
         for idx, p in enumerate(procs, start=1):
-            if p.poll() is None or p.returncode == 0:
-                result.succeeded += 1
+            if p.poll() is None:
+                result.succeeded += 1  # still holding the connection open
             elif result.first_failed_index is None:
                 result.first_failed_index = idx
+                # Safe to read: an exited process won't block the pipe.
                 stderr = p.stderr.read().strip() if p.stderr else ""
                 result.first_error = get_redactor().redact(stderr)
         return result
@@ -241,6 +241,9 @@ def connection_ceiling_probe(
                 p.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 p.kill()
+            finally:
+                if p.stderr and not p.stderr.closed:
+                    p.stderr.close()  # avoid leaked-pipe ResourceWarnings
 
 
 TPCC_TABLE_BASES = (
@@ -263,6 +266,41 @@ def _count_query(spec: Spec, password: str, sql: str) -> Optional[int]:
     return int(out) if ok and out.lstrip("-").isdigit() else None
 
 
+def _list_query(spec: Spec, password: str, sql: str) -> list[str]:
+    ok, out = psql_query_soft(spec, password, sql)
+    return [line for line in out.splitlines() if line.strip()] if ok else []
+
+
+def _sql_str(value: str) -> str:
+    """Quote a Python string as a SQL string literal (single quotes doubled)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def count_resolvable_tables(spec: Spec, password: str, names: list[str]) -> Optional[int]:
+    """Count how many unqualified table names resolve via the session search_path.
+
+    Uses ``to_regclass`` so the answer matches exactly how sysbench (which
+    issues unqualified ``CREATE``/``SELECT``) resolves the same names. This is
+    schema-agnostic: the dataset is "present" iff sysbench's own run would
+    find it, regardless of which schema it actually lives in.
+    """
+    values = ", ".join(f"({_sql_str(n)})" for n in names)
+    return _count_query(
+        spec, password,
+        f"SELECT count(*) FROM (VALUES {values}) v(n) WHERE to_regclass(v.n) IS NOT NULL",
+    )
+
+
+def find_tables_any_schema(spec: Spec, password: str, names: list[str]) -> list[str]:
+    """Locate the given table names across *all* schemas, as schema.table strings."""
+    in_list = ", ".join(_sql_str(n) for n in names)
+    return _list_query(
+        spec, password,
+        f"SELECT schemaname || '.' || tablename FROM pg_catalog.pg_tables "
+        f"WHERE tablename IN ({in_list}) ORDER BY 1",
+    )
+
+
 def database_size_bytes(spec: Spec, password: str) -> Optional[int]:
     """Current size of the target database in bytes (best effort)."""
     return _count_query(
@@ -270,18 +308,22 @@ def database_size_bytes(spec: Spec, password: str) -> Optional[int]:
 
 
 def _check_canary_schema(spec: Spec, password: str) -> tuple[bool, str]:
-    """Verify the canary table has the columns the workload's schema defines."""
+    """Verify the canary table has the columns the workload's schema defines.
+
+    Resolves the canary via ``to_regclass`` (search_path-aware, so it inspects
+    the same table sysbench will use, in whichever schema it lives).
+    """
     cols: tuple[str, ...]
     if spec.workload.type == "tpcc":
         table, cols = "warehouse1", ("w_id", "w_ytd")
     else:
         table, cols = "sbtest1", ("id", "k", "c", "pad")
-    quoted = ", ".join(f"'{c}'" for c in cols)
+    quoted = ", ".join(_sql_str(c) for c in cols)
     n = _count_query(
         spec, password,
-        f"SELECT count(*) FROM information_schema.columns "
-        f"WHERE table_schema='public' AND table_name='{table}' "
-        f"AND column_name IN ({quoted})",
+        f"SELECT count(*) FROM pg_catalog.pg_attribute "
+        f"WHERE attrelid = to_regclass({_sql_str(table)}) "
+        f"AND attname IN ({quoted}) AND attnum > 0 AND NOT attisdropped",
     )
     if n != len(cols):
         return False, (
@@ -328,32 +370,44 @@ def check_dataset(spec: Spec, password: str) -> DatasetCheck:
     callers can warn about shared databases.
     """
     names = expected_table_names(spec)
-    quoted = ", ".join(f"'{n}'" for n in names)
+    quoted = ", ".join(_sql_str(n) for n in names)
     chk = DatasetCheck(expected_tables=len(names))
-    present = _count_query(
-        spec, password,
-        f"SELECT count(*) FROM information_schema.tables "
-        f"WHERE table_schema='public' AND table_name IN ({quoted})",
-    )
+    chk.search_path = (psql_query_soft(spec, password, "SHOW search_path")[1] or "").strip()
+    present = count_resolvable_tables(spec, password, names)
     if present is None:
-        chk.detail = "could not query information_schema (connectivity/permissions?)"
+        chk.detail = "could not resolve benchmark tables (connectivity/permissions?)"
         return chk
     chk.present_tables = present
     chk.foreign_tables = _count_query(
         spec, password,
-        f"SELECT count(*) FROM information_schema.tables "
-        f"WHERE table_schema='public' AND table_type='BASE TABLE' "
-        f"AND table_name NOT IN ({quoted})",
+        f"SELECT count(*) FROM pg_catalog.pg_tables "
+        f"WHERE schemaname NOT IN ('pg_catalog','information_schema') "
+        f"AND tablename NOT IN ({quoted})",
     ) or 0
     if present == 0:
-        chk.status = "missing"
-        chk.detail = f"none of the {len(names)} expected benchmark tables exist"
+        # Not on the search_path — but did sysbench create them in another
+        # schema? If so this is a routing/search_path problem, not a load failure.
+        chk.found_elsewhere = find_tables_any_schema(spec, password, names)
+        if chk.found_elsewhere:
+            chk.status = "wrong_schema"
+            chk.detail = (
+                f"sysbench created the benchmark tables, but they are not on the "
+                f"connection's search_path ({chk.search_path or 'unknown'}). Found: "
+                + ", ".join(chk.found_elsewhere[:6])
+                + (" …" if len(chk.found_elsewhere) > 6 else "")
+            )
+        else:
+            chk.status = "missing"
+            chk.detail = (
+                f"none of the {len(names)} expected benchmark tables exist in any "
+                "schema — the load did not create them"
+            )
         return chk
     if present < len(names):
         chk.status = "incomplete"
         chk.detail = (
-            f"only {present} of {len(names)} expected benchmark tables exist — "
-            "a previous load was interrupted, or the spec's `tables` changed"
+            f"only {present} of {len(names)} expected benchmark tables resolve on the "
+            "search_path — a previous load was interrupted, or the spec's `tables` changed"
         )
         return chk
     schema_ok, schema_err = _check_canary_schema(spec, password)
@@ -425,15 +479,15 @@ def capture_env(run_dir: Path, spec: Spec, password: str, pf: PreflightResult) -
     """Write the env/ capture directory (settings, versions, host info)."""
     env_dir = run_dir / "env"
     env_dir.mkdir(parents=True, exist_ok=True)
+    # All writes go through atomic_write_text, which redacts the registered
+    # secret — so even psql output that echoed connection params stays safe.
     if spec.capture.pg_settings:
-        (env_dir / "pg_settings.csv").write_text(
-            capture_pg_settings(spec, password) + "\n", encoding="utf-8")
-    (env_dir / "server_version.txt").write_text(
-        pf.server_version_full + "\n", encoding="utf-8")
-    (env_dir / "sysbench_version.txt").write_text(pf.sysbench_version + "\n", encoding="utf-8")
-    (env_dir / "tpcc_git_sha.txt").write_text(pf.tpcc_git_sha + "\n", encoding="utf-8")
-    (env_dir / "harness_git_sha.txt").write_text(harness_version() + "\n", encoding="utf-8")
-    (env_dir / "host_info.txt").write_text(host_info(), encoding="utf-8")
+        atomic_write_text(env_dir / "pg_settings.csv", capture_pg_settings(spec, password) + "\n")
+    atomic_write_text(env_dir / "server_version.txt", pf.server_version_full + "\n")
+    atomic_write_text(env_dir / "sysbench_version.txt", pf.sysbench_version + "\n")
+    atomic_write_text(env_dir / "tpcc_git_sha.txt", pf.tpcc_git_sha + "\n")
+    atomic_write_text(env_dir / "harness_git_sha.txt", harness_version() + "\n")
+    atomic_write_text(env_dir / "host_info.txt", host_info())
 
 
 def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> PreflightResult:

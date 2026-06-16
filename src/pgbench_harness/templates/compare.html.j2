@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Run comparison — {{ runs | map(attribute="label") | join(" vs ") }}</title>
+<title>Run comparison — {{ runs | map(attribute="display") | join(" vs ") }}</title>
 <style>{% include "base.css.j2" %}</style>
 </head>
 <body>
@@ -11,47 +11,93 @@
   <h1>Run comparison</h1>
   <div class="runid">{{ runs | map(attribute="run_id") | join("  ·  ") }}</div>
   <div class="crumbs">
-    {% for r in runs %}<span class="crumb">{{ r.label }} ({{ r.edition }} · {{ r.tshirt_size }})</span>{% endfor %}
+    {% for r in runs %}<span class="crumb">{{ r.display }} ({{ r.edition }} · {{ r.tshirt_size }})</span>{% endfor %}
     <span class="crumb">generated {{ generated_utc }} UTC</span>
   </div>
 </div>
 
 <main>
-<div class="card soft">
-  <table style="margin:0">
-    <tr><th>Run</th><th>Run id</th><th>Edition</th><th>Size</th><th>Status</th><th>Workload</th></tr>
-    {% for r in runs %}
-    <tr>
-      <td><b>{{ r.label }}</b></td>
-      <td style="text-align:left">{{ r.run_id }}</td>
-      <td>{{ r.edition }}</td>
-      <td>{{ r.tshirt_size }}</td>
-      <td><span class="badge {{ r.status }}">{{ r.status }}</span></td>
-      <td style="text-align:left">{{ r.workload.type }} (tables {{ r.workload.tables }}{% if r.workload.scale %}, scale {{ r.workload.scale }}{% endif %}{% if r.workload.table_size %}, table_size {{ "{:,}".format(r.workload.table_size) }}{% endif %})</td>
-    </tr>
-    {% endfor %}
-  </table>
+<div class="toc">
+  <a href="#summary">Summary</a><a href="#throughput">Throughput</a>
+  <a href="#latency">Latency</a><a href="#efficiency">Efficiency</a>
+  <a href="#table">Side-by-side</a><a href="#diff">Settings diff</a>
 </div>
 
-<h2><span class="secno">1</span>Throughput</h2>
+{% if winner %}
+<div class="note" style="font-size:15px">
+  <b>{{ winner.display }}</b> has the highest peak throughput at
+  <b>{{ "{:,.0f}".format(winner.peak_qps) }} QPS</b>{% if winner.margin_pct is not none %},
+  {{ "%.1f" | format(winner.margin_pct) }}% ahead of the next run{% endif %}.
+</div>
+{% endif %}
+
+<h2 id="summary"><span class="secno">1</span>Per-run summary</h2>
+<div class="kpis">
+  {% for k in kpis %}
+  <div class="kpi {% if winner and k.display == winner.display %}good{% endif %}">
+    <div class="v">{% if k.peak_qps is not none %}{{ "{:,.0f}".format(k.peak_qps) }}{% else %}—{% endif %}</div>
+    <div class="k">{{ k.display }} · peak QPS{% if k.peak_threads %} @ {{ k.peak_threads }}t{% endif %}</div>
+  </div>
+  {% endfor %}
+</div>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Run</th><th>Run id</th><th>Edition</th><th>Size</th><th>Status</th>
+    <th>Peak QPS</th><th>@ threads</th><th>p99 @ peak (ms)</th><th>Workload</th></tr></thead>
+  <tbody>
+  {% for r in runs %}
+  {% set k = kpis[loop.index0] %}
+  <tr>
+    <td><b>{{ r.display }}</b></td>
+    <td style="text-align:left">{{ r.run_id }}</td>
+    <td>{{ r.edition }}</td>
+    <td>{{ r.tshirt_size }}</td>
+    <td><span class="badge {{ r.status }}">{{ r.status }}</span></td>
+    <td>{% if k.peak_qps is not none %}{{ "{:,.0f}".format(k.peak_qps) }}{% else %}—{% endif %}</td>
+    <td>{{ k.peak_threads or "—" }}</td>
+    <td>{% if k.p99_at_peak is not none %}{{ "%.2f" | format(k.p99_at_peak) }}{% else %}—{% endif %}</td>
+    <td style="text-align:left">{{ r.workload.type }} (tables {{ r.workload.tables }}{% if r.workload.scale %}, scale {{ r.workload.scale }}{% endif %}{% if r.workload.table_size %}, table_size {{ "{:,}".format(r.workload.table_size) }}{% endif %})</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<h2 id="throughput"><span class="secno">2</span>Throughput</h2>
 {% if charts.qps %}<div class="chart"><img alt="QPS comparison" src="{{ charts.qps }}"></div>
 {% else %}<p class="subtle">No successful levels to chart.</p>{% endif %}
+{% if charts.tps %}<div class="chart"><img alt="TPS comparison" src="{{ charts.tps }}"></div>{% endif %}
+{% if charts.relative %}
+<div class="chart"><img alt="QPS relative to baseline" src="{{ charts.relative }}">
+  <div class="cap">Each run's throughput as a percentage of the first run (the baseline) at the same thread level.</div>
+</div>
+{% endif %}
 
-<h2><span class="secno">2</span>Latency (p99)</h2>
+<h2 id="latency"><span class="secno">3</span>Latency (p99)</h2>
 {% if charts.p99 %}<div class="chart"><img alt="p99 latency comparison" src="{{ charts.p99 }}"></div>
 {% else %}<p class="subtle">No p99 data to chart.</p>{% endif %}
 
-<h2><span class="secno">3</span>Headline side-by-side</h2>
+<h2 id="efficiency"><span class="secno">4</span>Efficiency (latency vs throughput)</h2>
+{% if charts.efficiency %}<div class="chart"><img alt="Latency vs throughput" src="{{ charts.efficiency }}">
+  <div class="cap">Tail latency at each achieved throughput. Lower and further right is better.</div>
+</div>
+{% else %}<p class="subtle">Not enough data to chart.</p>{% endif %}
+
+<h2 id="table"><span class="secno">5</span>Headline side-by-side</h2>
 <p class="subtle">Union of thread ladders; “—” marks levels a run did not execute or that failed.</p>
+<div class="table-wrap">
 <table>
+  <thead>
   <tr>
     <th rowspan="2">Threads</th>
-    {% for r in runs %}<th colspan="2">{{ r.label }}</th>{% endfor %}
+    {% for r in runs %}<th colspan="2">{{ r.display }}</th>{% endfor %}
     {% if table.with_delta %}<th rowspan="2">Δ QPS %</th>{% endif %}
   </tr>
   <tr>
     {% for r in runs %}<th>QPS</th><th>p99 (ms)</th>{% endfor %}
   </tr>
+  </thead>
+  <tbody>
   {% for row in table.rows %}
   <tr>
     <td>{{ row.threads }}</td>
@@ -60,22 +106,30 @@
     <td>{{ "%.2f" | format(c.p99) if c.p99 is not none else "—" }}</td>
     {% endfor %}
     {% if table.with_delta %}
-    <td>{{ "%+.1f" | format(row.delta_pct) if row.delta_pct is not none else "—" }}</td>
+    <td class="{% if row.delta_pct is not none and row.delta_pct > 0 %}pos{% elif row.delta_pct is not none and row.delta_pct < 0 %}neg{% endif %}">
+      {{ "%+.1f" | format(row.delta_pct) if row.delta_pct is not none else "—" }}</td>
     {% endif %}
   </tr>
   {% endfor %}
+  </tbody>
 </table>
-{% if table.with_delta %}<p class="subtle">Δ QPS % = second run vs first run at the same thread level.</p>{% endif %}
+</div>
+{% if table.with_delta %}<p class="subtle">Δ QPS % = second run vs first run at the same thread level (green = faster, red = slower).</p>{% endif %}
 
-<h2><span class="secno">4</span>Settings diff</h2>
+<h2 id="diff"><span class="secno">6</span>Settings diff</h2>
 {% if diff %}
-<p class="subtle">Only pg_settings rows that differ between runs are shown.</p>
-<table>
-  <tr><th>Setting</th>{% for r in runs %}<th>{{ r.label }}</th>{% endfor %}</tr>
+<p class="subtle">Only pg_settings rows that differ between runs are shown; key settings first (bold).</p>
+<div class="table-wrap">
+<table class="settings">
+  <thead><tr><th>Setting</th>{% for r in runs %}<th>{{ r.display }}</th>{% endfor %}</tr></thead>
+  <tbody>
   {% for d in diff %}
-  <tr><td>{{ d.name }}</td>{% for v in d.vals %}<td>{{ v }}</td>{% endfor %}</tr>
+  <tr><td>{% if d.is_key %}<b>{{ d.name }}</b>{% else %}{{ d.name }}{% endif %}</td>
+    {% for v in d.vals %}<td>{{ v }}</td>{% endfor %}</tr>
   {% endfor %}
+  </tbody>
 </table>
+</div>
 {% elif any_settings %}
 <p>No differing pg_settings between these runs.</p>
 {% else %}

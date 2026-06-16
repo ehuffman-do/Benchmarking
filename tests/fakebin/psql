@@ -2,8 +2,10 @@
 """Fake psql for end-to-end tests.
 
 Knobs (env vars):
-  FAKE_PSQL_TABLES     expected-table count reported (default: all expected;
-                       also forced to "all" once the prepared marker exists)
+  FAKE_PSQL_TABLES     count of expected tables resolving on search_path
+                       (default: all; forced to all once the prepared marker exists)
+  FAKE_PSQL_WRONG_SCHEMA  schema name: simulate tables created off the search_path
+                       (resolvable count = 0, but found in this schema)
   FAKE_PSQL_FOREIGN    count of non-benchmark tables (default 0)
   FAKE_PSQL_ROWS       warehouse1 row count for tpcc scale checks (default 30)
   FAKE_PSQL_MAX_ID     max(id) of sbtest1 for oltp size checks (default 1000)
@@ -66,8 +68,19 @@ def names_in_list(sql_text):
     return len(re.findall(r"'[^']*'", m.group(1))) if m else 0
 
 
+TABLE_RE = re.compile(
+    r"^(sbtest|warehouse|district|customer|history|orders|new_orders|"
+    r"order_line|stock|item)\d+$")
+
+
+def table_names(sql_text):
+    """All quoted table-like names referenced in the statement."""
+    return [s for s in re.findall(r"'([^']*)'", sql_text) if TABLE_RE.match(s)]
+
+
 state_dir = os.environ.get("FAKE_PSQL_STATE", "")
 prepared = state_dir and os.path.exists(os.path.join(state_dir, "prepared"))
+wrong_schema = os.environ.get("FAKE_PSQL_WRONG_SCHEMA")
 
 if "select version()" in low:
     print("PostgreSQL 16.4 on x86_64-pc-linux-gnu, compiled by gcc 13.2.0, 64-bit")
@@ -75,19 +88,30 @@ elif "show server_version" in low:
     print("16.4")
 elif "show max_connections" in low:
     print("500")
+elif "show search_path" in low:
+    print('"$user", public')
 elif "show pool_mode" in low:
     print('ERROR:  unrecognized configuration parameter "pool_mode"', file=sys.stderr)
     sys.exit(1)
 elif "pg_extension" in low:
     print("0")
-elif "information_schema.tables" in low and "not in" in low:
-    print(os.environ.get("FAKE_PSQL_FOREIGN", "0"))
-elif "information_schema.tables" in low:
-    if prepared:
-        print(names_in_list(low))
+elif "to_regclass" in low and "values" in low:
+    # count of expected tables resolving on the search_path
+    names = table_names(sql)
+    if wrong_schema:
+        print("0")
+    elif prepared:
+        print(len(names))
     else:
-        print(os.environ.get("FAKE_PSQL_TABLES", str(names_in_list(low))))
-elif "information_schema.columns" in low:
+        print(os.environ.get("FAKE_PSQL_TABLES", str(len(names))))
+elif "pg_tables" in low and "not in" in low:
+    print(os.environ.get("FAKE_PSQL_FOREIGN", "0"))
+elif "pg_tables" in low:
+    # find expected tables in ANY schema
+    if wrong_schema:
+        for n in table_names(sql):
+            print(f"{wrong_schema}.{n}")
+elif "pg_attribute" in low or "information_schema.columns" in low:
     print(os.environ.get("FAKE_PSQL_CANARY_COLS", str(names_in_list(low))))
 elif "max(id) from sbtest1" in low:
     print(os.environ.get("FAKE_PSQL_MAX_ID", "1000"))

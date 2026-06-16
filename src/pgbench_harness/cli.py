@@ -81,7 +81,7 @@ def _peak_qps(run_dir: Path) -> str:
     path = run_dir / "parsed" / "summary.json"
     try:
         levels = json.loads(path.read_text(encoding="utf-8"))["levels"]
-        vals = [l["qps_avg"] for l in levels if l.get("qps_avg")]
+        vals = [l["qps_avg"] for l in levels if l.get("qps_avg") is not None]
         return f"{max(vals):,.0f}" if vals else "—"
     except (OSError, ValueError, KeyError):
         return "—"

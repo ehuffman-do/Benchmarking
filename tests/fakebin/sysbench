@@ -35,7 +35,9 @@ if count_file and action == "run":
 if action == "prepare":
     print("Creating tables and loading data...")
     state = os.environ.get("FAKE_PSQL_STATE")
-    if state:
+    # FAKE_SYSBENCH_NO_MARKER simulates a prepare that exits 0 but creates
+    # nothing (e.g. silently wrote to the wrong place).
+    if state and not os.environ.get("FAKE_SYSBENCH_NO_MARKER"):
         with open(os.path.join(state, "prepared"), "w") as fh:
             fh.write("1\n")  # makes the fake psql report a fully loaded dataset
     sys.exit(0)

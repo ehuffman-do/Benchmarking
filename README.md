@@ -269,12 +269,23 @@ pgbench-harness compare \
   --out standard-vs-advanced-8c32g.html
 ```
 
-The comparison report contains overlaid QPS-vs-threads and p99-vs-threads
-charts (one color per run, legend = run label), a side-by-side headline
-table over the **union** of thread ladders (gaps render as "—"), and a
-settings-diff table showing only `pg_settings` rows that differ between the
-runs. `--runs` accepts run ids under `--results-dir` or direct paths to run
-directories.
+The comparison report contains:
+
+- a **per-run KPI band** and a "winner" callout (highest peak QPS and its margin
+  over the runner-up);
+- overlaid **QPS**, **TPS** and **p99-latency** vs-threads charts (one colour per
+  run, legend = run label);
+- a **latency-vs-throughput efficiency** chart (p99 against achieved QPS — lower
+  and further right is better);
+- a **QPS-relative-to-baseline** chart (every run as a % of the first run, ideal
+  for "tuned vs default");
+- a side-by-side headline table over the **union** of thread ladders (gaps render
+  as "—"; a coloured Δ column for two-run compares);
+- a **settings-diff** table showing only `pg_settings` rows that differ, with the
+  curated key settings listed first.
+
+`--runs` accepts run ids under `--results-dir` or direct paths to run
+directories, and runs with duplicate labels are disambiguated automatically.
 
 ## Development
 

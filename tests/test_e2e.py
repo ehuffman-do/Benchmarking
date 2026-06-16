@@ -100,6 +100,9 @@ def test_full_run_produces_report(fake_env, spec_file, results_dir) -> None:
     assert "http://" not in html and "https://" not in html  # no CDN/network refs
     assert "rep Δ QPS %" in html                   # variance column (2 reps)
     assert "shared_buffers" in html                # key settings table
+    assert "overflow: hidden" not in html          # scroll-bug regression guard
+    assert "table-wrap" in html                    # tables scroll horizontally
+    assert "<tbody>" in html                        # proper zebra striping structure
 
     summary = json.loads((run_dir / "parsed" / "summary.json").read_text())
     assert {(l["rep"], l["threads"]) for l in summary["levels"]} == \
@@ -187,8 +190,15 @@ def test_compare_two_runs(fake_env, spec_file, results_dir, monkeypatch, tmp_pat
     html = out.read_text()
     assert "work_mem" in html            # settings diff caught the difference
     assert "65536" in html and "4096" in html
-    assert html.count("data:image/png;base64,") >= 2  # overlaid QPS + p99 charts
+    # QPS, TPS, p99, efficiency, relative-to-baseline
+    assert html.count("data:image/png;base64,") >= 4
     assert "Settings diff" in html
+    assert "Per-run summary" in html         # new KPI band
+    assert "Efficiency (latency vs throughput)" in html
+    assert "peak QPS" in html
+    assert "highest peak throughput" in html  # winner callout
+    assert "overflow: hidden" not in html     # scroll-bug regression guard
+    assert "table-wrap" in html               # tables are horizontally scrollable
 
 
 def test_list_runs(fake_env, spec_file, results_dir, capsys) -> None:
@@ -221,6 +231,29 @@ def test_dataset_size_mismatch_aborts(fake_env, spec_file, results_dir, monkeypa
     assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 2
     assert run_cli("prepare", "--spec", str(spec_file),
                    "--results-dir", str(results_dir)) == 2
+
+
+def test_wrong_schema_detected(fake_env, spec_file, monkeypatch, capsys) -> None:
+    """Tables exist but off the search_path -> diagnosed as wrong_schema, not missing."""
+    monkeypatch.setenv("FAKE_PSQL_WRONG_SCHEMA", "benchmark")
+    assert run_cli("preflight", "--spec", str(spec_file)) == 2
+    err = capsys.readouterr().err
+    assert "wrong_schema" in err
+    assert "search_path" in err
+    assert "benchmark.sbtest1" in err  # tells the user exactly where they are
+
+
+def test_prepare_succeeds_but_creates_nothing(
+    fake_env, spec_file, results_dir, monkeypatch, capsys
+) -> None:
+    """sysbench prepare exits 0 but no tables appear -> error shows the log tail."""
+    monkeypatch.setenv("FAKE_PSQL_TABLES", "0")
+    monkeypatch.setenv("FAKE_SYSBENCH_NO_MARKER", "1")
+    rc = run_cli("prepare", "--spec", str(spec_file), "--results-dir", str(results_dir))
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "reported success but no benchmark tables exist" in err
+    assert "Creating tables and loading data" in err  # prepare-log tail included
 
 
 def test_incomplete_dataset_aborts(fake_env, spec_file, monkeypatch, capsys) -> None:
