@@ -236,6 +236,8 @@ def _execute_level(
     manifest.save(run_dir)
     if spec.capture.bgwriter_stats:
         pre = capture.snapshot_bgwriter(spec, password)
+    if spec.capture.io_stats:
+        io_pre = capture.snapshot_io_stats(spec, password)
     cmd = sysbench.build_run_command(spec, lvl.threads)
     logger.info("level %s: %s", lvl.key, cmd.display())
     rc = sysbench.run_streaming(
@@ -247,6 +249,11 @@ def _execute_level(
         atomic_write_text(
             run_dir / "raw" / f"{lvl.key}_bgwriter.json",
             f'{{"pre": {pre or "null"}, "post": {post or "null"}}}\n',
+        )
+    if spec.capture.io_stats:
+        atomic_write_json(
+            run_dir / "raw" / f"{lvl.key}_iostats.json",
+            {"pre": io_pre, "post": capture.snapshot_io_stats(spec, password)},
         )
     if rc == 0:
         lvl.status = STATUS_OK

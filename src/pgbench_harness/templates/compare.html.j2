@@ -20,7 +20,7 @@
 <div class="toc">
   <a href="#summary">Summary</a><a href="#throughput">Throughput</a>
   <a href="#latency">Latency</a><a href="#efficiency">Efficiency</a>
-  <a href="#table">Side-by-side</a><a href="#diff">Settings diff</a>
+  <a href="#io">Storage I/O</a><a href="#table">Side-by-side</a><a href="#diff">Settings diff</a>
 </div>
 
 {% if winner %}
@@ -83,7 +83,14 @@
 </div>
 {% else %}<p class="subtle">Not enough data to chart.</p>{% endif %}
 
-<h2 id="table"><span class="secno">5</span>Headline side-by-side</h2>
+<h2 id="io"><span class="secno">5</span>Storage I/O (engine-side)</h2>
+{% if charts.io_write or charts.io_read %}
+<p class="subtle">Logical I/O as PostgreSQL issued it (8&nbsp;KB blocks) — an IOPS proxy, not device IOPS.</p>
+{% if charts.io_write %}<div class="chart"><img alt="Write ops/s comparison" src="{{ charts.io_write }}"></div>{% endif %}
+{% if charts.io_read %}<div class="chart"><img alt="Read ops/s comparison" src="{{ charts.io_read }}"></div>{% endif %}
+{% else %}<p class="subtle">No engine-side I/O captured for these runs.</p>{% endif %}
+
+<h2 id="table"><span class="secno">6</span>Headline side-by-side</h2>
 <p class="subtle">Union of thread ladders; “—” marks levels a run did not execute or that failed.</p>
 <div class="table-wrap">
 <table>
@@ -116,7 +123,7 @@
 </div>
 {% if table.with_delta %}<p class="subtle">Δ QPS % = second run vs first run at the same thread level (green = faster, red = slower).</p>{% endif %}
 
-<h2 id="diff"><span class="secno">6</span>Settings diff</h2>
+<h2 id="diff"><span class="secno">7</span>Settings diff</h2>
 {% if diff %}
 <p class="subtle">Only pg_settings rows that differ between runs are shown; key settings first (bold).</p>
 <div class="table-wrap">

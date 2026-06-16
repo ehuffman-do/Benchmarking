@@ -103,12 +103,18 @@ def test_full_run_produces_report(fake_env, spec_file, results_dir) -> None:
     assert "overflow: hidden" not in html          # scroll-bug regression guard
     assert "table-wrap" in html                    # tables scroll horizontally
     assert "<tbody>" in html                        # proper zebra striping structure
+    assert "Storage I/O (engine-side)" in html     # IOPS-proxy section
+    assert "read ops/s" in html and "write ops/s" in html
+    assert (run_dir / "raw" / "rep1_t001_iostats.json").exists()  # raw snapshots
 
     summary = json.loads((run_dir / "parsed" / "summary.json").read_text())
     assert {(l["rep"], l["threads"]) for l in summary["levels"]} == \
         {(1, 1), (1, 4), (2, 1), (2, 4)}
     assert all(l["qps_avg"] > 0 for l in summary["levels"])
     assert all(l["steady_state_window"] == [1, 5] for l in summary["levels"])
+    # engine-side I/O deltas landed in the summary contract
+    for lvl in summary["levels"]:
+        assert "io" in lvl and lvl["io"]["read_ops_s"] is not None
 
 
 def test_no_password_anywhere_in_results(fake_env, spec_file, results_dir) -> None:
@@ -195,6 +201,7 @@ def test_compare_two_runs(fake_env, spec_file, results_dir, monkeypatch, tmp_pat
     assert "Settings diff" in html
     assert "Per-run summary" in html         # new KPI band
     assert "Efficiency (latency vs throughput)" in html
+    assert "Storage I/O (engine-side)" in html  # I/O overlay section
     assert "peak QPS" in html
     assert "highest peak throughput" in html  # winner callout
     assert "overflow: hidden" not in html     # scroll-bug regression guard

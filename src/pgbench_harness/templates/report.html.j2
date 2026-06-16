@@ -24,8 +24,8 @@
 <div class="toc">
   <a href="#overview">Overview</a><a href="#headline">Headline results</a>
   <a href="#throughput">Throughput</a><a href="#latency">Latency</a>
-  <a href="#stability">Stability</a><a href="#errors">Errors &amp; limits</a>
-  <a href="#config">Configuration</a>
+  <a href="#stability">Stability</a><a href="#io">Storage I/O</a>
+  <a href="#errors">Errors &amp; limits</a><a href="#config">Configuration</a>
 </div>
 
 {% if kpis %}
@@ -150,8 +150,38 @@
 <p class="subtle">No timeseries levels configured (report.timeseries_levels).</p>
 {% endif %}
 
-{# ── 6. Errors & limits ─────────────────────────────────────────── #}
-<h2 id="errors"><span class="secno">6</span>Errors &amp; limits</h2>
+{# ── 6. Storage I/O ─────────────────────────────────────────────── #}
+<h2 id="io"><span class="secno">6</span>Storage I/O (engine-side)</h2>
+{% if has_io %}
+<div class="note">
+  Logical I/O as PostgreSQL issued it (from <code>pg_stat_io</code> /
+  <code>pg_stat_database</code> / <code>pg_stat_wal</code>), in 8&nbsp;KB blocks, over the
+  full level (snapshots bracket the whole run incl. warm-up). This is an IOPS
+  <em>proxy</em>, not device IOPS — the OS page cache absorbs some reads and writes are
+  batched; cross-reference your provider's device metrics for the same UTC window.
+</div>
+{% if charts.io %}<div class="chart"><img alt="Engine-side I/O ops vs threads" src="{{ charts.io }}"></div>{% endif %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Threads</th>{% for key, label in io_columns %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for row in io_rows %}
+  <tr><td>{{ row.threads }}</td>
+    {% for key, label in io_columns %}
+    <td>{{ "{:,.1f}".format(row[key]) if row[key] is not none else "—" }}</td>
+    {% endfor %}
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="subtle">No engine-side I/O captured (capture.io_stats disabled, or the server
+predates <code>pg_stat_io</code> / the views were unavailable).</p>
+{% endif %}
+
+{# ── 7. Errors & limits ─────────────────────────────────────────── #}
+<h2 id="errors"><span class="secno">7</span>Errors &amp; limits</h2>
 {% if errors.failed_levels %}
 <h3>Failed levels</h3>
 <div class="table-wrap">
@@ -184,8 +214,8 @@
 <p>No failed levels, no nonzero err/s or reconn/s intervals.</p>
 {% endif %}
 
-{# ── 7. Configuration appendix ──────────────────────────────────── #}
-<h2 id="config"><span class="secno">7</span>Configuration appendix</h2>
+{# ── 8. Configuration appendix ──────────────────────────────────── #}
+<h2 id="config"><span class="secno">8</span>Configuration appendix</h2>
 <h3>Key settings</h3>
 <div class="table-wrap">
 <table class="settings cfg">

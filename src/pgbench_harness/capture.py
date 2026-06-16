@@ -13,7 +13,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pgbench_harness import __version__
 from pgbench_harness.errors import PreflightError
@@ -452,6 +452,49 @@ def snapshot_bgwriter(spec: Spec, password: str) -> str:
     ok, out = psql_query_soft(
         spec, password, "SELECT row_to_json(t) FROM pg_stat_bgwriter t")
     return out if ok else f'{{"error": "{out[:200]}"}}'
+
+
+def snapshot_io_stats(spec: Spec, password: str) -> dict[str, Any]:
+    """Engine-side I/O counters: pg_stat_io (PG16+), pg_stat_database, pg_stat_wal.
+
+    Each source is queried independently and degrades to ``None`` if absent, so
+    this works across server versions. These are *logical* I/O counts as
+    PostgreSQL issued them (an IOPS proxy on a managed cluster where device
+    metrics aren't reachable), in 8 KB blocks; deltas of two snapshots that
+    bracket a level give read/write operation counts for that level.
+    """
+    out: dict[str, Any] = {"io": None, "db": None, "wal": None}
+    ok, val = psql_query_soft(
+        spec, password,
+        "SELECT json_build_object("
+        "'reads', coalesce(sum(reads),0), 'writes', coalesce(sum(writes),0), "
+        "'extends', coalesce(sum(extends),0), 'fsyncs', coalesce(sum(fsyncs),0), "
+        "'hits', coalesce(sum(hits),0)) FROM pg_stat_io")
+    if ok and val:
+        out["io"] = _loads(val)
+    ok, val = psql_query_soft(
+        spec, password,
+        "SELECT json_build_object('blks_read', blks_read, 'blks_hit', blks_hit) "
+        "FROM pg_stat_database WHERE datname = current_database()")
+    if ok and val:
+        out["db"] = _loads(val)
+    ok, val = psql_query_soft(
+        spec, password,
+        "SELECT json_build_object('wal_records', wal_records, 'wal_bytes', wal_bytes, "
+        "'wal_fpi', wal_fpi) FROM pg_stat_wal")
+    if ok and val:
+        out["wal"] = _loads(val)
+    return out
+
+
+def _loads(text: str) -> Optional[dict[str, Any]]:
+    import json
+
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except ValueError:
+        return None
 
 
 def snapshot_pg_stat_statements(spec: Spec, password: str, limit: int = 50) -> str:

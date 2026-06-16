@@ -149,6 +149,40 @@ def chart_relative(runs: list[dict[str, Any]]) -> Optional[str]:
     return fig_to_base64(fig)
 
 
+def _mean_io_by_threads(summary: dict[str, Any], key: str) -> dict[int, float]:
+    by_threads: dict[int, list[float]] = {}
+    for l in summary["levels"]:
+        io = l.get("io") if l["status"] == STATUS_OK else None
+        if io and io.get(key) is not None:
+            by_threads.setdefault(l["threads"], []).append(io[key])
+    return {t: statistics.fmean(vs) for t, vs in sorted(by_threads.items())}
+
+
+def chart_io_overlay(runs: list[dict[str, Any]], key: str, title: str, ylabel: str) -> Optional[str]:
+    """Overlay one engine-side I/O metric (e.g. write_ops_s) across runs."""
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    all_threads: set[int] = set()
+    peak = 0.0
+    plotted = False
+    for i, run in enumerate(runs):
+        pts = _mean_io_by_threads(run, key)
+        if not pts:
+            continue
+        ax.plot(list(pts), list(pts.values()), marker="o", linewidth=2.2,
+                color=_color(i), label=run["display"])
+        all_threads.update(pts)
+        peak = max(peak, max(pts.values()))
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return None
+    _style_ax(ax, title, "client threads (log scale)", ylabel)
+    _log_x(ax, sorted(all_threads))
+    ax.legend(fontsize=11)
+    ax.set_ylim(bottom=0, top=peak * 1.18 if peak > 0 else None)
+    return fig_to_base64(fig)
+
+
 def build_run_kpis(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Per-run headline KPIs: peak QPS, the thread level at peak, p99 there."""
     kpis = []
@@ -234,6 +268,8 @@ def generate_compare(run_dirs: list[Path], out_path: Path) -> Path:
             "p99": chart_overlay(runs, "lat_p99", "p99 latency vs client threads", "p99 latency (ms)"),
             "efficiency": chart_efficiency(runs),
             "relative": chart_relative(runs),
+            "io_write": chart_io_overlay(runs, "write_ops_s", "Write ops/s vs client threads", "write ops / second"),
+            "io_read": chart_io_overlay(runs, "read_ops_s", "Read ops/s vs client threads", "read ops / second"),
         },
         table=build_table(runs),
         diff=settings_diff(runs),

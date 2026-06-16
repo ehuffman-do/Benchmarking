@@ -61,6 +61,7 @@ class Capture:
     pg_settings: bool = True
     pg_stat_statements: str = "auto"  # "auto" | "true" | "false"
     bgwriter_stats: bool = True
+    io_stats: bool = True
     histogram: bool = True
 
 
@@ -223,7 +224,8 @@ def _parse_sweep(sec: dict[str, Any]) -> Sweep:
 
 
 def _parse_capture(sec: dict[str, Any]) -> Capture:
-    _check_keys(sec, "capture", set(), {"pg_settings", "pg_stat_statements", "bgwriter_stats", "histogram"})
+    _check_keys(sec, "capture", set(),
+                {"pg_settings", "pg_stat_statements", "bgwriter_stats", "io_stats", "histogram"})
     pss = sec.get("pg_stat_statements", "auto")
     if isinstance(pss, bool):
         pss = "true" if pss else "false"
@@ -233,6 +235,7 @@ def _parse_capture(sec: dict[str, Any]) -> Capture:
         pg_settings=_typed(sec, "capture", "pg_settings", bool, True),
         pg_stat_statements=pss,
         bgwriter_stats=_typed(sec, "capture", "bgwriter_stats", bool, True),
+        io_stats=_typed(sec, "capture", "io_stats", bool, True),
         histogram=_typed(sec, "capture", "histogram", bool, True),
     )
 

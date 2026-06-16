@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0
+
+### Engine-side I/O capture (IOPS proxy)
+- New `capture.io_stats` (default true). Per thread level, the harness snapshots
+  `pg_stat_io` (PG16+), `pg_stat_database` and `pg_stat_wal` before and after the
+  run (alongside the existing bgwriter snapshots) and stores them in
+  `raw/<level>_iostats.json`.
+- `parsed/summary.json` gains a per-level `io` block with **read ops/s, write
+  ops/s, fsync/s, extend ops/s, MB read, MB written, WAL MB(/s), WAL records/s,
+  and buffer cache-hit %**, derived as deltas over the level (8 KB blocks).
+- The report gets a **"Storage I/O (engine-side)"** section (table + read-vs-write
+  ops chart); `compare` gets write-ops/s and read-ops/s overlays.
+- These are *logical* I/O as PostgreSQL issued it — an IOPS proxy for managed
+  clusters where device metrics aren't reachable, not device IOPS. Each source
+  degrades to "n/a" gracefully on older servers.
+
 ## 0.3.0
 
 ### Bug fixes (from a full code audit)

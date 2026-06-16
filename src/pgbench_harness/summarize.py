@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import statistics
 from pathlib import Path
 from typing import Any, Optional
@@ -69,6 +70,61 @@ def _samples_rows(run_id: str, rep: int, threads: int, parsed: ParsedLog) -> lis
     ]
 
 
+BLOCK_BYTES = 8192      # PostgreSQL default block size; pg_stat_io counts 8 KB ops
+MB = 1024 * 1024
+
+
+def io_delta(path: Path, duration_s: int) -> Optional[dict[str, Any]]:
+    """Derive engine-side I/O rates from a level's pre/post I/O snapshots.
+
+    Reads ``raw/<level>_iostats.json`` ({pre, post} of pg_stat_io /
+    pg_stat_database / pg_stat_wal), subtracts, and converts to per-second
+    rates over the **whole level** (the snapshots bracket the entire run,
+    including warm-up). 8 KB blocks are assumed for byte conversions. Returns
+    ``None`` when nothing usable was captured.
+    """
+    if duration_s <= 0 or not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    pre, post = doc.get("pre") or {}, doc.get("post") or {}
+
+    def delta(section: str, key: str) -> Optional[float]:
+        a, b = pre.get(section) or {}, post.get(section) or {}
+        if a.get(key) is not None and b.get(key) is not None:
+            return max(0.0, float(b[key]) - float(a[key]))
+        return None
+
+    out: dict[str, Any] = {}
+    reads, writes = delta("io", "reads"), delta("io", "writes")
+    if reads is not None:
+        out["read_ops_s"] = round(reads / duration_s, 1)
+        out["read_mb"] = round(reads * BLOCK_BYTES / MB, 1)
+    if writes is not None:
+        out["write_ops_s"] = round(writes / duration_s, 1)
+        out["write_mb"] = round(writes * BLOCK_BYTES / MB, 1)
+    for src, name in (("extends", "extend_ops_s"), ("fsyncs", "fsync_s")):
+        v = delta("io", src)
+        if v is not None:
+            out[name] = round(v / duration_s, 1)
+    blks_read, blks_hit = delta("db", "blks_read"), delta("db", "blks_hit")
+    if blks_read is not None and blks_hit is not None and (blks_read + blks_hit) > 0:
+        out["cache_hit_pct"] = round(blks_hit / (blks_hit + blks_read) * 100, 2)
+    elif reads is not None:
+        hits = delta("io", "hits")
+        if hits is not None and (hits + reads) > 0:
+            out["cache_hit_pct"] = round(hits / (hits + reads) * 100, 2)
+    wal_bytes, wal_records = delta("wal", "wal_bytes"), delta("wal", "wal_records")
+    if wal_bytes is not None:
+        out["wal_mb"] = round(wal_bytes / MB, 1)
+        out["wal_mb_s"] = round(wal_bytes / MB / duration_s, 2)
+    if wal_records is not None:
+        out["wal_records_s"] = round(wal_records / duration_s, 1)
+    return out or None
+
+
 def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any]:
     """(Re)build parsed/samples.csv and parsed/summary.json from raw logs.
 
@@ -91,6 +147,10 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
             rows.extend(_samples_rows(manifest.run_id, lvl.rep, lvl.threads, parsed))
             if lvl.status == STATUS_OK:
                 entry.update(summarize_level(parsed, spec, pcts))
+                iostats = io_delta(
+                    run_dir / "raw" / f"{lvl.key}_iostats.json", spec.sweep.duration_s)
+                if iostats is not None:
+                    entry["io"] = iostats
             elif parsed.error_lines and not entry["error_excerpt"]:
                 entry["error_excerpt"] = "\n".join(parsed.error_lines[:3])
         levels_out.append(entry)

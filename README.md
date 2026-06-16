@@ -131,6 +131,9 @@ capture:                                  # whole section optional
                                           # true = fail preflight if missing; false = skip
   bgwriter_stats: true                    # default true; pg_stat_bgwriter snapshot
                                           # before/after each level (raw/<level>_bgwriter.json)
+  io_stats: true                          # default true; pg_stat_io / pg_stat_database /
+                                          # pg_stat_wal snapshots -> per-level engine-side
+                                          # I/O rates (IOPS proxy) in the report & summary
   histogram: true                         # default true; pass --histogram to sysbench
 
 report:                                   # whole section optional
@@ -246,12 +249,30 @@ results/<run_id>/
     harness_git_sha.txt  host_info.txt          spec.yaml
   raw/rep<r>_t<NNN>.log              # live-streamed sysbench output
   raw/rep<r>_t<NNN>_bgwriter.json    # pre/post pg_stat_bgwriter snapshots
+  raw/rep<r>_t<NNN>_iostats.json     # pre/post pg_stat_io/database/wal snapshots
   parsed/samples.csv     # tidy per-second samples: run_id, rep, threads, t_offset,
                          # tps, qps, r, w, o, lat_p99, err_s, reconn_s
   parsed/summary.json    # per (rep, threads) steady-state aggregates — the
                          # contract `compare` consumes
   report.html            # self-contained report (charts embedded as base64 PNG)
 ```
+
+## Storage I/O metrics (IOPS proxy)
+
+With `capture.io_stats` (default on), the harness snapshots PostgreSQL's own I/O
+counters — `pg_stat_io` (PG16+), `pg_stat_database`, `pg_stat_wal` — before and
+after each thread level and reports the deltas as **read ops/s, write ops/s,
+fsync/s, MB read/written, WAL MB/s, and buffer cache-hit %** (a "Storage I/O"
+section in the report; overlays in `compare`).
+
+These are **logical** I/O as the engine issued it (8 KB blocks), over the whole
+level. On a *managed* database you have no shell on the DB host, so true
+block-device IOPS isn't reachable from the harness — it lives in your provider's
+monitoring (e.g. the DigitalOcean metrics/Insights graphs). Treat these numbers
+as an IOPS proxy and cross-reference the provider's device graphs for the
+report's UTC steady-state window. The OS page cache absorbs some reads and writes
+are batched, so logical ≥ physical. On servers without `pg_stat_io`, the section
+degrades gracefully (cache-hit % and WAL still come from the other views).
 
 ## Comparing runs
 

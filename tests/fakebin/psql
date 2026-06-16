@@ -119,6 +119,45 @@ elif "pg_database_size" in low:
     print("1073741824")
 elif "pg_stat_bgwriter" in low:
     print('{"checkpoints_timed":12,"checkpoints_req":3,"buffers_clean":4567}')
+elif "pg_stat_io" in low:
+    # monotonic-ish counters driven by a per-state call counter
+    state = os.environ.get("FAKE_PSQL_STATE", "")
+    n = 0
+    if state:
+        cf = os.path.join(state, "io_counter")
+        try:
+            n = int(open(cf).read().strip())
+        except (OSError, ValueError):
+            n = 0
+        with open(cf, "w") as fh:
+            fh.write(str(n + 1))
+    base = n * 1000
+    print('{"reads": %d, "writes": %d, "extends": %d, "fsyncs": %d, "hits": %d}'
+          % (base, base // 2, base // 10, base // 20, base * 9))
+elif "pg_stat_database" in low:
+    state = os.environ.get("FAKE_PSQL_STATE", "")
+    n = 0
+    if state:
+        cf = os.path.join(state, "db_counter")
+        try:
+            n = int(open(cf).read().strip())
+        except (OSError, ValueError):
+            n = 0
+        with open(cf, "w") as fh:
+            fh.write(str(n + 1))
+    print('{"blks_read": %d, "blks_hit": %d}' % (n * 500, n * 4500))
+elif "pg_stat_wal" in low:
+    state = os.environ.get("FAKE_PSQL_STATE", "")
+    n = 0
+    if state:
+        cf = os.path.join(state, "wal_counter")
+        try:
+            n = int(open(cf).read().strip())
+        except (OSError, ValueError):
+            n = 0
+        with open(cf, "w") as fh:
+            fh.write(str(n + 1))
+    print('{"wal_records": %d, "wal_bytes": %d, "wal_fpi": %d}' % (n * 2000, n * 8000000, n * 50))
 elif "pg_stat_statements" in low:
     print("[]")
 elif "copy (select name, setting, unit, source from pg_settings" in low:

@@ -232,6 +232,59 @@ def build_error_sections(summary: dict[str, Any], samples: list[dict[str, Any]])
     }
 
 
+IO_COLUMNS = [
+    ("read_ops_s", "read ops/s"), ("write_ops_s", "write ops/s"),
+    ("fsync_s", "fsync/s"), ("read_mb", "MB read"), ("write_mb", "MB written"),
+    ("wal_mb", "WAL MB"), ("cache_hit_pct", "cache hit %"),
+]
+
+
+def _ok_io_levels(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    return [l for l in summary["levels"] if l["status"] == STATUS_OK and l.get("io")]
+
+
+def has_io(summary: dict[str, Any]) -> bool:
+    """True when any successful level captured engine-side I/O stats."""
+    return bool(_ok_io_levels(summary))
+
+
+def build_io_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-thread-level engine-side I/O metrics, averaged across repetitions."""
+    levels = _ok_io_levels(summary)
+    rows = []
+    for t in sorted({l["threads"] for l in levels}):
+        here = [l["io"] for l in levels if l["threads"] == t]
+        row: dict[str, Any] = {"threads": t}
+        for key, _ in IO_COLUMNS:
+            vals = [io[key] for io in here if io.get(key) is not None]
+            row[key] = statistics.fmean(vals) if vals else None
+        rows.append(row)
+    return rows
+
+
+def chart_io(summary: dict[str, Any]) -> Optional[str]:
+    """Read vs write operations/second against client threads (log-x)."""
+    rows = build_io_rows(summary)
+    series = [("read_ops_s", "read ops/s", "#2eb67d"), ("write_ops_s", "write ops/s", "#d6453d")]
+    plotted = [(label, color, [(r["threads"], r[key]) for r in rows if r.get(key) is not None])
+               for key, label, color in series]
+    plotted = [(lab, col, pts) for lab, col, pts in plotted if pts]
+    if not plotted:
+        return None
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    threads_all: set[int] = set()
+    for label, color, pts in plotted:
+        ax.plot([t for t, _ in pts], [v for _, v in pts], marker="o",
+                linewidth=2.2, color=color, label=label)
+        threads_all.update(t for t, _ in pts)
+    _style_ax(ax, "Engine-side I/O operations vs client threads",
+              "client threads (log scale)", "operations / second")
+    _log_x(ax, sorted(threads_all))
+    ax.legend(fontsize=12)
+    ax.set_ylim(bottom=0)
+    return fig_to_base64(fig)
+
+
 def build_kpis(headline: list[dict[str, Any]], summary: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Headline KPI cards: peak throughput, latency at peak, error totals."""
     ok_rows = [r for r in headline if "qps" in r]
@@ -296,6 +349,7 @@ def generate_report(run_dir: Path) -> Path:
         "qps": chart_metric_vs_threads(summary, "qps_avg", "QPS vs client threads", "QPS"),
         "tps": chart_metric_vs_threads(summary, "tps_avg", "TPS vs client threads", "TPS"),
         "latency": chart_latency_vs_threads(summary),
+        "io": chart_io(summary),
         "timeseries": [
             {"threads": t, "img": chart_timeseries(samples, t, spec)}
             for t in spec.report.timeseries_levels
@@ -315,6 +369,9 @@ def generate_report(run_dir: Path) -> Path:
         warnings=manifest.preflight.get("warnings", []),
         errors=build_error_sections(summary, samples),
         charts=charts,
+        io_rows=build_io_rows(summary),
+        io_columns=IO_COLUMNS,
+        has_io=has_io(summary),
         key_settings=[settings_map.get(k, {"name": k, "setting": "n/a", "unit": "", "source": ""})
                       for k in KEY_SETTINGS],
         all_settings=settings,
