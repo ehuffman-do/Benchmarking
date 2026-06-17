@@ -33,6 +33,8 @@ class Level:
     exit_code: Optional[int] = None
     error_excerpt: str = ""
     raw_log: str = ""
+    attempts: int = 1
+    prior_attempts: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def key(self) -> str:

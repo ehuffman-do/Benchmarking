@@ -55,6 +55,7 @@
     <div><b>tpcc SHA:</b> {{ env.tpcc_git_sha }}</div>
     <div><b>Harness:</b> {{ env.harness_version }}</div>
     <div><b>Sweep:</b> threads {{ spec.sweep.threads | list }}, {{ spec.sweep.duration_s }}s per level, {{ spec.sweep.repetitions }} rep(s)</div>
+    <div><b>Retry policy:</b> {{ spec.sweep.retries }} retr{{ "y" if spec.sweep.retries == 1 else "ies" }} per level{% if spec.sweep.retries %}, waiting up to {{ spec.sweep.retry_wait_s }}s for write-availability between attempts{% endif %}</div>
     <div><b>Steady-state window:</b> {{ steady_window }} per level (first {{ spec.sweep.warmup_s }}s discarded as warm-up)</div>
     <div><b>Workload:</b> {{ spec.workload.type }}
       ({{ spec.workload.tables }} tables,
@@ -80,6 +81,18 @@
 {% if warnings %}
 <div class="warnbox"><b>Preflight warnings:</b>
   <ul style="margin:6px 0 0">{% for w in warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+{% if recoveries %}
+<div class="warnbox"><b>Auto-recovered levels (a mid-run failure such as a failover was retried):</b>
+  <ul style="margin:6px 0 0">
+  {% for r in recoveries %}
+    <li>rep {{ r.rep }}, {{ r.threads }} threads — {{ r.attempts }} attempt(s), final status
+      <span class="badge {{ r.status }}">{{ r.status }}</span>{% if r.first_error %};
+      first failure: <code>{{ r.first_error.split("\n")[0] | truncate(140) }}</code>{% endif %}</li>
+  {% endfor %}
+  </ul>
 </div>
 {% endif %}
 

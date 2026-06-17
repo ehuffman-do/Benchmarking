@@ -198,41 +198,108 @@ def _init_run(
     return run_dir, manifest
 
 
-def _execute_level(
-    spec: Spec, password: str, run_dir: Path, manifest: Manifest,
-    lvl: Level, logger: logging.Logger,
-) -> None:
-    """Run one (rep, threads) level: stats snapshots, sysbench, outcome bookkeeping."""
-    raw_rel = f"raw/{lvl.key}.log"
-    lvl.raw_log = raw_rel
-    lvl.status = STATUS_RUNNING
-    lvl.started_utc = utc_now_iso()
-    manifest.save(run_dir)
+def _level_error_excerpt(run_dir: Path, raw_rel: str, rc: int) -> str:
+    """First few verbatim error lines from a failed attempt's raw log."""
+    from pgbench_harness.parser import parse_log_file
+
+    errs = parse_log_file(run_dir / raw_rel).error_lines
+    return "\n".join(errs[:5]) or f"sysbench exited with code {rc}"
+
+
+def _run_attempt(
+    spec: Spec, password: str, run_dir: Path, lvl: Level, raw_rel: str,
+    logger: logging.Logger,
+) -> int:
+    """Execute sysbench once for this level (with bgwriter snapshots); return exit code."""
     if spec.capture.bgwriter_stats:
         pre = capture.snapshot_bgwriter(spec, password)
     cmd = sysbench.build_run_command(spec, lvl.threads)
     logger.info("level %s: %s", lvl.key, cmd.display())
     rc = sysbench.run_streaming(
         cmd, sysbench.child_env(spec, password), run_dir / raw_rel, logger)
-    lvl.exit_code = rc
-    lvl.finished_utc = utc_now_iso()
     if spec.capture.bgwriter_stats:
         post = capture.snapshot_bgwriter(spec, password)
         atomic_write_text(
             run_dir / "raw" / f"{lvl.key}_bgwriter.json",
             f'{{"pre": {pre or "null"}, "post": {post or "null"}}}\n',
         )
-    if rc == 0:
-        lvl.status = STATUS_OK
-        logger.info("level %s: OK", lvl.key)
-    else:
-        from pgbench_harness.parser import parse_log_file
-        errs = parse_log_file(run_dir / raw_rel).error_lines
-        lvl.status = STATUS_FAILED
-        lvl.error_excerpt = "\n".join(errs[:5]) or f"sysbench exited with code {rc}"
-        logger.error("level %s FAILED (exit %d): %s — continuing with remaining levels",
-                     lvl.key, rc, lvl.error_excerpt.splitlines()[0])
-    manifest.save(run_dir)
+    return rc
+
+
+def _execute_level(
+    spec: Spec, password: str, run_dir: Path, manifest: Manifest,
+    lvl: Level, logger: logging.Logger,
+) -> None:
+    """Run one (rep, threads) level, retrying transient failures (e.g. failovers).
+
+    A level is attempted up to ``1 + sweep.retries`` times. Between attempts the
+    failed attempt's raw log is preserved (``raw/<key>.attemptN.log``) and the
+    harness waits up to ``sweep.retry_wait_s`` for the target to accept writes
+    again, so a mid-run failover is ridden out instead of ending the segment.
+    """
+    raw_rel = f"raw/{lvl.key}.log"
+    lvl.raw_log = raw_rel
+    max_attempts = 1 + max(0, spec.sweep.retries)
+    for attempt in range(1, max_attempts + 1):
+        lvl.attempts = attempt
+        lvl.status = STATUS_RUNNING
+        lvl.started_utc = utc_now_iso()
+        manifest.save(run_dir)
+        rc = _run_attempt(spec, password, run_dir, lvl, raw_rel, logger)
+        lvl.exit_code = rc
+        lvl.finished_utc = utc_now_iso()
+        if rc == 0:
+            lvl.status = STATUS_OK
+            if attempt > 1:
+                logger.info("level %s: OK (recovered on attempt %d of %d)",
+                            lvl.key, attempt, max_attempts)
+            else:
+                logger.info("level %s: OK", lvl.key)
+            manifest.save(run_dir)
+            return
+        excerpt = _level_error_excerpt(run_dir, raw_rel, rc)
+        if attempt < max_attempts:
+            preserved = f"raw/{lvl.key}.attempt{attempt}.log"
+            try:
+                shutil.copy(run_dir / raw_rel, run_dir / preserved)
+            except OSError:
+                preserved = ""
+            lvl.prior_attempts.append({
+                "attempt": attempt, "exit_code": rc, "error_excerpt": excerpt,
+                "raw_log": preserved, "started_utc": lvl.started_utc,
+                "finished_utc": lvl.finished_utc,
+            })
+            logger.warning(
+                "level %s attempt %d of %d FAILED (exit %d): %s — waiting up to %ds for "
+                "the target to recover, then retrying",
+                lvl.key, attempt, max_attempts, rc, excerpt.splitlines()[0],
+                spec.sweep.retry_wait_s)
+            manifest.save(run_dir)
+            capture.wait_for_writable(spec, password, spec.sweep.retry_wait_s, logger)
+        else:
+            lvl.status = STATUS_FAILED
+            lvl.error_excerpt = excerpt
+            logger.error(
+                "level %s FAILED after %d attempt(s) (exit %d): %s — continuing with "
+                "remaining levels", lvl.key, attempt, rc, excerpt.splitlines()[0])
+            manifest.save(run_dir)
+            return
+
+
+def _apply_retry_override(spec: Spec, automatic_retries: Optional[int]) -> Spec:
+    """Override sweep.retries from the --automatic-retries flag, when given.
+
+    The override is reflected in spec.raw so the stored spec.yaml and the
+    report's retry-policy line show the value the run actually used.
+    """
+    if automatic_retries is None:
+        return spec
+    if automatic_retries < 0:
+        raise RunError("--automatic-retries must be >= 0")
+    if isinstance(spec.raw.get("sweep"), dict):
+        spec.raw["sweep"]["retries"] = automatic_retries
+    return dataclasses.replace(
+        spec, sweep=dataclasses.replace(spec.sweep, retries=automatic_retries))
 
 
 def cmd_run(
@@ -241,9 +308,10 @@ def cmd_run(
     resume: bool = False,
     run_dir_opt: Optional[Path] = None,
     dry_run: bool = False,
+    automatic_retries: Optional[int] = None,
 ) -> int:
     """`run` subcommand: preflight, sweep, parse, report."""
-    spec = load_spec(spec_path)
+    spec = _apply_retry_override(load_spec(spec_path), automatic_retries)
     if dry_run:
         print_dry_run(spec)
         return 0

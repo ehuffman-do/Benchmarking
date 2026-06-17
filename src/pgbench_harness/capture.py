@@ -371,6 +371,50 @@ def check_dataset(spec: Spec, password: str) -> DatasetCheck:
     return chk
 
 
+def is_writable(spec: Spec, password: str) -> tuple[bool, str]:
+    """Whether the target currently accepts writes.
+
+    ``transaction_read_only`` is ``on`` both on a hot standby (so right after a
+    managed-PG failover, before promotion completes) and when
+    ``default_transaction_read_only`` is set — i.e. exactly the states that make
+    every UPDATE fail with "cannot execute ... in a read-only transaction".
+    Returns ``(writable, detail)``; an unreachable target counts as not writable.
+    """
+    ok, out = psql_query_soft(spec, password, "SHOW transaction_read_only")
+    if not ok:
+        return False, "target unreachable"
+    val = out.strip().lower()
+    return val == "off", f"transaction_read_only={val or '?'}"
+
+
+def wait_for_writable(
+    spec: Spec, password: str, timeout_s: int, logger: logging.Logger, poll_s: float = 3.0
+) -> bool:
+    """Poll until the target accepts writes again, up to *timeout_s* seconds.
+
+    Used between level retries so a retry does not get spent connecting to a
+    node that is still read-only mid-failover. Returns True as soon as the
+    target is writable, False if the timeout elapses first. ``timeout_s == 0``
+    performs a single immediate check.
+    """
+    deadline = time.monotonic() + max(0, timeout_s)
+    waited = False
+    while True:
+        writable, detail = is_writable(spec, password)
+        if writable:
+            if waited:
+                logger.info("    target writable again (%s)", detail)
+            return True
+        if time.monotonic() >= deadline:
+            if timeout_s > 0:
+                logger.warning(
+                    "    target still not writable after %ds (%s)", timeout_s, detail)
+            return False
+        waited = True
+        logger.info("    waiting for target to become writable (%s) ...", detail)
+        time.sleep(min(poll_s, max(0.1, deadline - time.monotonic())))
+
+
 def detect_pooler(spec: Spec, password: str) -> str:
     """Best-effort pooler detection; records raw behavior, never fails preflight.
 

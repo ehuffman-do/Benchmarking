@@ -33,8 +33,18 @@ def test_defaults_applied() -> None:
     spec = parse_spec(doc)
     assert spec.sweep.warmup_s == 0
     assert spec.sweep.repetitions == 1
+    assert spec.sweep.retries == 0
+    assert spec.sweep.retry_wait_s == 30
     assert spec.capture.histogram is True
     assert spec.report.variance_warn_pct == 10.0
+
+
+def test_retry_fields_parse() -> None:
+    spec = parse_spec(make_spec_doc(sweep={
+        "threads": [4], "duration_s": 5, "retries": 3, "retry_wait_s": 120,
+    }))
+    assert spec.sweep.retries == 3
+    assert spec.sweep.retry_wait_s == 120
 
 
 @pytest.mark.parametrize("mutate, fragment", [
@@ -48,13 +58,15 @@ def test_defaults_applied() -> None:
     (lambda d: d["sweep"].__setitem__("threads", [1, "two"]), "threads"),
     (lambda d: d["sweep"].__setitem__("warmup_s", 5), "warmup_s"),
     (lambda d: d["sweep"].__setitem__("repetitions", 0), "repetitions"),
+    (lambda d: d["sweep"].__setitem__("retries", -1), "retries"),
+    (lambda d: d["sweep"].__setitem__("retry_wait_s", -5), "retry_wait_s"),
     (lambda d: d["workload"].__setitem__("type", "ycsb"), "workload.type"),
     (lambda d: d["report"].__setitem__("timeseries_levels", [3]), "timeseries_levels"),
     (lambda d: d["capture"].__setitem__("pg_stat_statements", "maybe"), "pg_stat_statements"),
 ], ids=["unknown-section", "unknown-key", "missing-label", "bad-edition",
         "missing-password-env", "inline-password", "empty-threads", "non-int-threads",
-        "warmup-ge-duration", "zero-reps", "bad-workload", "ts-level-not-in-ladder",
-        "bad-pss"])
+        "warmup-ge-duration", "zero-reps", "neg-retries", "neg-retry-wait",
+        "bad-workload", "ts-level-not-in-ladder", "bad-pss"])
 def test_invalid_specs_fail_with_clear_message(mutate, fragment) -> None:
     doc = make_spec_doc()
     mutate(doc)

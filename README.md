@@ -73,6 +73,14 @@ prompts during `run` and logs all progress to stdout **and**
 nohup pgbench-harness run --spec examples/tpcc-full.yaml > run.out 2>&1 &
 ```
 
+For week-long soak runs that must ride out routine managed-database
+maintenance/failovers, enable per-level auto-retry on the command line:
+
+```bash
+nohup pgbench-harness run --spec examples/soak-segmented.yaml --automatic-retries 3 \
+  > run.out 2>&1 &
+```
+
 If the process is killed mid-sweep, resume with:
 
 ```bash
@@ -124,6 +132,12 @@ sweep:
                                           # aggregate — no separate warmup process runs
   cooldown_s: 120                         # optional (default 0); sleep between levels
   repetitions: 2                          # optional (default 1); full ladder repeated N times
+  retries: 0                              # optional (default 0); extra attempts per level on
+                                          # failure — rides out transient faults like a managed
+                                          # failover (a level is run up to 1 + retries times)
+  retry_wait_s: 30                        # optional (default 30); before each retry, poll up to
+                                          # this many seconds for the target to accept writes
+                                          # again (post-failover read-only window) before re-running
 
 capture:                                  # whole section optional
   pg_settings: true                       # default true; full pg_settings CSV dump
@@ -213,6 +227,22 @@ snapshot post-level stats → sleep `cooldown_s`.
   `FATAL: Worker threads failed to initialize`) is recorded with its verbatim
   error lines in the manifest, and the sweep **continues**; the run is marked
   `partial`. One bad level never destroys hours of prior results.
+* **Automatic retry on transient failures (e.g. failover).** With
+  `sweep.retries > 0` (or the `run --automatic-retries N` flag, which overrides
+  it; bare `--automatic-retries` means 3), a level that fails (non-zero *or* a
+  crash/segfault, which
+  is what sysbench typically does when its connections are torn out during a
+  managed-database failover) is retried up to `retries` more times. Before each
+  retry the harness preserves the failed attempt's log as
+  `raw/<key>.attemptN.log` and then **waits up to `retry_wait_s` for the target
+  to accept writes again** (`SHOW transaction_read_only` → `off`), so the retry
+  is not wasted hitting a still-read-only standby mid-promotion. A level that
+  recovers ends up `ok` (the run can still be `complete`), records its
+  `attempts` count, and is highlighted as an auto-recovered level in the report.
+  This is the recommended setting for long soak runs that must survive routine
+  maintenance/failover events. Note a retry re-runs the **whole** level, so with
+  long levels prefer shorter segments (more, smaller `duration_s` × higher
+  `repetitions`) to keep a single retry cheap.
 * `manifest.json` is rewritten atomically after every level, making the run
   crash-resumable (`run --resume`).
 * `run --dry-run` prints the exact sysbench command per level and the planned
@@ -244,7 +274,8 @@ results/<run_id>/
     pg_settings.csv      # full dump: name,setting,unit,source
     server_version.txt   sysbench_version.txt   tpcc_git_sha.txt
     harness_git_sha.txt  host_info.txt          spec.yaml
-  raw/rep<r>_t<NNN>.log              # live-streamed sysbench output
+  raw/rep<r>_t<NNN>.log              # live-streamed sysbench output (final attempt)
+  raw/rep<r>_t<NNN>.attempt<n>.log   # preserved log of a failed attempt that was retried
   raw/rep<r>_t<NNN>_bgwriter.json    # pre/post pg_stat_bgwriter snapshots
   parsed/samples.csv     # tidy per-second samples: run_id, rep, threads, t_offset,
                          # tps, qps, r, w, o, lat_p99, err_s, reconn_s

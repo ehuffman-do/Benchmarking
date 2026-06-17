@@ -10,10 +10,11 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from pgbench_harness.cli import main
 
-from conftest import TEST_PASSWORD
+from conftest import TEST_PASSWORD, make_spec_doc
 
 REQUIRED_SECTIONS = [
     "Headline results",
@@ -136,6 +137,90 @@ def test_failed_level_continues_and_marks_partial(
     html = (run_dir / "report.html").read_text()
     assert "FAILED" in html
     assert "max_client_conn" in html
+
+
+def test_transient_failover_auto_recovers(
+    fake_env, results_dir, tmp_path, monkeypatch
+) -> None:
+    """A level that fails once (read-only failover) is retried and the run completes."""
+    monkeypatch.setenv("FAKE_SYSBENCH_TRANSIENT_THREADS", "4")
+    doc = make_spec_doc(sweep={"threads": [1, 4], "duration_s": 5, "warmup_s": 1,
+                               "cooldown_s": 0, "repetitions": 2,
+                               "retries": 2, "retry_wait_s": 0})
+    spec_path = tmp_path / "retry.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    rc = run_cli("run", "--spec", str(spec_path), "--results-dir", str(results_dir))
+    assert rc == 0  # recovered -> complete, not partial
+    run_dir = find_run_dir(results_dir)
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    by = {(l["rep"], l["threads"]): l for l in manifest["levels"]}
+    assert by[(1, 4)]["status"] == "ok"
+    assert by[(1, 4)]["attempts"] == 2          # failed once, succeeded on retry
+    assert by[(1, 1)]["attempts"] == 1          # untouched levels run once
+    assert "read-only transaction" in by[(1, 4)]["prior_attempts"][0]["error_excerpt"]
+    # the failed attempt's log is preserved as forensic evidence
+    assert (run_dir / "raw" / "rep1_t004.attempt1.log").exists()
+
+    summary = json.loads((run_dir / "parsed" / "summary.json").read_text())
+    rec = {(l["rep"], l["threads"]): l for l in summary["levels"]}
+    assert rec[(1, 4)]["recovered"] is True
+    html = (run_dir / "report.html").read_text()
+    assert "Auto-recovered levels" in html
+
+
+def test_automatic_retries_flag_overrides_spec(
+    fake_env, results_dir, tmp_path, monkeypatch
+) -> None:
+    """--automatic-retries enables retry even when the spec sets retries: 0."""
+    monkeypatch.setenv("FAKE_SYSBENCH_TRANSIENT_THREADS", "4")
+    doc = make_spec_doc(sweep={"threads": [1, 4], "duration_s": 5, "warmup_s": 1,
+                               "cooldown_s": 0, "repetitions": 1,
+                               "retries": 0, "retry_wait_s": 0})
+    spec_path = tmp_path / "flag.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    # Without the flag the transient failure is fatal for that level.
+    assert run_cli("run", "--spec", str(spec_path), "--results-dir", str(results_dir)) == 1
+    (fake_env / "transient_t4").unlink(missing_ok=True)  # let it fail once again
+
+    # With the flag (bare -> 3 retries) it recovers and the run completes.
+    rc = run_cli("run", "--spec", str(spec_path), "--results-dir", str(results_dir),
+                 "--automatic-retries")
+    assert rc == 0
+    run_dirs = sorted(d for d in results_dir.iterdir() if (d / "manifest.json").exists())
+    manifest = json.loads((run_dirs[-1] / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    by = {(l["rep"], l["threads"]): l for l in manifest["levels"]}
+    assert by[(1, 4)]["attempts"] == 2
+    # the effective retry count is reflected in the stored spec copy
+    stored = (run_dirs[-1] / "spec.yaml").read_text()
+    assert "retries: 3" in stored
+
+
+def test_retries_exhausted_marks_failed(
+    fake_env, results_dir, tmp_path, monkeypatch
+) -> None:
+    """When every attempt fails, the level is marked failed after all retries."""
+    monkeypatch.setenv("FAKE_SYSBENCH_FAIL_THREADS", "4")
+    doc = make_spec_doc(sweep={"threads": [1, 4], "duration_s": 5, "warmup_s": 1,
+                               "cooldown_s": 0, "repetitions": 1,
+                               "retries": 2, "retry_wait_s": 0},
+                        report={"timeseries_levels": []})
+    spec_path = tmp_path / "exhaust.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    rc = run_cli("run", "--spec", str(spec_path), "--results-dir", str(results_dir))
+    assert rc == 1  # partial: threads=1 ok, threads=4 failed
+    run_dir = find_run_dir(results_dir)
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    by = {(l["rep"], l["threads"]): l for l in manifest["levels"]}
+    assert by[(1, 4)]["status"] == "failed"
+    assert by[(1, 4)]["attempts"] == 3                       # 1 + 2 retries
+    assert len(by[(1, 4)]["prior_attempts"]) == 2            # two preserved failures
+    assert (run_dir / "raw" / "rep1_t004.attempt1.log").exists()
+    assert (run_dir / "raw" / "rep1_t004.attempt2.log").exists()
 
 
 def test_resume_completes_only_remaining_levels(

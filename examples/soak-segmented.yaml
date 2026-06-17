@@ -1,0 +1,76 @@
+# Segmented soak / endurance spec (single concurrency, repeated 1-hour segments).
+#
+# This is the "week-long" shape, but sized for a 2-HOUR PREVIEW first:
+#   - one thread level
+#   - duration_s 3600 (1 h) x repetitions 2  = 2 h total
+#   - each repetition is its own level -> own raw log, summary row, histogram,
+#     and bgwriter delta, and is crash-resumable (`run --resume`) per segment.
+#
+# To promote this to the real run, change ONLY:
+#   sweep.repetitions: 2  ->  168   (168 x 1 h = 7 days)
+run:
+  label: "soak-2h-preview"
+  edition: advanced          
+  tshirt_size: 8c32g           
+  notes: "2h segmented soak preview before the 7-day run"
+
+target:
+  host: private-mydb.db.ondigitalocean.com  
+  port: 25060                                 # DO managed PG default
+  database: sbtest
+  user: doadmin
+  password_env: PGB_TARGET_PASSWORD        
+  sslmode: require
+
+workload:
+  type: oltp_read_write
+  tables: 16
+  # ~10 GB target: 16 tables x 2,000,000 rows ~= 32M rows ~= ~10 GB
+  # (data + PK + secondary index). After `prepare`, check the report's
+  # "Data load" card / prepare_*.json db_size_pretty and nudge table_size
+  # if your build lands above/below 10 GB.
+  table_size: 2000000
+  # Start with NO --rate: closed-loop saturation (threads run as fast as the
+  # cluster allows). This is stable and reveals the ceiling (e.g. ~650 tps /
+  # ~13k qps at 16 threads on this cluster).
+  #
+  # Only add an open-loop --rate for the "realistic capped load" week, and set
+  # it BELOW the measured saturation. IMPORTANT: --rate is TRANSACTIONS/sec
+  # (compare to the `tps` column, not `qps`). Setting it above capacity makes
+  # the event queue overflow and sysbench aborts with "event queue is full".
+  # e.g. with ~650 tps saturation, a sustainable rate is ~400:
+  #   extra_args: ["--rate=400"]
+  extra_args: []
+
+sweep:
+  # Single realistic concurrency. NOTE: sysbench opens ALL `threads`
+  # connections simultaneously at startup. Against managed PG (SSL required), a
+  # large burst can blow past sysbench's hard-coded 30s thread-init timeout and
+  # fail with "Worker threads failed to initialize" and NO connection error in
+  # the raw log. Preflight's ceiling probe staggers connections, so it won't
+  # catch this. Fix: lower this, or point target at the DO connection pooler
+  # (PgBouncer) which terminates client TLS instantly and lets you go higher.
+  threads: [16]
+  duration_s: 3600     
+  warmup_s: 0          
+  cooldown_s: 0        
+  repetitions: 2       # 2 h now;  set to 168 for a 7-day run
+  # Survive routine managed-DB failovers/maintenance: if a segment fails
+  # (sysbench crash or "read-only transaction" right after a failover), retry it
+  # up to `retries` times, waiting up to `retry_wait_s` for the primary to accept
+  # writes again first. A recovered segment counts as ok and is flagged in the
+  # report. With 1-hour segments a single retry costs at most ~1 h.
+  # `retries` can also be set/overridden on the CLI: `run --automatic-retries 3`.
+  retries: 3
+  retry_wait_s: 180
+
+capture:
+  pg_settings: true
+  pg_stat_statements: auto
+  bgwriter_stats: true
+  histogram: true
+
+report:
+  percentiles: [50, 95, 99]
+  timeseries_levels: [16]   # must match a value in sweep.threads
+  variance_warn_pct: 10     

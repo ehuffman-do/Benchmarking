@@ -2,9 +2,12 @@
 """Fake sysbench for end-to-end tests: emits realistic output instantly.
 
 Knobs (env vars):
-  FAKE_SYSBENCH_FAIL_THREADS  comma-separated thread counts whose `run` fails
-                              with the worker-init FATAL and exit code 1.
-  FAKE_SYSBENCH_COUNT_FILE    file to append one line per `run` invocation.
+  FAKE_SYSBENCH_FAIL_THREADS      comma-separated thread counts whose `run` fails
+                                  with the worker-init FATAL and exit code 1.
+  FAKE_SYSBENCH_TRANSIENT_THREADS comma-separated thread counts that fail ONCE
+                                  (simulated read-only failover) then succeed on
+                                  the next attempt. Requires FAKE_PSQL_STATE.
+  FAKE_SYSBENCH_COUNT_FILE        file to append one line per `run` invocation.
 """
 import os
 import sys
@@ -56,6 +59,19 @@ if threads in fail_threads:
     print("FATAL: PQsetdbLogin() failed: ERROR:  no more connections allowed (max_client_conn)")
     print("FATAL: Worker threads failed to initialize within 30 seconds!")
     sys.exit(1)
+
+transient_threads = {
+    int(x) for x in os.environ.get("FAKE_SYSBENCH_TRANSIENT_THREADS", "").split(",") if x
+}
+if threads in transient_threads:
+    state = os.environ.get("FAKE_PSQL_STATE")
+    marker = os.path.join(state, f"transient_t{threads}") if state else None
+    if marker and not os.path.exists(marker):
+        with open(marker, "w") as fh:
+            fh.write("1")  # first attempt only; subsequent attempts succeed
+        print("FATAL: PQexecPrepared() failed: 7 cannot execute UPDATE in a "
+              "read-only transaction")
+        sys.exit(1)
 
 print("Threads started!\n")
 base_tps = 100.0 * threads

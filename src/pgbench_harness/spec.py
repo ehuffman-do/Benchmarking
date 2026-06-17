@@ -54,6 +54,8 @@ class Sweep:
     warmup_s: int = 0
     cooldown_s: int = 0
     repetitions: int = 1
+    retries: int = 0
+    retry_wait_s: int = 30
 
 
 @dataclass(frozen=True)
@@ -200,13 +202,16 @@ def _parse_workload(sec: dict[str, Any]) -> Workload:
 
 
 def _parse_sweep(sec: dict[str, Any]) -> Sweep:
-    _check_keys(sec, "sweep", {"threads", "duration_s"}, {"warmup_s", "cooldown_s", "repetitions"})
+    _check_keys(sec, "sweep", {"threads", "duration_s"},
+                {"warmup_s", "cooldown_s", "repetitions", "retries", "retry_wait_s"})
     sweep = Sweep(
         threads=_int_list(sec, "sweep", "threads", ()),
         duration_s=_typed(sec, "sweep", "duration_s", int),
         warmup_s=_typed(sec, "sweep", "warmup_s", int, 0),
         cooldown_s=_typed(sec, "sweep", "cooldown_s", int, 0),
         repetitions=_typed(sec, "sweep", "repetitions", int, 1),
+        retries=_typed(sec, "sweep", "retries", int, 0),
+        retry_wait_s=_typed(sec, "sweep", "retry_wait_s", int, 30),
     )
     if sweep.duration_s <= 0:
         raise SpecError("'sweep.duration_s' must be a positive integer")
@@ -219,6 +224,10 @@ def _parse_sweep(sec: dict[str, Any]) -> Sweep:
         )
     if sweep.repetitions < 1:
         raise SpecError("'sweep.repetitions' must be >= 1")
+    if sweep.retries < 0:
+        raise SpecError("'sweep.retries' must be >= 0")
+    if sweep.retry_wait_s < 0:
+        raise SpecError("'sweep.retry_wait_s' must be >= 0")
     return sweep
 
 

@@ -301,9 +301,19 @@ def generate_report(run_dir: Path) -> Path:
         ],
     }
     headline = build_headline_rows(summary, spec)
+    recoveries = [
+        {
+            "rep": l.rep, "threads": l.threads, "attempts": l.attempts,
+            "status": l.status,
+            "first_error": next((a.get("error_excerpt") for a in l.prior_attempts
+                                 if a.get("error_excerpt")), ""),
+        }
+        for l in manifest.levels if l.attempts > 1
+    ]
     html = _jinja_env().get_template("report.html.j2").render(
         manifest=manifest,
         spec=spec,
+        recoveries=recoveries,
         summary=summary,
         percentiles=summary.get("percentiles", [50, 95, 99]),
         headline=headline,

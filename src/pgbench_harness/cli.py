@@ -34,6 +34,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="resume the latest run for this label, skipping completed levels")
     rn.add_argument("--run-dir", type=Path, default=None,
                     help="explicit run directory to resume (with --resume)")
+    rn.add_argument("--automatic-retries", dest="automatic_retries", type=int,
+                    nargs="?", const=3, default=None, metavar="N",
+                    help="auto-retry a level that fails (e.g. a transient managed-database "
+                         "failover) up to N more times, waiting for the target to accept "
+                         "writes again between attempts (default 3 when given without a "
+                         "value). Overrides sweep.retries from the spec.")
     rn.add_argument("--dry-run", action="store_true",
                     help="print the sysbench command per level and the wall-clock budget, then exit")
 
@@ -124,7 +130,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "run":
             from pgbench_harness.runner import cmd_run
             return cmd_run(args.spec, args.results_dir, resume=args.resume,
-                           run_dir_opt=args.run_dir, dry_run=args.dry_run)
+                           run_dir_opt=args.run_dir, dry_run=args.dry_run,
+                           automatic_retries=args.automatic_retries)
         if args.command == "report":
             from pgbench_harness.runner import cmd_report
             return cmd_report(args.run_dir)

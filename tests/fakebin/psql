@@ -11,6 +11,8 @@ Knobs (env vars):
   FAKE_PSQL_MAX_CONN   simulate a pooler ceiling: pg_sleep connections beyond
                        this count are refused with PgBouncer's error.
                        Requires FAKE_PSQL_STATE (a writable directory).
+  FAKE_PSQL_READ_ONLY  value returned for `SHOW transaction_read_only`
+                       (default "off"; set "on" to simulate a standby/failover).
 
 A `prepared` marker file in FAKE_PSQL_STATE (written by the fake sysbench's
 `prepare`) makes the dataset look fully loaded regardless of FAKE_PSQL_TABLES.
@@ -75,6 +77,8 @@ elif "show server_version" in low:
     print("16.4")
 elif "show max_connections" in low:
     print("500")
+elif "show transaction_read_only" in low:
+    print(os.environ.get("FAKE_PSQL_READ_ONLY", "off"))
 elif "show pool_mode" in low:
     print('ERROR:  unrecognized configuration parameter "pool_mode"', file=sys.stderr)
     sys.exit(1)
