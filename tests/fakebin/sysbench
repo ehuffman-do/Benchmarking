@@ -65,9 +65,10 @@ for t in range(1, duration + 1):
     tps = base_tps * (0.8 if t == 1 else 1.0) + t * 0.5
     qps = tps * 20
     r, w, o = qps * 0.5, qps * 0.33, qps * 0.17
+    # Mimic real sysbench-tpcc: "err/s" has NO colon (regression guard).
     print(f"[ {t}s ] thds: {threads} tps: {tps:.2f} qps: {qps:.2f} "
           f"(r/w/o: {r:.2f}/{w:.2f}/{o:.2f}) lat (ms,99%): {45.79 + t:.2f} "
-          f"err/s: 0.00 reconn/s: 0.00")
+          f"err/s 0.00 reconn/s: 0.00")
 
 if "--histogram" in args:
     print("Latency histogram (values are in milliseconds)")

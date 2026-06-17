@@ -117,6 +117,11 @@
     <td {% if row.variance_warn %}class="warn"{% endif %}>
       {{ "%.1f" | format(row.variance_pct) if row.variance_pct is not none else "—" }}</td>
   </tr>
+  {% elif row.no_samples %}
+  <tr>
+    <td>{{ row.threads }}</td>
+    <td class="warn" colspan="{{ 6 + percentiles | length }}">ran (exit 0) but no per-second samples were parsed — see raw log</td>
+  </tr>
   {% else %}
   <tr class="fail">
     <td>{{ row.threads }}</td>

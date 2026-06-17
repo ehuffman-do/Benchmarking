@@ -215,6 +215,10 @@ def build_headline_rows(summary: dict[str, Any], spec: Spec) -> list[dict[str, A
             row["variance_warn"] = (
                 row["variance_pct"] is not None
                 and row["variance_pct"] > spec.report.variance_warn_pct)
+        elif not failed:
+            # Level(s) finished cleanly (status ok) but produced no parseable
+            # per-second samples — distinct from a real failure.
+            row["no_samples"] = True
         rows.append(row)
     return rows
 

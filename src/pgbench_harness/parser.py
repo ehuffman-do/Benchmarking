@@ -16,14 +16,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# Colons after each label are optional: some sysbench builds (notably
+# sysbench-tpcc) print "err/s 0.00" with NO colon while every other field keeps
+# one. Tolerating ":?" everywhere makes the parser robust across builds.
 INTERVAL_RE = re.compile(
-    r"\[\s*(?P<t>\d+)s\s*\]\s+thds:\s*(?P<thds>\d+)"
-    r"\s+tps:\s*(?P<tps>[\d.]+)"
-    r"\s+qps:\s*(?P<qps>[\d.]+)"
-    r"\s+\(r/w/o:\s*(?P<r>[\d.]+)/(?P<w>[\d.]+)/(?P<o>[\d.]+)\)"
-    r"\s+lat\s+\(ms,(?P<pct>\d+)%\):\s*(?P<lat>[\d.]+)"
-    r"\s+err/s:\s*(?P<err>[\d.]+)"
-    r"\s+reconn/s:\s*(?P<reconn>[\d.]+)"
+    r"\[\s*(?P<t>\d+)s\s*\]\s+thds:?\s*(?P<thds>\d+)"
+    r"\s+tps:?\s*(?P<tps>[\d.]+)"
+    r"\s+qps:?\s*(?P<qps>[\d.]+)"
+    r"\s+\(r/w/o:?\s*(?P<r>[\d.]+)/(?P<w>[\d.]+)/(?P<o>[\d.]+)\)"
+    r"\s+lat\s+\(ms,(?P<pct>\d+)%\):?\s*(?P<lat>[\d.]+)"
+    r"\s+err/s:?\s*(?P<err>[\d.]+)"
+    r"\s+reconn/s:?\s*(?P<reconn>[\d.]+)"
 )
 
 _SUMMARY_NUM = r"([\d.]+)"

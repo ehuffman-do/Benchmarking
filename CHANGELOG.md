@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.1
+
+### Critical parser fix — empty reports for sysbench-tpcc
+- The per-second interval parser required a colon after every field label, but
+  sysbench-tpcc prints `err/s 0.00` (no colon) while keeping colons elsewhere.
+  Result: **no interval lines matched**, so `samples.csv` was header-only and
+  every aggregate was null — the report showed all levels as "FAILED" despite
+  exit code 0. Colons after all labels are now optional. Re-run
+  `pgbench-harness report --run-dir <dir>` to recover affected runs from their
+  intact raw logs (no benchmark re-run needed).
+- Report: a level that finishes cleanly but yields no parseable samples now
+  renders as "ran (exit 0) but no per-second samples were parsed", not
+  "FAILED" (which contradicted the Errors section).
+
 ## 0.4.0
 
 ### Engine-side I/O capture (IOPS proxy)

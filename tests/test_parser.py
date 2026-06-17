@@ -47,6 +47,26 @@ def test_parse_interval_line_rejects_non_interval(line: str) -> None:
     assert parse_interval_line(line) is None
 
 
+# Real sysbench-tpcc (1.0.20) interval line: note "err/s 0.00" has NO colon,
+# unlike the OLTP format. Regression guard for the empty-report bug.
+REAL_TPCC_LINE = (
+    "[ 1s ] thds: 8 tps: 59.88 qps: 1710.46 (r/w/o: 781.38/785.38/143.70) "
+    "lat (ms,99%): 475.79 err/s 0.00 reconn/s: 0.00"
+)
+
+
+def test_parse_interval_line_tpcc_no_colon_after_err_s() -> None:
+    s = parse_interval_line(REAL_TPCC_LINE)
+    assert s is not None
+    assert s.threads == 8
+    assert s.tps == 59.88
+    assert s.qps == 1710.46
+    assert (s.r, s.w, s.o) == (781.38, 785.38, 143.70)
+    assert s.lat_ms == 475.79
+    assert s.err_s == 0.0
+    assert s.reconn_s == 0.0
+
+
 def test_parse_success_fixture() -> None:
     parsed = parse_log_file(FIXTURES / "success_with_histogram.log")
     assert len(parsed.samples) == 10
