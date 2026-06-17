@@ -95,11 +95,12 @@ elif low.startswith("drop table"):
             os.remove(prepared_path)
     print("DROP TABLE")
 elif "table_name ~" in low:
-    # find_benchmark_tables: list existing benchmark-namespace tables
+    # find_benchmark_tables: list existing benchmark-namespace tables as
+    # schema|table rows (psql -A field separator), across all schemas.
     if not (dropped and not prepared):
         k = int(os.environ.get("FAKE_PSQL_TABLES", "9") or "9")
         for i in range(1, k + 1):
-            print(f"sbtest{i}")
+            print(f"public|sbtest{i}")
 elif "information_schema.tables" in low and "not in" in low:
     print(os.environ.get("FAKE_PSQL_FOREIGN", "0"))
 elif "information_schema.tables" in low:

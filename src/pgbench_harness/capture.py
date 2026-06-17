@@ -258,7 +258,7 @@ def expected_table_names(spec: Spec) -> list[str]:
     return [f"sbtest{i}" for i in range(1, w.tables + 1)]
 
 
-def benchmark_table_pattern(spec: Spec, logger: logging.Logger) -> str:
+def benchmark_table_pattern(spec: Spec) -> str:
     """POSIX regex matching this workload's whole table namespace (any suffix).
 
     Broader than ``expected_table_names`` on purpose: it also catches leftovers
@@ -266,54 +266,61 @@ def benchmark_table_pattern(spec: Spec, logger: logging.Logger) -> str:
     the current spec only configures 16), so ``--clean`` fully resets the cluster.
     """
     if spec.workload.type == "tpcc":
-        logger.info("benchmark_table_pattern: %s", f"^({'|'.join(TPCC_TABLE_BASES)})[0-9]+$")
         return f"^({'|'.join(TPCC_TABLE_BASES)})[0-9]+$"
-    logger.info("benchmark_table_pattern: %s", "^sbtest[0-9]+$")
     return "^sbtest[0-9]+$"
 
 
-def find_benchmark_tables(spec: Spec, password: str, logger: logging.Logger) -> list[str]:
-    """Public base tables whose names belong to this workload's namespace."""
-    ok, out = psql_query_soft(
-        spec, password,
-        "SELECT count(*) FROM information_schema.tables "
-    )
-    if (ok):
-        logger.info("count of benchmark tables: %s", out)
-    else:
-        logger.info("count of benchmark tables: failed")
+# Non-system schemas, expressed without an ``IN (...)`` list so the predicate
+# never collides with the benchmark-name ``IN (...)`` list when present.
+_NON_SYSTEM_SCHEMAS = "table_schema !~ '^pg_' AND table_schema <> 'information_schema'"
 
 
+def find_benchmark_tables(spec: Spec, password: str) -> list[tuple[str, str]]:
+    """(schema, table) for every benchmark-namespace table in ANY user schema.
+
+    sysbench creates its tables through the connection's ``search_path``, which
+    on some managed clusters does not resolve to ``public`` — so conflicting
+    leftovers can hide in another schema. Scanning all non-system schemas finds
+    them wherever they are, which is what ``--clean`` needs to fully reset.
+    """
     ok, out = psql_query_soft(
         spec, password,
-        "SELECT table_name FROM information_schema.tables "
-        "WHERE table_schema='public' AND table_type='BASE TABLE' "
-        f"AND table_name ~ '{benchmark_table_pattern(spec, logger)}' ORDER BY table_name",
+        "SELECT table_schema, table_name FROM information_schema.tables "
+        f"WHERE table_type='BASE TABLE' AND {_NON_SYSTEM_SCHEMAS} "
+        f"AND table_name ~ '{benchmark_table_pattern(spec)}' "
+        "ORDER BY table_schema, table_name",
     )
-    if (ok):
-        logger.info("find_benchmark_tables: %s", out)
-    else:
-        logger.info("find_benchmark_tables: failed")
-    return [ln.strip() for ln in out.splitlines() if ln.strip()] if ok else []
+    if not ok:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if "|" in ln:  # psql -A separates columns with '|'
+            schema, name = ln.split("|", 1)
+            pairs.append((schema.strip(), name.strip()))
+    return pairs
 
 
 def drop_benchmark_tables(spec: Spec, password: str, logger: logging.Logger) -> list[str]:
-    """``DROP ... CASCADE`` every benchmark-namespace table for this workload.
+    """``DROP ... CASCADE`` every benchmark-namespace table, across all schemas.
 
     Only tables matching the tool's own naming pattern (``sbtest<N>`` or the nine
-    tpcc tables ``<base><N>``) are dropped, so unrelated user tables in the same
-    database are never touched. CASCADE handles the tpcc foreign keys. Returns
-    the names that were dropped.
+    tpcc tables ``<base><N>``) are dropped, so unrelated user tables are never
+    touched. CASCADE handles the tpcc foreign keys. Returns the dropped tables as
+    ``schema.table`` strings.
     """
-    names = find_benchmark_tables(spec, password, logger)
-    if not names:
+    pairs = find_benchmark_tables(spec, password)
+    if not pairs:
         logger.info("clean: no benchmark tables found for this workload; nothing to drop")
         return []
-    logger.warning("clean: dropping %d benchmark table(s): %s", len(names), ", ".join(names))
-    quoted = ", ".join(f'public."{n}"' for n in names)
-    psql_query(spec, password, f"DROP TABLE IF EXISTS {quoted} CASCADE", timeout=120)
-    logger.info("clean: dropped %d table(s)", len(names))
-    return names
+    display = [f"{s}.{n}" for s, n in pairs]
+    schemas = sorted({s for s, _ in pairs})
+    logger.warning("clean: dropping %d benchmark table(s) across %d schema(s) (%s): %s",
+                   len(pairs), len(schemas), ", ".join(schemas), ", ".join(display))
+    quoted = ", ".join(f'"{s}"."{n}"' for s, n in pairs)
+    psql_query(spec, password, f"DROP TABLE IF EXISTS {quoted} CASCADE", timeout=300)
+    logger.info("clean: dropped %d table(s)", len(pairs))
+    return display
 
 
 def _count_query(spec: Spec, password: str, sql: str) -> Optional[int]:
@@ -337,8 +344,8 @@ def _check_canary_schema(spec: Spec, password: str) -> tuple[bool, str]:
     quoted = ", ".join(f"'{c}'" for c in cols)
     n = _count_query(
         spec, password,
-        f"SELECT count(*) FROM information_schema.columns "
-        f"WHERE table_schema='public' AND table_name='{table}' "
+        f"SELECT count(DISTINCT column_name) FROM information_schema.columns "
+        f"WHERE {_NON_SYSTEM_SCHEMAS} AND table_name='{table}' "
         f"AND column_name IN ({quoted})",
     )
     if n != len(cols):
@@ -390,8 +397,8 @@ def check_dataset(spec: Spec, password: str) -> DatasetCheck:
     chk = DatasetCheck(expected_tables=len(names))
     present = _count_query(
         spec, password,
-        f"SELECT count(*) FROM information_schema.tables "
-        f"WHERE table_schema='public' AND table_name IN ({quoted})",
+        f"SELECT count(DISTINCT table_name) FROM information_schema.tables "
+        f"WHERE {_NON_SYSTEM_SCHEMAS} AND table_name IN ({quoted})",
     )
     if present is None:
         chk.detail = "could not query information_schema (connectivity/permissions?)"
