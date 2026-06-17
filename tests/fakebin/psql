@@ -16,6 +16,8 @@ Knobs (env vars):
 
 A `prepared` marker file in FAKE_PSQL_STATE (written by the fake sysbench's
 `prepare`) makes the dataset look fully loaded regardless of FAKE_PSQL_TABLES.
+A `DROP TABLE ...` statement writes a `dropped` marker and clears `prepared`,
+so after `prepare --clean` the dataset reads as missing until reloaded.
 """
 import fcntl
 import os
@@ -70,6 +72,7 @@ def names_in_list(sql_text):
 
 state_dir = os.environ.get("FAKE_PSQL_STATE", "")
 prepared = state_dir and os.path.exists(os.path.join(state_dir, "prepared"))
+dropped = state_dir and os.path.exists(os.path.join(state_dir, "dropped"))
 
 if "select version()" in low:
     print("PostgreSQL 16.4 on x86_64-pc-linux-gnu, compiled by gcc 13.2.0, 64-bit")
@@ -84,11 +87,26 @@ elif "show pool_mode" in low:
     sys.exit(1)
 elif "pg_extension" in low:
     print("0")
+elif low.startswith("drop table"):
+    if state_dir:
+        open(os.path.join(state_dir, "dropped"), "w").close()
+        prepared_path = os.path.join(state_dir, "prepared")
+        if os.path.exists(prepared_path):
+            os.remove(prepared_path)
+    print("DROP TABLE")
+elif "table_name ~" in low:
+    # find_benchmark_tables: list existing benchmark-namespace tables
+    if not (dropped and not prepared):
+        k = int(os.environ.get("FAKE_PSQL_TABLES", "9") or "9")
+        for i in range(1, k + 1):
+            print(f"sbtest{i}")
 elif "information_schema.tables" in low and "not in" in low:
     print(os.environ.get("FAKE_PSQL_FOREIGN", "0"))
 elif "information_schema.tables" in low:
     if prepared:
         print(names_in_list(low))
+    elif dropped:
+        print("0")
     else:
         print(os.environ.get("FAKE_PSQL_TABLES", str(names_in_list(low))))
 elif "information_schema.columns" in low:

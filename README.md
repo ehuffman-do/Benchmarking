@@ -10,6 +10,7 @@ per run plus cross-run comparison reports.
 ```
 pgbench-harness preflight   --spec run.yaml        # connectivity, version, limits checks
 pgbench-harness prepare     --spec run.yaml        # load the dataset (idempotent, records load metrics)
+pgbench-harness prepare     --spec run.yaml --clean # drop existing benchmark tables, then load fresh
 pgbench-harness run         --spec run.yaml        # execute the sweep(s), capture everything, report
 pgbench-harness report      --run-dir results/<run_id>/   # regenerate the HTML report
 pgbench-harness compare     --runs <run_id> <run_id> --out compare.html
@@ -207,7 +208,17 @@ contains it.
 
 `prepare` is idempotent: if the dataset already exists *and matches the spec*
 it does nothing; if it conflicts (wrong size, partial load, unrecognized
-schema) it aborts with the same messages as preflight. When it does load, it
+schema) it aborts with the same messages as preflight.
+
+To reset a cluster left in a conflicting/bad state, pass **`--clean`**:
+`prepare --clean` first **drops this workload's benchmark tables** and then
+loads a fresh dataset. It targets only the tool's own table namespace
+(`sbtest<N>` for oltp, or the nine tpcc tables `<base><N>` — matched by name with
+any numeric suffix, so leftovers from a previous run with a different `tables`
+count are removed too), using `DROP TABLE ... CASCADE`. Tables outside that
+namespace are never touched. This is the supported way past the "mismatch /
+incomplete / unrecognized schema" aborts when you intend to overwrite. When it
+does load, it
 records **data-load metrics** to `results/prepare_<host>-<db>.json`: load
 wall time, database size after load (`pg_database_size`), derived MB/s
 throughput, rows/warehouses loaded, and the thread count used. The next `run`

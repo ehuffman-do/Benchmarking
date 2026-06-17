@@ -119,12 +119,19 @@ def _write_prepare_stats(
     return stats
 
 
-def cmd_prepare(spec_path: Path, results_dir: Path) -> int:
-    """`prepare` subcommand: load the dataset idempotently, recording load metrics."""
+def cmd_prepare(spec_path: Path, results_dir: Path, clean: bool = False) -> int:
+    """`prepare` subcommand: load the dataset idempotently, recording load metrics.
+
+    With ``clean=True`` the workload's existing benchmark tables are dropped
+    first, so a cluster left in a conflicting state (wrong size, partial load,
+    leftover tables) can be reset and reloaded in one step.
+    """
     spec = load_spec(spec_path)
     password = spec.password()
     get_redactor().register(password)
     logger = setup_logging()
+    if clean:
+        capture.drop_benchmark_tables(spec, password, logger)
     check = capture.check_dataset(spec, password)
     if check.ok:
         logger.info("dataset already present and matches the spec (%s); nothing to do.",

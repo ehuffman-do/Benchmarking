@@ -66,6 +66,36 @@ def test_prepare_idempotent(fake_env, spec_file, monkeypatch, tmp_path) -> None:
     assert run_cli("prepare", "--spec", str(spec_file)) == 0  # dataset already present
 
 
+def test_prepare_clean_resets_conflicting_dataset(
+    fake_env, spec_file, results_dir, monkeypatch, tmp_path
+) -> None:
+    """--clean drops a partial/conflicting dataset, then loads fresh."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FAKE_PSQL_TABLES", "3")  # 3 of 9 tables: conflicting/incomplete
+
+    # Without --clean, prepare refuses to touch the conflicting data.
+    assert run_cli("prepare", "--spec", str(spec_file),
+                   "--results-dir", str(results_dir)) == 2
+
+    # With --clean, it drops the benchmark tables and loads successfully.
+    assert run_cli("prepare", "--spec", str(spec_file),
+                   "--results-dir", str(results_dir), "--clean") == 0
+    assert (fake_env / "dropped").exists()      # DROP TABLE ran
+    assert (fake_env / "prepared").exists()      # then it reloaded
+    # dataset now passes preflight
+    assert run_cli("preflight", "--spec", str(spec_file)) == 0
+
+
+def test_prepare_clean_on_empty_cluster_is_safe(
+    fake_env, spec_file, results_dir, monkeypatch, tmp_path
+) -> None:
+    """--clean against a cluster with no benchmark tables just loads."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FAKE_PSQL_TABLES", "0")
+    assert run_cli("prepare", "--spec", str(spec_file),
+                   "--results-dir", str(results_dir), "--clean") == 0
+
+
 def test_dry_run_prints_commands_and_budget(fake_env, spec_file, capsys) -> None:
     assert run_cli("run", "--spec", str(spec_file), "--dry-run") == 0
     out = capsys.readouterr().out

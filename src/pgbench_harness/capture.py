@@ -258,6 +258,48 @@ def expected_table_names(spec: Spec) -> list[str]:
     return [f"sbtest{i}" for i in range(1, w.tables + 1)]
 
 
+def benchmark_table_pattern(spec: Spec) -> str:
+    """POSIX regex matching this workload's whole table namespace (any suffix).
+
+    Broader than ``expected_table_names`` on purpose: it also catches leftovers
+    from a previous run with a different ``tables`` count (e.g. ``sbtest17`` when
+    the current spec only configures 16), so ``--clean`` fully resets the cluster.
+    """
+    if spec.workload.type == "tpcc":
+        return f"^({'|'.join(TPCC_TABLE_BASES)})[0-9]+$"
+    return "^sbtest[0-9]+$"
+
+
+def find_benchmark_tables(spec: Spec, password: str) -> list[str]:
+    """Public base tables whose names belong to this workload's namespace."""
+    ok, out = psql_query_soft(
+        spec, password,
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema='public' AND table_type='BASE TABLE' "
+        f"AND table_name ~ '{benchmark_table_pattern(spec)}' ORDER BY table_name",
+    )
+    return [ln.strip() for ln in out.splitlines() if ln.strip()] if ok else []
+
+
+def drop_benchmark_tables(spec: Spec, password: str, logger: logging.Logger) -> list[str]:
+    """``DROP ... CASCADE`` every benchmark-namespace table for this workload.
+
+    Only tables matching the tool's own naming pattern (``sbtest<N>`` or the nine
+    tpcc tables ``<base><N>``) are dropped, so unrelated user tables in the same
+    database are never touched. CASCADE handles the tpcc foreign keys. Returns
+    the names that were dropped.
+    """
+    names = find_benchmark_tables(spec, password)
+    if not names:
+        logger.info("clean: no benchmark tables found for this workload; nothing to drop")
+        return []
+    logger.warning("clean: dropping %d benchmark table(s): %s", len(names), ", ".join(names))
+    quoted = ", ".join(f'public."{n}"' for n in names)
+    psql_query(spec, password, f"DROP TABLE IF EXISTS {quoted} CASCADE", timeout=120)
+    logger.info("clean: dropped %d table(s)", len(names))
+    return names
+
+
 def _count_query(spec: Spec, password: str, sql: str) -> Optional[int]:
     ok, out = psql_query_soft(spec, password, sql)
     return int(out) if ok and out.lstrip("-").isdigit() else None

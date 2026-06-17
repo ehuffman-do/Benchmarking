@@ -26,6 +26,10 @@ def _build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--spec", required=True, type=Path)
     pr.add_argument("--results-dir", type=Path, default=Path("results"),
                     help="where prepare logs/load-metrics are stored (default: results/)")
+    pr.add_argument("--clean", action="store_true",
+                    help="DROP this workload's benchmark tables (sbtest<N> / the tpcc tables) "
+                         "before loading — resets a cluster left in a conflicting state. Only "
+                         "the tool's own table namespace is dropped; other tables are untouched.")
 
     rn = sub.add_parser("run", help="execute the full sweep(s) and generate the report")
     rn.add_argument("--spec", required=True, type=Path)
@@ -126,7 +130,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return cmd_preflight(args.spec)
         if args.command == "prepare":
             from pgbench_harness.runner import cmd_prepare
-            return cmd_prepare(args.spec, args.results_dir)
+            return cmd_prepare(args.spec, args.results_dir, clean=args.clean)
         if args.command == "run":
             from pgbench_harness.runner import cmd_run
             return cmd_run(args.spec, args.results_dir, resume=args.resume,
