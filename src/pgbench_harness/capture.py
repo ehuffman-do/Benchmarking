@@ -258,7 +258,7 @@ def expected_table_names(spec: Spec) -> list[str]:
     return [f"sbtest{i}" for i in range(1, w.tables + 1)]
 
 
-def benchmark_table_pattern(spec: Spec) -> str:
+def benchmark_table_pattern(spec: Spec, logger: logging.Logger) -> str:
     """POSIX regex matching this workload's whole table namespace (any suffix).
 
     Broader than ``expected_table_names`` on purpose: it also catches leftovers
@@ -266,18 +266,34 @@ def benchmark_table_pattern(spec: Spec) -> str:
     the current spec only configures 16), so ``--clean`` fully resets the cluster.
     """
     if spec.workload.type == "tpcc":
+        logger.info("benchmark_table_pattern: %s", f"^({'|'.join(TPCC_TABLE_BASES)})[0-9]+$")
         return f"^({'|'.join(TPCC_TABLE_BASES)})[0-9]+$"
+    logger.info("benchmark_table_pattern: %s", "^sbtest[0-9]+$")
     return "^sbtest[0-9]+$"
 
 
-def find_benchmark_tables(spec: Spec, password: str) -> list[str]:
+def find_benchmark_tables(spec: Spec, password: str, logger: logging.Logger) -> list[str]:
     """Public base tables whose names belong to this workload's namespace."""
+    ok, out = psql_query_soft(
+        spec, password,
+        "SELECT count(*) FROM information_schema.tables "
+    )
+    if (ok):
+        logger.info("count of benchmark tables: %s", out)
+    else:
+        logger.info("count of benchmark tables: failed")
+
+
     ok, out = psql_query_soft(
         spec, password,
         "SELECT table_name FROM information_schema.tables "
         "WHERE table_schema='public' AND table_type='BASE TABLE' "
-        f"AND table_name ~ '{benchmark_table_pattern(spec)}' ORDER BY table_name",
+        f"AND table_name ~ '{benchmark_table_pattern(spec, logger)}' ORDER BY table_name",
     )
+    if (ok):
+        logger.info("find_benchmark_tables: %s", out)
+    else:
+        logger.info("find_benchmark_tables: failed")
     return [ln.strip() for ln in out.splitlines() if ln.strip()] if ok else []
 
 
@@ -289,7 +305,7 @@ def drop_benchmark_tables(spec: Spec, password: str, logger: logging.Logger) -> 
     database are never touched. CASCADE handles the tpcc foreign keys. Returns
     the names that were dropped.
     """
-    names = find_benchmark_tables(spec, password)
+    names = find_benchmark_tables(spec, password, logger)
     if not names:
         logger.info("clean: no benchmark tables found for this workload; nothing to drop")
         return []
