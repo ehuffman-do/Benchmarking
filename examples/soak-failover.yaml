@@ -1,0 +1,51 @@
+# Resilience / soak run: hold a fixed load while you trigger a failover or
+# scale event from the provider console, then measure the client-observed
+# disruption. Run with:  pgbench-harness soak --spec examples/soak-failover.yaml
+# and at the moment you trigger each event, run (on the same machine):
+#   pgbench-harness mark --run-dir results/<run_id> --type failover --label "primary failover"
+run:
+  label: "advanced-8c32g-failover"
+  edition: advanced
+  tshirt_size: 8c32g
+  notes: "resilience: primary failover under sustained load"
+
+target:
+  host: private-xyz.db.ondigitalocean.com
+  port: 5432
+  database: sbtest
+  user: doadmin
+  password_env: PGB_TARGET_PASSWORD
+  sslmode: require
+
+workload:
+  type: tpcc
+  tpcc_path: /opt/sysbench-tpcc
+  tables: 10
+  scale: 350
+  extra_args: ["--use_fk=0", "--trx_level=RC"]
+
+soak:
+  threads: 64               # fixed concurrency (not a sweep)
+  duration_s: 3600          # 1 hour; supervisor relaunches the load gen on early exit
+  tolerate_errors: true     # keep hammering through the outage
+
+# Planned markers (optional). For exact timing, prefer `pgbench-harness mark`
+# at the real moment you trigger the event from the console.
+events:
+  - at_s: 600
+    type: failover
+    trigger: manual
+    label: "primary failover"
+    note: "trigger primary failover from the DO/Aiven console now"
+
+capture:
+  pg_settings: true
+  io_stats: true
+  histogram: true
+
+report:
+  baseline_window_s: [120, 540]   # clean pre-event span for the baseline median
+  recovery_threshold_pct: 95      # TTR target
+  full_recovery_pct: 100          # cache-rewarm tail target
+  recovery_hold_s: 10             # sustained-for to count as recovered
+  latency_spike_mult: 2           # "seconds above N x baseline p99"

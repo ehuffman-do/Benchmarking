@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0
+
+### Resilience / soak mode (Phase 1) — failover & scaling measurement
+- New `soak` run mode: fixed concurrency for a long window, retaining the full
+  per-second timeline keyed on **absolute read-time UTC**. New `soak` subcommand
+  and a `mark` subcommand to stamp timeline events on the same clock.
+- **Load generator survives the outage:** a supervisor relaunches sysbench if it
+  exits early, so a failover/scale event can never truncate the test; gaps are
+  measured as downtime. (sysbench has no pgsql `--ignore-errors`, so this is the
+  guarantee, not a flag.)
+- Per-event disruption metrics vs a pre-event baseline (median): **hard
+  downtime, time-to-first-success, error window, reconnects, TTR (95% sustained),
+  full re-warm/cache-cold tail (100% sustained), peak p99 & seconds above
+  N×baseline, sysbench failures, and transactions-missed-vs-baseline.** Every
+  definition is documented in the report's methodology section.
+- New **Resilience report** (`soak_report.html`): whole-run overview decimated to
+  stay legible for multi-hour (e.g. 8h) runs — per-bucket minimum shaded so brief
+  outages aren't averaged away — plus a full-resolution zoom and a plain-language
+  verdict per event; tables are per-event. `report --run-dir` is mode-aware.
+- Artifacts: `parsed/soak_timeseries.csv`, `parsed/soak_summary.json`
+  (overlay-ready), `events.jsonl`, `raw/soak_seg*.log`. Spec gains `soak:` /
+  `events:` sections and `report` resilience knobs; `soak` and `sweep` are
+  mutually exclusive. Phase-2 (provider-API event automation, multi-run overlay)
+  left as clean seams.
+
 ## 0.4.1
 
 ### Critical parser fix — empty reports for sysbench-tpcc

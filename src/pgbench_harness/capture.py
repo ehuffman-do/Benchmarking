@@ -561,13 +561,21 @@ def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> Prefligh
     return pf
 
 
+def peak_threads(spec: Spec) -> int:
+    """Highest concurrency a run will reach (sweep or soak), for preflight sizing."""
+    if spec.soak is not None:
+        return spec.soak.threads
+    assert spec.sweep is not None
+    return max(spec.sweep.threads)
+
+
 def _collect_warnings(spec: Spec, pf: PreflightResult) -> None:
     """Non-fatal conditions worth surfacing in logs, manifest and report."""
     cpus = os.cpu_count() or 1
-    max_threads = max(spec.sweep.threads)
+    max_threads = peak_threads(spec)
     if max_threads > cpus * 8:
         pf.warnings.append(
-            f"sweep peaks at {max_threads} client threads but this load generator "
+            f"the run peaks at {max_threads} client threads but this load generator "
             f"has only {cpus} CPUs — the loadgen itself may become the bottleneck "
             "at high thread counts (check host_info.txt when interpreting results)"
         )
@@ -594,7 +602,7 @@ def _check_pg_stat_statements(spec: Spec, password: str, pf: PreflightResult) ->
 def _check_ceiling(
     spec: Spec, password: str, pf: PreflightResult, logger: logging.Logger
 ) -> None:
-    count = max(spec.sweep.threads)
+    count = peak_threads(spec)
     pf.probe = connection_ceiling_probe(spec, password, count, logger)
     if not pf.probe.ok:
         raise PreflightError(

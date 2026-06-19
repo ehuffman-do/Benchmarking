@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Resilience — {{ summary.label }} ({{ summary.run_id }})</title>
+<style>{% include "base.css.j2" %}</style>
+</head>
+<body>
+
+<div class="banner">
+  <h1>Resilience &amp; scaling — {{ summary.label }}</h1>
+  <div class="runid">{{ summary.run_id }}</div>
+  <div class="crumbs">
+    <span class="crumb">{{ summary.edition | title }} Edition</span>
+    <span class="crumb">{{ summary.tshirt_size }}</span>
+    <span class="crumb">soak · {{ summary.soak.threads }} threads · {{ fmt_duration(summary.target_duration_s) }}</span>
+    <span class="crumb">{{ summary.events | length }} event(s)</span>
+    <span class="crumb">coverage {{ summary.coverage_pct }}%</span>
+  </div>
+</div>
+
+<main>
+<div class="toc">
+  <a href="#overview">Overview</a><a href="#events">Per-event detail</a>
+  <a href="#timeline">Timeline</a><a href="#method">Methodology</a>
+</div>
+
+{# ── Per-event KPI band + verdicts ──────────────────────────────── #}
+{% if summary.events %}
+<div class="kpis">
+  {% for ev in summary.events %}
+  {% set m = ev.metrics %}
+  <div class="kpi {% if m.hard_downtime_s > 0 %}bad{% elif m.ttr_s is not none %}good{% endif %}">
+    <div class="v">{{ m.hard_downtime_s }}<small> s</small></div>
+    <div class="k">{{ ev.label or ev.type }} · hard downtime</div>
+  </div>
+  {% endfor %}
+</div>
+{% for ev in summary.events %}
+<div class="note" style="font-size:15px"><b>{{ ev.label or ev.type }}</b> — {{ ev.verdict }}</div>
+{% endfor %}
+{% else %}
+<div class="warnbox">No events were marked on this run. Use
+<code>pgbench-harness mark --run-dir &lt;dir&gt; --type failover --label "..."</code>
+during the soak, or declare <code>events:</code> in the spec.</div>
+{% endif %}
+
+<h2 id="overview"><span class="secno">1</span>Run overview</h2>
+<div class="card soft">
+  <div class="meta-grid">
+    <div><b>Status:</b> <span class="badge {{ summary.status }}">{{ summary.status }}</span></div>
+    <div><b>Soak start (UTC):</b> {{ summary.soak_start_utc }}</div>
+    <div><b>Duration (target):</b> {{ fmt_duration(summary.target_duration_s) }}</div>
+    <div><b>Observed seconds:</b> {{ summary.observed_seconds }} ({{ summary.coverage_pct }}% coverage)</div>
+    <div><b>Concurrency:</b> {{ summary.soak.threads }} threads (fixed)</div>
+    <div><b>Load-gen relaunches:</b> {{ summary.relaunches }}{% if summary.relaunches %} (supervisor kept the test alive through early exits){% endif %}</div>
+    <div><b>Baseline:</b> {{ summary.baseline.tps }} TPS / {{ summary.baseline.lat_p99_ms }} ms p99
+      (median over {{ summary.baseline.window_s[0] }}–{{ summary.baseline.window_s[1] }}s, {{ summary.baseline.samples }} samples)</div>
+    <div><b>PostgreSQL:</b> {{ env.server_version | truncate(60) }}</div>
+    <div><b>sysbench:</b> {{ env.sysbench_version }}</div>
+    <div><b>Harness:</b> {{ env.harness_version }}</div>
+  </div>
+  {% if summary.notes %}<p style="margin-bottom:0"><b>Notes:</b> {{ summary.notes }}</p>{% endif %}
+</div>
+{% if charts.overview %}<div class="chart"><img alt="Throughput over the full run" src="{{ charts.overview }}">
+  <div class="cap">Whole run, decimated for legibility; per-bucket minimum is shaded so brief dips/outages are visible. Red lines = events; red shading = disruption window.</div>
+</div>{% endif %}
+
+{# ── Per-event detail ───────────────────────────────────────────── #}
+<h2 id="events"><span class="secno">2</span>Per-event disruption</h2>
+{% if summary.events %}
+<div class="table-wrap">
+<table>
+  <thead><tr>
+    <th>Event</th><th>At</th><th>Hard downtime (s)</th><th>First success (s)</th>
+    <th>Error window (s)</th><th>Reconnects</th>
+    <th>TTR to {{ summary.thresholds.recovery_threshold_pct | int }}% (s)</th>
+    <th>Full re-warm (s)</th><th>Peak p99 (ms)</th>
+    <th>Failed txns</th><th>Missed vs baseline</th>
+  </tr></thead>
+  <tbody>
+  {% for ev in summary.events %}{% set m = ev.metrics %}
+  <tr>
+    <td>{{ ev.label or ev.type }}{% if ev.type != (ev.label or ev.type) %} <span class="subtle">({{ ev.type }})</span>{% endif %}</td>
+    <td>{{ fmt_duration(ev.at_s) }}</td>
+    <td {% if m.hard_downtime_s > 0 %}class="fail"{% endif %}>{{ m.hard_downtime_s }}</td>
+    <td>{{ m.time_to_first_success_s if m.time_to_first_success_s is not none else "—" }}</td>
+    <td>{{ m.error_window_s }}</td>
+    <td>{{ m.reconnect_count }}</td>
+    <td {% if m.ttr_s is none %}class="warn"{% endif %}>{{ m.ttr_s if m.ttr_s is not none else "not reached" }}</td>
+    <td {% if m.full_recovery_s is none %}class="warn"{% endif %}>{{ m.full_recovery_s if m.full_recovery_s is not none else "not reached" }}</td>
+    <td>{{ m.peak_p99_ms if m.peak_p99_ms is not none else "—" }}</td>
+    <td>{{ "{:,.0f}".format(m.txns_failed) }}</td>
+    <td>{{ "{:,.0f}".format(m.missed_vs_baseline) }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% for item in charts.events %}
+  {% if item.img %}<div class="chart"><img alt="Event detail {{ item.ev.label or item.ev.type }}" src="{{ item.img }}">
+    <div class="cap">{{ item.ev.label or item.ev.type }} — full-resolution window. Red = event &amp; downtime; green dotted = {{ summary.thresholds.recovery_threshold_pct | int }}% recovery; blue dotted = full re-warm to baseline; orange = p99 latency (right axis).</div>
+  </div>{% endif %}
+{% endfor %}
+{% else %}
+<p class="subtle">No events to analyze.</p>
+{% endif %}
+
+{# ── Timeline / artifacts ───────────────────────────────────────── #}
+<h2 id="timeline"><span class="secno">3</span>Timeline &amp; artifacts</h2>
+<p class="subtle">Full 1 Hz series: <code>parsed/soak_timeseries.csv</code> ·
+machine-readable summary: <code>parsed/soak_summary.json</code> ·
+events: <code>events.jsonl</code> · raw logs: <code>raw/soak_seg*.log</code>
+(each line prefixed with read-time UTC).</p>
+{% if summary.segments | length > 1 %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Segment</th><th>Started (UTC)</th><th>Finished (UTC)</th><th>Exit</th><th>Samples</th></tr></thead>
+  <tbody>
+  {% for s in summary.segments %}
+  <tr><td>{{ s.seg }}</td><td>{{ s.started_utc }}</td><td>{{ s.finished_utc }}</td>
+      <td>{{ s.exit_code }}</td><td>{{ s.intervals }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+
+{# ── Methodology ────────────────────────────────────────────────── #}
+<h2 id="method"><span class="secno">4</span>Methodology &amp; definitions</h2>
+<div class="card soft" style="font-size:14px">
+  <p>Continuous load at fixed concurrency ({{ summary.soak.threads }} threads); the load
+  generator is kept alive across the event by a supervisor that relaunches sysbench if it
+  exits early, so an outage cannot truncate the test. Every per-second sample carries the
+  load generator's read-time UTC, and event markers use the same clock.</p>
+  <ul style="margin:0">
+    <li><b>Baseline</b> — median TPS &amp; p99 over a clean pre-event window
+      ({{ summary.baseline.window_s[0] }}–{{ summary.baseline.window_s[1] }}s).</li>
+    <li><b>Hard downtime</b> — consecutive seconds with no successful transactions (a sample
+      reporting 0 TPS, or a second with no sample at all) from the event onward.</li>
+    <li><b>Time-to-first-success</b> — event → first second with TPS &gt; 0 after downtime.</li>
+    <li><b>Error window</b> — span of seconds reporting errors or reconnects; <b>reconnects</b>
+      is their sum.</li>
+    <li><b>TTR</b> — event → first second TPS ≥ {{ summary.thresholds.recovery_threshold_pct | int }}%
+      of baseline, sustained {{ summary.thresholds.recovery_hold_s }}s.</li>
+    <li><b>Full re-warm</b> — same at {{ summary.thresholds.full_recovery_pct | int }}% of baseline
+      (the buffer/page-cache cold-start tail after storage reattaches); always ≥ TTR.</li>
+    <li><b>Peak p99</b> / seconds above {{ summary.thresholds.latency_spike_mult }}× baseline p99.</li>
+    <li><b>Failed txns</b> — sysbench-reported errors in the window. <b>Missed vs baseline</b> —
+      Σ max(0, baseline TPS − observed TPS): estimated transactions not served vs baseline.</li>
+  </ul>
+</div>
+</main>
+
+<footer>Generated by {{ env.harness_version }} — soak run {{ summary.run_id }}.</footer>
+</body>
+</html>

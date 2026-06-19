@@ -147,6 +147,7 @@ def chart_timeseries(
     samples: list[dict[str, Any]], threads: int, spec: Spec
 ) -> Optional[str]:
     """QPS over time for one thread level: warm-up greyed, steady window shaded."""
+    assert spec.sweep is not None
     rows = [s for s in samples if s["threads"] == threads]
     if not rows:
         return None
@@ -343,6 +344,7 @@ def generate_report(run_dir: Path) -> Path:
         raise ReportError(f"no spec.yaml in {run_dir}",
                           hint="is this a pgbench-harness run directory?")
     spec = load_spec(spec_path)
+    assert spec.sweep is not None, "generate_report is for sweep runs; use report_soak for soak"
     manifest = Manifest.load(run_dir)
     summary = write_parsed(run_dir, spec, manifest)  # raw logs are the source of truth
     samples = load_samples_csv(run_dir / "parsed" / "samples.csv")

@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
@@ -70,6 +70,38 @@ class ReportCfg:
     percentiles: tuple[int, ...] = (50, 95, 99)
     timeseries_levels: tuple[int, ...] = ()
     variance_warn_pct: float = 10.0
+    # Resilience/soak analysis knobs (used only by soak mode).
+    baseline_window_s: Optional[tuple[int, int]] = None
+    recovery_threshold_pct: float = 95.0
+    full_recovery_pct: float = 100.0
+    recovery_hold_s: int = 10
+    latency_spike_mult: float = 2.0
+
+
+SOAK_EVENT_TYPES = ("failover", "scale_up", "scale_down", "note", "loadgen_restart")
+SOAK_TRIGGERS = ("manual", "do_api", "aiven_api")
+
+
+@dataclass(frozen=True)
+class Event:
+    """A timeline annotation (declared in the spec or appended live via `mark`)."""
+
+    type: str
+    at_s: Optional[int] = None          # offset from soak start (spec-declared events)
+    trigger: str = "manual"
+    note: str = ""
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class Soak:
+    """Fixed-concurrency, long-duration resilience run (failover/scale capture)."""
+
+    threads: int
+    duration_s: int
+    tolerate_errors: bool = True        # keep the load generator alive through outages
+    report_interval_s: int = 1
+    max_relaunches: int = 50            # supervisor safety cap
 
 
 @dataclass(frozen=True)
@@ -77,10 +109,16 @@ class Spec:
     run: RunMeta
     target: Target
     workload: Workload
-    sweep: Sweep
+    sweep: Optional[Sweep]
     capture: Capture
     report: ReportCfg
+    soak: Optional[Soak] = None
+    events: tuple[Event, ...] = ()
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
+
+    @property
+    def is_soak(self) -> bool:
+        return self.soak is not None
 
     def password(self) -> str:
         """Resolve the target password from the configured environment variable."""
@@ -240,33 +278,121 @@ def _parse_capture(sec: dict[str, Any]) -> Capture:
     )
 
 
-def _parse_report(sec: dict[str, Any], sweep: Sweep) -> ReportCfg:
-    _check_keys(sec, "report", set(), {"percentiles", "timeseries_levels", "variance_warn_pct"})
+def _parse_report(sec: dict[str, Any], sweep: Optional[Sweep]) -> ReportCfg:
+    _check_keys(sec, "report", set(),
+                {"percentiles", "timeseries_levels", "variance_warn_pct",
+                 "baseline_window_s", "recovery_threshold_pct", "full_recovery_pct",
+                 "recovery_hold_s", "latency_spike_mult"})
     pcts = _int_list(sec, "report", "percentiles", (50, 95, 99))
     if any(p < 1 or p > 100 for p in pcts):
         raise SpecError("'report.percentiles' entries must be between 1 and 100")
     levels = _int_list(sec, "report", "timeseries_levels", (), allow_empty=True)
-    for lvl in levels:
-        if lvl not in sweep.threads:
-            raise SpecError(
-                f"'report.timeseries_levels' contains {lvl}, which is not in sweep.threads {list(sweep.threads)}"
-            )
+    if sweep is not None:
+        for lvl in levels:
+            if lvl not in sweep.threads:
+                raise SpecError(
+                    f"'report.timeseries_levels' contains {lvl}, which is not in "
+                    f"sweep.threads {list(sweep.threads)}"
+                )
+    baseline = None
+    if "baseline_window_s" in sec:
+        bw = sec["baseline_window_s"]
+        if (not isinstance(bw, list) or len(bw) != 2
+                or not all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in bw)
+                or bw[0] >= bw[1]):
+            raise SpecError("'report.baseline_window_s' must be [start, end] seconds with start < end")
+        baseline = (bw[0], bw[1])
+    pct = _typed(sec, "report", "recovery_threshold_pct", float, 95.0)
+    full = _typed(sec, "report", "full_recovery_pct", float, 100.0)
+    hold = _typed(sec, "report", "recovery_hold_s", int, 10)
+    mult = _typed(sec, "report", "latency_spike_mult", float, 2.0)
+    if not 0 < pct <= 100 or not 0 < full <= 100:
+        raise SpecError("'report.recovery_threshold_pct'/'full_recovery_pct' must be in (0, 100]")
+    if hold < 1:
+        raise SpecError("'report.recovery_hold_s' must be >= 1")
     return ReportCfg(
         percentiles=pcts,
         timeseries_levels=levels,
         variance_warn_pct=_typed(sec, "report", "variance_warn_pct", float, 10.0),
+        baseline_window_s=baseline,
+        recovery_threshold_pct=pct,
+        full_recovery_pct=full,
+        recovery_hold_s=hold,
+        latency_spike_mult=mult,
     )
+
+
+def _parse_soak(sec: dict[str, Any]) -> Soak:
+    _check_keys(sec, "soak", {"threads", "duration_s"},
+                {"tolerate_errors", "report_interval_s", "max_relaunches"})
+    threads = _typed(sec, "soak", "threads", int)
+    duration = _typed(sec, "soak", "duration_s", int)
+    if threads < 1:
+        raise SpecError("'soak.threads' must be >= 1")
+    if duration < 1:
+        raise SpecError("'soak.duration_s' must be >= 1")
+    interval = _typed(sec, "soak", "report_interval_s", int, 1)
+    if interval < 1:
+        raise SpecError("'soak.report_interval_s' must be >= 1")
+    return Soak(
+        threads=threads,
+        duration_s=duration,
+        tolerate_errors=_typed(sec, "soak", "tolerate_errors", bool, True),
+        report_interval_s=interval,
+        max_relaunches=_typed(sec, "soak", "max_relaunches", int, 50),
+    )
+
+
+def _parse_events(doc: Any) -> tuple[Event, ...]:
+    if "events" not in doc:
+        return ()
+    raw = doc["events"]
+    if not isinstance(raw, list):
+        raise SpecError("'events' must be a list")
+    out: list[Event] = []
+    for i, ev in enumerate(raw):
+        if not isinstance(ev, dict):
+            raise SpecError(f"events[{i}] must be a mapping")
+        unknown = set(ev) - {"at_s", "type", "trigger", "note", "label"}
+        if unknown:
+            raise SpecError(f"unknown key(s) in events[{i}]: {', '.join(sorted(unknown))}")
+        etype = ev.get("type")
+        if etype not in SOAK_EVENT_TYPES:
+            raise SpecError(f"events[{i}].type must be one of {SOAK_EVENT_TYPES}, got {etype!r}")
+        trigger = ev.get("trigger", "manual")
+        if trigger not in SOAK_TRIGGERS:
+            raise SpecError(f"events[{i}].trigger must be one of {SOAK_TRIGGERS}")
+        if trigger != "manual":
+            raise SpecError(
+                f"events[{i}].trigger={trigger!r} is not supported yet (Phase 1 is manual only)")
+        at_s = ev.get("at_s")
+        if at_s is not None and (not isinstance(at_s, int) or isinstance(at_s, bool) or at_s < 0):
+            raise SpecError(f"events[{i}].at_s must be a non-negative integer (seconds from soak start)")
+        out.append(Event(type=etype, at_s=at_s, trigger=trigger,
+                         note=str(ev.get("note", "")), label=str(ev.get("label", ""))))
+    return tuple(out)
 
 
 def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
     """Validate a parsed YAML document and return a typed :class:`Spec`."""
     if not isinstance(doc, dict):
         raise SpecError(f"{source}: top level of the spec must be a mapping")
-    known = {"run", "target", "workload", "sweep", "capture", "report"}
+    known = {"run", "target", "workload", "sweep", "capture", "report", "soak", "events"}
     unknown = set(doc) - known
     if unknown:
         raise SpecError(f"unknown top-level section(s): {', '.join(sorted(unknown))}")
-    sweep = _parse_sweep(_section(doc, "sweep"))
+    has_soak, has_sweep = "soak" in doc, "sweep" in doc
+    if has_soak and has_sweep:
+        raise SpecError("spec has both 'soak' and 'sweep'; they are mutually exclusive "
+                        "(soak = fixed-concurrency resilience run, sweep = thread sweep)")
+    if not has_soak and not has_sweep:
+        raise SpecError("spec must contain either a 'sweep' (steady-state) or a 'soak' "
+                        "(resilience) section")
+    sweep = _parse_sweep(_section(doc, "sweep")) if has_sweep else None
+    soak = _parse_soak(_section(doc, "soak")) if has_soak else None
+    events = _parse_events(doc)
+    if events and not has_soak:
+        raise SpecError("'events' are only valid with a 'soak' section")
     return Spec(
         run=_parse_run(_section(doc, "run")),
         target=_parse_target(_section(doc, "target")),
@@ -274,6 +400,8 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
         sweep=sweep,
         capture=_parse_capture(doc.get("capture") or {}),
         report=_parse_report(doc.get("report") or {}, sweep),
+        soak=soak,
+        events=events,
         raw=doc,
     )
 

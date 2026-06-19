@@ -34,6 +34,7 @@ def summarize_level(
     from the histogram (interpolated) when available; otherwise only the
     declared 99th percentile from the summary block is reported.
     """
+    assert spec.sweep is not None
     steady = trim_warmup(parsed.samples, spec.sweep.warmup_s)
     out: dict[str, Any] = {
         "qps_avg": round(statistics.fmean(s.qps for s in steady), 2) if steady else None,
@@ -131,6 +132,7 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
     Re-parsing from raw is the source of truth, so reports can be regenerated
     after parser improvements without re-running benchmarks.
     """
+    assert spec.sweep is not None
     parsed_dir = run_dir / "parsed"
     parsed_dir.mkdir(parents=True, exist_ok=True)
     pcts = spec.report.percentiles

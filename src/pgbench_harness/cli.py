@@ -37,6 +37,20 @@ def _build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--dry-run", action="store_true",
                     help="print the sysbench command per level and the wall-clock budget, then exit")
 
+    sk = sub.add_parser("soak", help="fixed-concurrency resilience run (failover/scale) + report")
+    sk.add_argument("--spec", required=True, type=Path)
+    sk.add_argument("--results-dir", type=Path, default=Path("results"))
+    sk.add_argument("--dry-run", action="store_true",
+                    help="print the soak sysbench command and planned events, then exit")
+
+    mk = sub.add_parser("mark", help="stamp a timeline event into a (running) soak run")
+    mk.add_argument("--run-dir", required=True, type=Path)
+    mk.add_argument("--type", required=True,
+                    choices=["failover", "scale_up", "scale_down", "note"],
+                    help="event type")
+    mk.add_argument("--label", default="", help="short label shown on the chart/table")
+    mk.add_argument("--note", default="", help="free-text note")
+
     rp = sub.add_parser("report", help="(re)generate the HTML report for a run")
     rp.add_argument("--run-dir", required=True, type=Path)
 
@@ -125,6 +139,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             from pgbench_harness.runner import cmd_run
             return cmd_run(args.spec, args.results_dir, resume=args.resume,
                            run_dir_opt=args.run_dir, dry_run=args.dry_run)
+        if args.command == "soak":
+            from pgbench_harness.runner import cmd_soak
+            return cmd_soak(args.spec, args.results_dir, dry_run=args.dry_run)
+        if args.command == "mark":
+            from pgbench_harness.runner import cmd_mark
+            return cmd_mark(args.run_dir, args.type, args.label, args.note)
         if args.command == "report":
             from pgbench_harness.runner import cmd_report
             return cmd_report(args.run_dir)

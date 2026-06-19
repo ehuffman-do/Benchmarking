@@ -48,11 +48,13 @@ class Manifest:
     edition: str
     tshirt_size: str
     status: str = "created"  # created|running|complete|partial|failed
+    mode: str = "sweep"      # sweep | soak  (additive; older manifests default to sweep)
     created_utc: str = field(default_factory=utc_now_iso)
     finished_utc: str = ""
     wall_time_s: float = 0.0
     preflight: dict[str, Any] = field(default_factory=dict)
     levels: list[Level] = field(default_factory=list)
+    soak: dict[str, Any] = field(default_factory=dict)  # soak-mode bookkeeping
 
     def level(self, rep: int, threads: int) -> Level:
         """Find (or raise) the level entry for (rep, threads)."""

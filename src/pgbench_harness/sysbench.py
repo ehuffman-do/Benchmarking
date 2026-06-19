@@ -13,10 +13,12 @@ import logging
 import os
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from pgbench_harness.errors import RunError
+from pgbench_harness.parser import INTERVAL_RE
 from pgbench_harness.spec import Spec
 from pgbench_harness.util import get_redactor
 
@@ -69,6 +71,7 @@ def _workload_args(spec: Spec) -> tuple[str, list[str], Optional[str]]:
 
 def build_run_command(spec: Spec, threads: int) -> SysbenchCommand:
     """Build the sysbench `run` command for one thread level."""
+    assert spec.sweep is not None
     script, wargs, cwd = _workload_args(spec)
     argv = (
         ["sysbench", script]
@@ -86,10 +89,42 @@ def build_run_command(spec: Spec, threads: int) -> SysbenchCommand:
     return SysbenchCommand(argv=tuple(argv), cwd=cwd)
 
 
+def build_soak_command(spec: Spec, threads: int, time_s: int) -> SysbenchCommand:
+    """Build a soak `run` command: fixed concurrency for *time_s* seconds.
+
+    Note on outage survival: sysbench's `--ignore-errors` is MySQL-driver only;
+    the pgsql driver has no equivalent, so on a connection reset sysbench may
+    exit. We do NOT inject `--reconnect` (it would distort steady throughput);
+    instead the runner's supervisor relaunches sysbench for the remaining time,
+    and the gap is measured as downtime. See runner._soak_supervisor.
+    """
+    assert spec.soak is not None
+    script, wargs, cwd = _workload_args(spec)
+    argv = (
+        ["sysbench", script]
+        + _connection_args(spec)
+        + wargs
+        + [
+            f"--threads={threads}",
+            f"--time={time_s}",
+            f"--report-interval={spec.soak.report_interval_s}",
+            "--percentile=99",
+        ]
+        + (["--histogram"] if spec.capture.histogram else [])
+        + ["run"]
+    )
+    return SysbenchCommand(argv=tuple(argv), cwd=cwd)
+
+
 def build_prepare_command(spec: Spec) -> SysbenchCommand:
     """Build the sysbench `prepare` command (parallel load, capped at 16 threads)."""
     script, wargs, cwd = _workload_args(spec)
-    threads = min(16, max(spec.sweep.threads))
+    if spec.sweep is not None:
+        peak = max(spec.sweep.threads)
+    else:
+        assert spec.soak is not None
+        peak = spec.soak.threads
+    threads = min(16, peak)
     argv = (
         ["sysbench", script]
         + _connection_args(spec)
@@ -139,6 +174,50 @@ def run_streaming(
             if lines_seen % heartbeat_every == 0:
                 logger.info("    %s", redact(line.rstrip()))
     return proc.wait()
+
+
+def run_streaming_timestamped(
+    cmd: SysbenchCommand,
+    env: dict[str, str],
+    log_path: Path,
+    logger: logging.Logger,
+    heartbeat_every: int = 120,
+) -> tuple[int, int]:
+    """Run *cmd*, teeing each line to *log_path* prefixed with the read-time UTC.
+
+    Each line becomes ``<ISO-8601 UTC>\\t<original line>``. The timestamp is the
+    moment the load generator received the line — i.e. ~the end of that 1s
+    sysbench interval — which is the clock used to align events and provider
+    graphs. The raw log stays parseable by INTERVAL_RE (it ``search``es, so the
+    prefix is ignored). Returns ``(exit_code, interval_line_count)`` so the
+    supervisor can detect launches that produced no samples.
+    """
+    redact = get_redactor().redact
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.Popen(
+            list(cmd.argv), cwd=cmd.cwd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        raise RunError(
+            f"could not execute '{cmd.argv[0]}': {exc}",
+            hint="install sysbench (see README) and re-run preflight.",
+        ) from exc
+    intervals = 0
+    seen = 0
+    with open(log_path, "w", encoding="utf-8") as log:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            log.write(f"{ts}\t{redact(line)}")
+            log.flush()
+            if INTERVAL_RE.search(line):
+                intervals += 1
+            seen += 1
+            if seen % heartbeat_every == 0:
+                logger.info("    %s", redact(line.rstrip()))
+    return proc.wait(), intervals
 
 
 def sysbench_version() -> str:

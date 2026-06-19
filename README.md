@@ -308,6 +308,39 @@ The comparison report contains:
 `--runs` accepts run ids under `--results-dir` or direct paths to run
 directories, and runs with duplicate labels are disambiguated automatically.
 
+## Resilience / soak mode (failover & scaling)
+
+`soak` mode holds a **fixed** concurrency for a long window and measures the
+**client-observed disruption** when you trigger a failover or a scale event —
+the empirical "how does it behave during an event" data. It's a separate mode
+from the thread sweep (`soak:` and `sweep:` are mutually exclusive).
+
+```bash
+# 1. start the sustained load (runs under tmux/nohup for long windows)
+pgbench-harness soak --spec examples/soak-failover.yaml
+
+# 2. at the MOMENT you trigger the event from the provider console, stamp it:
+pgbench-harness mark --run-dir results/<run_id> --type failover --label "primary failover"
+```
+
+The load generator is kept alive across the outage by a supervisor that
+relaunches sysbench if it exits early (sysbench has no pgsql `--ignore-errors`),
+so an event can't truncate the test; gaps are measured as downtime. Every
+per-second sample carries the load generator's **read-time UTC**, and `mark`
+uses the same clock, so events line up exactly with the timeline and with your
+provider's own monitoring graphs.
+
+For each event the **resilience report** (`soak_report.html`) reports, against a
+pre-event baseline: hard downtime, time-to-first-success, error window,
+reconnects, **TTR** (throughput back to 95% of baseline, sustained), the
+**full re-warm / cache-cold tail** (back to 100% — the buffer/page-cache penalty
+when storage reattaches to a new node), peak p99, sysbench failures, and
+**transactions missed vs baseline** — plus a one-paragraph plain-language
+verdict. The whole-run chart is decimated (with per-bucket minimums preserved)
+so even an 8-hour run stays legible, with a full-resolution zoom per event.
+Artifacts (`parsed/soak_timeseries.csv`, `parsed/soak_summary.json`,
+`events.jsonl`) are shaped for later single-node-vs-multi-node overlay.
+
 ## Development
 
 ```bash

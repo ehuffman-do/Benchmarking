@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import re
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from pgbench_harness import capture, report, sysbench
+from pgbench_harness import capture, report, report_soak, soak, sysbench
 from pgbench_harness.errors import PreflightError, RunError
 from pgbench_harness.manifest import (
     STATUS_FAILED, STATUS_OK, STATUS_RUNNING, Level, Manifest, plan_levels,
@@ -25,12 +27,14 @@ from pgbench_harness.util import (
 
 def planned_budget_s(spec: Spec) -> float:
     """Planned wall-clock budget: sum of durations plus inter-level cooldowns."""
+    assert spec.sweep is not None
     n = len(spec.sweep.threads) * spec.sweep.repetitions
     return n * spec.sweep.duration_s + max(0, n - 1) * spec.sweep.cooldown_s
 
 
 def print_dry_run(spec: Spec) -> None:
     """Print the exact sysbench command per level and the wall-clock budget."""
+    assert spec.sweep is not None
     print(f"# dry run for label '{spec.run.label}' "
           f"({spec.sweep.repetitions} repetition(s) x {len(spec.sweep.threads)} levels)")
     for rep in range(1, spec.sweep.repetitions + 1):
@@ -118,7 +122,7 @@ def _write_prepare_stats(
         "db_size_pretty": f"{size / 1024**3:.2f} GiB" if size else "n/a",
         "load_mb_s": round(size / 1024**2 / wall_s, 1) if size and wall_s > 0 else None,
         "loaded_units": units,
-        "load_threads": min(16, max(spec.sweep.threads)),
+        "load_threads": min(16, capture.peak_threads(spec)),
         "log": str(log_path),
     }
     atomic_write_json(prepare_stats_path(spec, results_dir), stats)
@@ -205,6 +209,7 @@ def _init_run(
         run_dir = run_dir_opt or _find_resume_dir(results_dir, spec.run.label)
         manifest = Manifest.load(run_dir)
         return run_dir, manifest
+    assert spec.sweep is not None
     run_id = make_run_id(spec.run.label)
     run_dir = results_dir / run_id
     n = 1
@@ -277,6 +282,9 @@ def cmd_run(
 ) -> int:
     """`run` subcommand: preflight, sweep, parse, report."""
     spec = load_spec(spec_path)
+    if spec.is_soak:
+        raise RunError("this spec has a 'soak' section, not 'sweep'",
+                       hint="use `pgbench-harness soak --spec ...` for resilience runs.")
     if dry_run:
         print_dry_run(spec)
         return 0
@@ -314,10 +322,174 @@ def cmd_run(
     return 0 if status == "complete" else 1
 
 
+def _iso_micros() -> str:
+    """UTC now at microsecond precision — the shared soak clock."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _append_event(run_dir: Path, etype: str, label: str, note: str, source: str,
+                  ts_utc: Optional[str] = None) -> dict:
+    """Append one event marker to events.jsonl (the shared-clock event log)."""
+    ev = {"ts_utc": ts_utc or _iso_micros(), "type": etype,
+          "label": label, "note": note, "source": source}
+    path = run_dir / "events.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:  # append-only; never holds a secret
+        fh.write(json.dumps(ev) + "\n")
+    return ev
+
+
+def cmd_mark(run_dir: Path, etype: str, label: str, note: str) -> int:
+    """`mark` subcommand: stamp a timeline event into a running/finished soak."""
+    setup_logging()
+    if not (run_dir / "manifest.json").exists():
+        raise RunError(f"no manifest.json in {run_dir}", hint="pass the soak run directory.")
+    ev = _append_event(run_dir, etype, label, note, source="mark")
+    get_logger().info("marked %s '%s' at %s in %s", etype, label, ev["ts_utc"], run_dir)
+    return 0
+
+
+def _soak_supervisor(
+    spec: Spec, password: str, run_dir: Path, manifest: Manifest, logger: logging.Logger
+) -> dict:
+    """Run sysbench at fixed concurrency for the full window, relaunching if it
+    exits early so an outage can never truncate the test. Each segment's lines
+    are timestamped at read time; gaps between segments are measured as downtime.
+    """
+    soak = spec.soak
+    assert soak is not None
+    env = sysbench.child_env(spec, password)
+    start_mono = time.monotonic()
+    start_utc = _iso_micros()
+    deadline = start_mono + soak.duration_s
+    segments: list[dict] = []
+    seg = relaunches = total_intervals = consecutive_empty = 0
+
+    # Seed planned (spec-declared) events that have an explicit offset.
+    base_dt = datetime.strptime(start_utc, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    for ev in spec.events:
+        if ev.at_s is not None:
+            ts = (base_dt.timestamp() + ev.at_s)
+            iso = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            _append_event(run_dir, ev.type, ev.label, ev.note, source="spec", ts_utc=iso)
+
+    while True:
+        remaining = int(round(deadline - time.monotonic()))
+        if remaining < 1:
+            break
+        seg += 1
+        if seg > 1:
+            relaunches += 1
+            _append_event(run_dir, "loadgen_restart", f"sysbench relaunch #{relaunches}",
+                          "supervisor relaunched the load generator after early exit", "auto")
+        cmd = sysbench.build_soak_command(spec, soak.threads, remaining)
+        seg_log = run_dir / "raw" / f"soak_seg{seg:02d}.log"
+        seg_start = _iso_micros()
+        logger.info("soak segment %d (remaining %ds): %s", seg, remaining, cmd.display())
+        rc, n_intervals = sysbench.run_streaming_timestamped(cmd, env, seg_log, logger)
+        segments.append({"seg": seg, "log": f"raw/{seg_log.name}", "started_utc": seg_start,
+                         "finished_utc": _iso_micros(), "exit_code": rc, "intervals": n_intervals})
+        manifest.soak = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
+        manifest.save(run_dir)
+        total_intervals += n_intervals
+        consecutive_empty = consecutive_empty + 1 if n_intervals == 0 else 0
+        if rc == 0 and time.monotonic() >= deadline - 1:
+            break  # completed the window cleanly
+        if total_intervals == 0 and consecutive_empty >= 8:
+            raise RunError(
+                "soak produced no samples across 8 launches — the load generator "
+                "cannot reach the target.",
+                hint="run `preflight`; verify connectivity, credentials and that the "
+                     "dataset is loaded before launching a soak.")
+        if seg >= soak.max_relaunches:
+            logger.error("soak: reached max_relaunches=%d; stopping early.", soak.max_relaunches)
+            break
+        if time.monotonic() < deadline:   # brief backoff so a hard outage isn't hot-looped
+            time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+
+    doc = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
+    doc["finish_utc"] = _iso_micros()
+    return doc
+
+
+def _soak_doc(manifest: Manifest, start_utc: str, duration_s: int,
+              segments: list, relaunches: int) -> dict:
+    return {"run_id": manifest.run_id, "start_utc": start_utc,
+            "target_duration_s": duration_s, "segments": segments, "relaunches": relaunches}
+
+
+def cmd_soak(
+    spec_path: Path, results_dir: Path, dry_run: bool = False,
+) -> int:
+    """`soak` subcommand: fixed-concurrency resilience run + resilience report."""
+    spec = load_spec(spec_path)
+    if not spec.is_soak:
+        raise RunError("this spec has no 'soak' section",
+                       hint="add a soak: block (threads, duration_s) for resilience runs.")
+    assert spec.soak is not None
+    if dry_run:
+        cmd = sysbench.build_soak_command(spec, spec.soak.threads, spec.soak.duration_s)
+        print(f"# soak dry run for '{spec.run.label}'")
+        print(cmd.display())
+        print(f"# fixed concurrency {spec.soak.threads}, duration "
+              f"{fmt_duration(spec.soak.duration_s)} (supervisor relaunches on early exit)")
+        for ev in spec.events:
+            at = f"at {ev.at_s}s" if ev.at_s is not None else "live via `mark`"
+            print(f"# planned event: {ev.type} ({at}) — {ev.note or ev.label}")
+        print(f"# password source: env var {spec.target.password_env} -> PGPASSWORD")
+        return 0
+    password = spec.password()
+    get_redactor().register(password)
+    run_id = make_run_id(spec.run.label)
+    run_dir = results_dir / run_id
+    n = 1
+    while run_dir.exists():
+        n += 1
+        run_id = f"{make_run_id(spec.run.label)}-{n}"
+        run_dir = results_dir / run_id
+    (run_dir / "raw").mkdir(parents=True, exist_ok=True)
+    dump_spec_copy(spec, run_dir / "spec.yaml")
+    dump_spec_copy(spec, run_dir / "env" / "spec.yaml")
+    manifest = Manifest(run_id=run_id, label=spec.run.label, edition=spec.run.edition,
+                        tshirt_size=spec.run.tshirt_size, mode="soak")
+    manifest.save(run_dir)
+    logger = setup_logging(run_dir / "harness.log")
+    logger.info("soak %s -> %s (duration %s, %d threads)", run_id, run_dir,
+                fmt_duration(spec.soak.duration_s), spec.soak.threads)
+    try:
+        pf = capture.run_preflight(spec, password, logger)
+        assert pf.dataset is not None
+        if not pf.dataset.ok:
+            raise _dataset_error(pf.dataset, spec_path)
+    except PreflightError:
+        manifest.status = "failed"
+        manifest.save(run_dir)
+        raise
+    manifest.preflight = _preflight_doc(pf)
+    manifest.status = "running"
+    manifest.save(run_dir)
+    capture.capture_env(run_dir, spec, password, pf)
+    _attach_prepare_stats(spec, results_dir, run_dir, logger)
+    logger.info("starting soak load; trigger events from the provider console and run "
+                "`pgbench-harness mark --run-dir %s --type <failover|scale_up|...> "
+                "--label '...'` at the moment you trigger them.", run_dir)
+    manifest.soak = _soak_supervisor(spec, password, run_dir, manifest, logger)
+    summary = soak.analyze(run_dir, spec, manifest.soak)
+    manifest.status = summary["status"]
+    manifest.finished_utc = manifest.soak.get("finish_utc", "")
+    manifest.wall_time_s = float(summary.get("observed_seconds", 0))
+    manifest.save(run_dir)
+    out = report_soak.generate_soak_report(run_dir)
+    logger.info("soak %s finished (status '%s', coverage %.1f%%); report: %s",
+                run_id, summary["status"], summary["coverage_pct"], out)
+    return 0 if summary["status"] == "complete" else 1
+
+
 def _sweep(
     spec: Spec, password: str, run_dir: Path, manifest: Manifest, logger: logging.Logger
 ) -> None:
     """Execute all pending levels in order, with cooldowns in between."""
+    assert spec.sweep is not None
     pending = manifest.pending_levels()
     done = len(manifest.levels) - len(pending)
     if done:
@@ -377,8 +549,12 @@ def _wall_time_s(manifest: Manifest) -> float:
 
 
 def cmd_report(run_dir: Path) -> int:
-    """`report` subcommand: regenerate report.html for an existing run."""
+    """`report` subcommand: regenerate the report for an existing run (sweep or soak)."""
     setup_logging()
-    out = report.generate_report(run_dir)
+    if (run_dir / "parsed" / "soak_summary.json").exists() or \
+            Manifest.load(run_dir).mode == "soak":
+        out = report_soak.generate_soak_report(run_dir)
+    else:
+        out = report.generate_report(run_dir)
     get_logger().info("report written: %s", out)
     return 0
