@@ -74,6 +74,57 @@ def _dataset_error(check: "capture.DatasetCheck", spec_path: Path) -> PreflightE
     )
 
 
+def cmd_validate(spec_path: Path) -> int:
+    """`validate` subcommand: parse + validate a spec without connecting (CI lint)."""
+    spec = load_spec(spec_path)  # raises SpecError (CLI prints message + hint, exit 2)
+    mode = "soak" if spec.is_soak else "sweep"
+    print(f"OK: {spec_path} is valid.")
+    print(f"  label    : {spec.run.label}  ({spec.run.edition} / {spec.run.tshirt_size})")
+    print(f"  target   : {spec.target.host}:{spec.target.port}/{spec.target.database} "
+          f"(password via ${spec.target.password_env})")
+    print(f"  workload : {spec.workload.type}")
+    print(f"  mode     : {mode}")
+    if spec.is_soak:
+        assert spec.soak is not None
+        print(f"  soak     : {spec.soak.threads} threads for {fmt_duration(spec.soak.duration_s)}, "
+              f"{len(spec.events)} planned event(s)")
+    else:
+        assert spec.sweep is not None
+        print(f"  sweep    : threads {list(spec.sweep.threads)}, {spec.sweep.duration_s}s/level, "
+              f"{spec.sweep.repetitions} rep(s); budget {fmt_duration(planned_budget_s(spec))}")
+    return 0
+
+
+def cmd_doctor() -> int:
+    """`doctor` subcommand: environment sanity — versions, git SHA/remote, tools."""
+    import subprocess
+    print(capture.harness_version())
+    here = str(Path(__file__).resolve().parent)
+    for label, args in (("git HEAD", ["git", "-C", here, "rev-parse", "--short", "HEAD"]),
+                        ("git remote", ["git", "-C", here, "config", "--get", "remote.origin.url"])):
+        try:
+            out = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            print(f"  {label:11}: {out.stdout.strip() or '(unknown)'}")
+        except (OSError, subprocess.SubprocessError):
+            print(f"  {label:11}: (unavailable)")
+    for label, args in (("sysbench", ["sysbench", "--version"]),
+                        ("psql", ["psql", "--version"])):
+        try:
+            out = subprocess.run(args, capture_output=True, text=True, timeout=15)
+            print(f"  {label:11}: {(out.stdout or out.stderr).strip() or 'present'}")
+        except (OSError, subprocess.SubprocessError):
+            print(f"  {label:11}: NOT FOUND on PATH")
+    return 0
+
+
+def _maybe_prepare(spec_path: Path, results_dir: Path, do_prepare: bool,
+                   logger: logging.Logger) -> None:
+    """For run/soak --prepare: load the dataset first if it's missing (idempotent)."""
+    if do_prepare:
+        logger.info("--prepare: ensuring the dataset is loaded before the run")
+        cmd_prepare(spec_path, results_dir)
+
+
 def cmd_preflight(spec_path: Path) -> int:
     """`preflight` subcommand."""
     spec = load_spec(spec_path)
@@ -279,6 +330,7 @@ def cmd_run(
     resume: bool = False,
     run_dir_opt: Optional[Path] = None,
     dry_run: bool = False,
+    prepare: bool = False,
 ) -> int:
     """`run` subcommand: preflight, sweep, parse, report."""
     spec = load_spec(spec_path)
@@ -290,6 +342,7 @@ def cmd_run(
         return 0
     password = spec.password()
     get_redactor().register(password)
+    _maybe_prepare(spec_path, results_dir, prepare, setup_logging())
     run_dir, manifest = _init_run(spec, spec_path, results_dir, resume, run_dir_opt)
     logger = setup_logging(run_dir / "harness.log")
     logger.info("run %s -> %s (budget %s)", manifest.run_id, run_dir,
@@ -350,7 +403,8 @@ def cmd_mark(run_dir: Path, etype: str, label: str, note: str) -> int:
 
 
 def _soak_supervisor(
-    spec: Spec, password: str, run_dir: Path, manifest: Manifest, logger: logging.Logger
+    spec: Spec, password: str, run_dir: Path, manifest: Manifest, logger: logging.Logger,
+    stop: Optional[dict] = None,
 ) -> dict:
     """Run sysbench at fixed concurrency for the full window, relaunching if it
     exits early so an outage can never truncate the test. Each segment's lines
@@ -363,7 +417,7 @@ def _soak_supervisor(
     start_utc = _iso_micros()
     deadline = start_mono + soak.duration_s
     segments: list[dict] = []
-    seg = relaunches = total_intervals = consecutive_empty = 0
+    seg = relaunches = total_intervals = consecutive_empty = consecutive_short = 0
 
     # Seed planned (spec-declared) events that have an explicit offset.
     base_dt = datetime.strptime(start_utc, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
@@ -374,6 +428,9 @@ def _soak_supervisor(
             _append_event(run_dir, ev.type, ev.label, ev.note, source="spec", ts_utc=iso)
 
     while True:
+        if stop is not None and stop.get("flag"):
+            logger.warning("soak: stop requested (signal) — finalizing partial results.")
+            break
         remaining = int(round(deadline - time.monotonic()))
         if remaining < 1:
             break
@@ -385,14 +442,19 @@ def _soak_supervisor(
         cmd = sysbench.build_soak_command(spec, soak.threads, remaining)
         seg_log = run_dir / "raw" / f"soak_seg{seg:02d}.log"
         seg_start = _iso_micros()
+        seg_mono = time.monotonic()
         logger.info("soak segment %d (remaining %ds): %s", seg, remaining, cmd.display())
         rc, n_intervals = sysbench.run_streaming_timestamped(cmd, env, seg_log, logger)
+        seg_wall = time.monotonic() - seg_mono
         segments.append({"seg": seg, "log": f"raw/{seg_log.name}", "started_utc": seg_start,
                          "finished_utc": _iso_micros(), "exit_code": rc, "intervals": n_intervals})
         manifest.soak = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
         manifest.save(run_dir)
         total_intervals += n_intervals
         consecutive_empty = consecutive_empty + 1 if n_intervals == 0 else 0
+        # A "short" segment exited well before its requested time — i.e. it keeps
+        # dying early. Tracked separately so a fast exit/0-sample loop can't churn.
+        consecutive_short = consecutive_short + 1 if seg_wall < min(5, remaining) else 0
         if rc == 0 and time.monotonic() >= deadline - 1:
             break  # completed the window cleanly
         if total_intervals == 0 and consecutive_empty >= 8:
@@ -401,7 +463,11 @@ def _soak_supervisor(
                 "cannot reach the target.",
                 hint="run `preflight`; verify connectivity, credentials and that the "
                      "dataset is loaded before launching a soak.")
-        if seg >= soak.max_relaunches:
+        if consecutive_short >= 15:
+            logger.error("soak: load generator exited almost immediately %d times in a "
+                         "row; stopping to avoid a relaunch hot-loop.", consecutive_short)
+            break
+        if relaunches >= soak.max_relaunches:
             logger.error("soak: reached max_relaunches=%d; stopping early.", soak.max_relaunches)
             break
         if time.monotonic() < deadline:   # brief backoff so a hard outage isn't hot-looped
@@ -419,7 +485,7 @@ def _soak_doc(manifest: Manifest, start_utc: str, duration_s: int,
 
 
 def cmd_soak(
-    spec_path: Path, results_dir: Path, dry_run: bool = False,
+    spec_path: Path, results_dir: Path, dry_run: bool = False, prepare: bool = False,
 ) -> int:
     """`soak` subcommand: fixed-concurrency resilience run + resilience report."""
     spec = load_spec(spec_path)
@@ -440,6 +506,7 @@ def cmd_soak(
         return 0
     password = spec.password()
     get_redactor().register(password)
+    _maybe_prepare(spec_path, results_dir, prepare, setup_logging())
     run_id = make_run_id(spec.run.label)
     run_dir = results_dir / run_id
     n = 1
@@ -473,7 +540,22 @@ def cmd_soak(
     logger.info("starting soak load; trigger events from the provider console and run "
                 "`pgbench-harness mark --run-dir %s --type <failover|scale_up|...> "
                 "--label '...'` at the moment you trigger them.", run_dir)
-    manifest.soak = _soak_supervisor(spec, password, run_dir, manifest, logger)
+    # Graceful stop: SIGINT/SIGTERM finalize a partial resilience report instead
+    # of discarding the run. The signal also reaches the child sysbench, which
+    # exits, unblocking the supervisor's read loop so it sees the flag.
+    import signal
+    stop = {"flag": False}
+
+    def _on_signal(_signum: int, _frame: object) -> None:
+        stop["flag"] = True
+
+    old_int = signal.signal(signal.SIGINT, _on_signal)
+    old_term = signal.signal(signal.SIGTERM, _on_signal)
+    try:
+        manifest.soak = _soak_supervisor(spec, password, run_dir, manifest, logger, stop=stop)
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
     summary = soak.analyze(run_dir, spec, manifest.soak)
     manifest.status = summary["status"]
     manifest.finished_utc = manifest.soak.get("finish_utc", "")

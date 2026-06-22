@@ -218,6 +218,32 @@ def test_list_runs(fake_env, spec_file, results_dir, capsys) -> None:
     assert "4/4" in out
 
 
+def test_validate_ok(spec_file, capsys) -> None:
+    assert run_cli("validate", "--spec", str(spec_file)) == 0
+    out = capsys.readouterr().out
+    assert "OK:" in out and "mode     : sweep" in out
+
+
+def test_validate_bad_spec(tmp_path, capsys) -> None:
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("run: {label: x}\n", encoding="utf-8")  # missing required sections
+    assert run_cli("validate", "--spec", str(bad)) == 2
+
+
+def test_doctor(capsys) -> None:
+    assert run_cli("doctor") == 0
+    assert "pgbench-harness" in capsys.readouterr().out
+
+
+def test_run_prepare_chains(fake_env, spec_file, results_dir, monkeypatch) -> None:
+    """`run --prepare` loads a missing dataset first, then runs to completion."""
+    monkeypatch.setenv("FAKE_PSQL_TABLES", "0")  # dataset absent until prepared
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir),
+                   "--prepare") == 0
+    run_dir = find_run_dir(results_dir)
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "complete"
+
+
 def test_run_refuses_missing_dataset(fake_env, spec_file, results_dir, monkeypatch, capsys) -> None:
     monkeypatch.setenv("FAKE_PSQL_TABLES", "0")
     rc = run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir))

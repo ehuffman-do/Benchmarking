@@ -45,6 +45,12 @@
 during the soak, or declare <code>events:</code> in the spec.</div>
 {% endif %}
 
+{% if summary.warnings %}
+<div class="warnbox"><b>Analysis warnings:</b>
+  <ul style="margin:6px 0 0">{% for w in summary.warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
 <h2 id="overview"><span class="secno">1</span>Run overview</h2>
 <div class="card soft">
   <div class="meta-grid">
@@ -91,7 +97,7 @@ during the soak, or declare <code>events:</code> in the spec.</div>
     <td {% if m.full_recovery_s is none %}class="warn"{% endif %}>{{ m.full_recovery_s if m.full_recovery_s is not none else "not reached" }}</td>
     <td>{{ m.peak_p99_ms if m.peak_p99_ms is not none else "—" }}</td>
     <td>{{ "{:,.0f}".format(m.txns_failed) }}</td>
-    <td>{{ "{:,.0f}".format(m.missed_vs_baseline) }}</td>
+    <td>{{ "{:,.0f}".format(m.missed_vs_baseline) if m.missed_vs_baseline is not none else "n/a" }}</td>
   </tr>
   {% endfor %}
   </tbody>

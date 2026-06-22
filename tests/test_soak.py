@@ -84,6 +84,43 @@ def test_disruption_graceful_dip_no_hard_downtime() -> None:
     assert m["seconds_p99_above"] == 0            # 18 < 2x10
 
 
+def test_recovery_near_window_end_not_false_negative() -> None:
+    """A healthy tail shorter than recovery_hold_s must NOT read 'never recovered'."""
+    tl = {t: _row(100, 10) for t in range(0, 65)}      # all healthy
+    m = disruption_metrics(tl, event_off=60, win_end=64, baseline_tps=100.0,
+                           baseline_lat=10.0, cfg=CFG)   # only 5s after event < hold(10)
+    assert m["hard_downtime_s"] == 0
+    assert m["ttr_s"] == 0                               # recovered immediately, not None
+    assert m["full_recovery_s"] == 0
+
+
+def test_recovery_delayed_by_gap_inside_hold() -> None:
+    tl = {t: _row(100, 10) for t in range(0, 60)}
+    for t in range(60, 65):
+        tl[t] = _row(0.0, 0.0, err=5.0)                 # 5s outage
+    for t in range(65, 121):
+        tl[t] = _row(100, 10)
+    del tl[70]                                           # a single missing sample mid-recovery
+    m = disruption_metrics(tl, 60, 120, 100.0, 10.0, CFG)
+    assert m["ttr_s"] == 11                              # recovery detected after the gap at 71
+
+
+def test_no_baseline_makes_dependent_metrics_none() -> None:
+    """baseline_tps==0 (degenerate) -> recovery/missed/spike metrics are None, not 0."""
+    tl = {t: _row(0.0, 0.0) for t in range(60, 121)}
+    m = disruption_metrics(tl, 60, 120, baseline_tps=0.0, baseline_lat=0.0, cfg=CFG)
+    assert m["ttr_s"] is None
+    assert m["full_recovery_s"] is None
+    assert m["missed_vs_baseline"] is None
+    assert m["seconds_p99_above"] is None
+
+
+def test_resolve_baseline_window_early_event_degenerate() -> None:
+    assert resolve_baseline_window({}, 1000, [{"_offset": 3}], None) == (0, 0)  # too early
+    a, b = resolve_baseline_window({}, 1000, [{"_offset": 20}], None)
+    assert (a, b) == (0, 15)                              # strictly before the event
+
+
 def test_resolve_baseline_window_defaults() -> None:
     assert resolve_baseline_window({}, 1000, [], None) == (200, 800)   # middle 60%
     ev = [{"_offset": 600}]

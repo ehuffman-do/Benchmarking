@@ -29,6 +29,8 @@ from pgbench_harness.spec import Spec
 from pgbench_harness.util import atomic_write_json, atomic_write_text, fmt_duration
 
 EPS = 1e-9  # tps at/below this counts as "no successful transactions"
+MIN_BASELINE_SAMPLES = 5  # need at least this many clean pre-event samples to trust a baseline
+ANALYSIS_TYPES = ("failover", "scale_up", "scale_down", "note")  # loadgen_restart is internal
 
 
 def _parse_ts(s: str) -> datetime:
@@ -119,10 +121,10 @@ def resolve_baseline_window(
         return cfg_window
     if events:
         first = min(e["_offset"] for e in events)
-        end = max(15, first - 5)
-        start = min(30, max(0, end - 1))
-        if end - start < 10:               # event too early for a clean baseline
-            start, end = 0, max(5, first)
+        end = first - 5                    # strictly BEFORE the event (5s guard)
+        if end <= 1:                        # event too early — no clean pre-event span
+            return (0, 0)                   # degenerate; flagged downstream
+        start = max(0, end - 600)           # up to ~10 min of clean pre-event baseline
         return start, end
     return int(total_s * 0.2), int(total_s * 0.8)
 
@@ -151,10 +153,17 @@ def disruption_metrics(
       full_recovery_s        same, at full_recovery% of baseline (cache re-warm
                              tail; always >= ttr_s).
       peak_p99_ms            max per-second p99 latency in the window.
-      seconds_p99_above      seconds with p99 > latency_spike_mult x baseline p99.
-      txns_failed            sum of err/s over the window (sysbench-reported).
+      seconds_p99_above      seconds with p99 > latency_spike_mult x baseline p99
+                             (None when there is no trustworthy baseline).
+      txns_failed            sum of err/s over the window — sysbench-reported, so
+                             observable ONLY while the load generator is alive
+                             (present seconds). During a gap-based outage sysbench
+                             isn't running, so this is ~0; gap downtime is captured
+                             by hard_downtime_s and missed_vs_baseline instead.
       missed_vs_baseline     sum of max(0, baseline_tps - observed_tps) over the
-                             window — estimated transactions NOT served vs baseline.
+                             window (gaps count as 0 served) — estimated
+                             transactions NOT served vs baseline. None when there
+                             is no trustworthy baseline.
     """
     thresh = baseline_tps * cfg.recovery_threshold_pct / 100.0
     full = baseline_tps * cfg.full_recovery_pct / 100.0
@@ -187,26 +196,40 @@ def disruption_metrics(
                                if x in tl), 1)
 
     def recovered_at(target: float) -> Optional[int]:
+        """First offset (from event) where TPS holds >= target.
+
+        The sustain requirement is clamped to the seconds actually available
+        before win_end, so a healthy tail shorter than recovery_hold_s near the
+        end of the run/window still counts as recovered (it must not be reported
+        as 'never recovered' simply because the window ended). A gap inside the
+        sustain window fails the check, so recovery is detected from the first
+        gap-free, at-or-above-target run — consistent with downtime semantics.
+        """
         for s in range(event_off, win_end + 1):
-            if all((s + k) <= win_end and (s + k) in tl and tl[s + k]["tps"] >= target
-                   for k in range(hold)):
+            eff = min(hold, win_end - s + 1)
+            if eff <= 0:
+                break
+            if all((s + k) in tl and tl[s + k]["tps"] >= target for k in range(eff)):
                 return s - event_off
         return None
 
-    ttr = recovered_at(thresh) if baseline_tps > 0 else None
-    full_recovery = recovered_at(full) if baseline_tps > 0 else None
+    have_baseline = baseline_tps > 0
+    ttr = recovered_at(thresh) if have_baseline else None
+    full_recovery = recovered_at(full) if have_baseline else None
 
     lat_vals = [(x, tl[x]["lat_p99"]) for x in range(event_off, win_end + 1) if x in tl]
     peak_p99 = max((v for _, v in lat_vals), default=None)
     peak_at = max(lat_vals, key=lambda p: p[1])[0] - event_off if lat_vals else None
-    spike_threshold = baseline_lat * cfg.latency_spike_mult if baseline_lat else None
+    spike_threshold = baseline_lat * cfg.latency_spike_mult if baseline_lat > 0 else None
     seconds_p99_above = (sum(1 for _, v in lat_vals if v > spike_threshold)
-                         if spike_threshold else 0)
+                         if spike_threshold is not None else None)
 
     txns_failed = round(sum(tl[x]["err_s"] for x in range(event_off, win_end + 1)
                            if x in tl), 1)
-    missed = round(sum(max(0.0, baseline_tps - _tps(tl, x))
-                      for x in range(event_off, win_end + 1)), 0)
+    # missed work needs a baseline to compare against; without one it's undefined.
+    missed = (round(sum(max(0.0, baseline_tps - _tps(tl, x))
+                       for x in range(event_off, win_end + 1)), 0)
+              if have_baseline else None)
 
     return {
         "hard_downtime_s": downtime_s,
@@ -236,6 +259,11 @@ def _verdict(ev: dict[str, Any], m: dict[str, Any], cfg: Any) -> str:
             parts.append(f"clients reconnected/served by {fmt_duration(m['time_to_first_success_s'])}")
     else:
         parts.append("no hard downtime")
+    if m["missed_vs_baseline"] is None:        # no trustworthy baseline
+        parts.append("recovery not assessed (no clean baseline; set "
+                     "report.baseline_window_s)")
+        tail = f" {int(m['txns_failed']):,} sysbench errors observed."
+        return f"{name}: " + "; ".join(parts) + "." + tail
     if m["ttr_s"] is not None:
         parts.append(f"throughput recovered to {cfg.recovery_threshold_pct:.0f}% of baseline "
                      f"at {fmt_duration(m['ttr_s'])}")
@@ -264,12 +292,27 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
     for e in events:
         e["_offset"] = max(0, int(round((e["_dt"] - soak_start).total_seconds())))
 
+    warnings: list[str] = []
     bw = resolve_baseline_window(tl, horizon, events, spec.report.baseline_window_s)
+    baseline_samples = sum(1 for o in range(bw[0], bw[1] + 1) if o in tl)
     baseline_tps = _median_over(tl, bw[0], bw[1], "tps") or 0.0
     baseline_lat = _median_over(tl, bw[0], bw[1], "lat_p99") or 0.0
+    baseline_ok = baseline_samples >= MIN_BASELINE_SAMPLES and baseline_tps > 0
+    if not baseline_ok:
+        baseline_tps = baseline_lat = 0.0   # force baseline-dependent metrics to None
+        warnings.append(
+            "no trustworthy pre-event baseline (event too early, or the baseline "
+            "window fell in a gap). Recovery, latency-spike and missed-vs-baseline "
+            "metrics are not computed — set report.baseline_window_s to a clean span.")
 
-    # Per-event window = [event, next event or end of timeline].
-    ordered = sorted(events, key=lambda e: e["_offset"])
+    # loadgen_restart markers are internal (supervisor relaunches), not user events:
+    # they annotate the overview but get no disruption metrics or zoom.
+    analysis = [e for e in events if e["type"] in ANALYSIS_TYPES]
+    restart_markers = [{"at_s": e["_offset"], "ts_utc": e["ts_utc"], "label": e.get("label", "")}
+                       for e in events if e["type"] == "loadgen_restart"]
+
+    # Per-event window = [event, next analysis event or end of timeline].
+    ordered = sorted(analysis, key=lambda e: e["_offset"])
     out_events = []
     for i, ev in enumerate(ordered):
         nxt = ordered[i + 1]["_offset"] - 1 if i + 1 < len(ordered) else horizon
@@ -284,10 +327,11 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
         entry["verdict"] = _verdict(entry, metrics, spec.report)
         out_events.append(entry)
 
-    coverage = len(present) / horizon if horizon else 0.0
+    span = horizon + 1                       # dense timeline is 0..horizon inclusive
+    coverage = min(1.0, len(present) / span) if span else 0.0
     if not present:
         status = "failed"
-    elif coverage < 0.9 or manifest_soak.get("relaunches", 0) > 0:
+    elif coverage < 0.9 or manifest_soak.get("relaunches", 0) > 0 or not baseline_ok:
         status = "partial"
     else:
         status = "complete"
@@ -306,14 +350,16 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
         "observed_seconds": len(present),
         "horizon_s": horizon,
         "coverage_pct": round(coverage * 100, 1),
-        "gaps_s": horizon + 1 - len(present) if horizon else 0,
+        "gaps_s": span - len(present),
         "relaunches": manifest_soak.get("relaunches", 0),
         "segments": manifest_soak.get("segments", []),
+        "warnings": warnings,
         "baseline": {
             "window_s": [bw[0], bw[1]], "tps": round(baseline_tps, 1),
             "lat_p99_ms": round(baseline_lat, 1),
-            "samples": sum(1 for o in range(bw[0], bw[1] + 1) if o in tl),
+            "samples": baseline_samples, "ok": baseline_ok,
         },
+        "restart_markers": restart_markers,
         "thresholds": {
             "recovery_threshold_pct": spec.report.recovery_threshold_pct,
             "full_recovery_pct": spec.report.full_recovery_pct,
