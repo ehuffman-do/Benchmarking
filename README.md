@@ -10,13 +10,17 @@ per run plus cross-run comparison reports.
 ```
 pgbench-harness preflight   --spec run.yaml        # connectivity, version, limits checks
 pgbench-harness prepare     --spec run.yaml        # load the dataset (idempotent, records load metrics)
-pgbench-harness run         --spec run.yaml        # execute the sweep(s), capture everything, report
-pgbench-harness report      --run-dir results/<run_id>/   # regenerate the HTML report
+pgbench-harness run         --spec run.yaml        # steady-state thread sweep, capture everything, report
+pgbench-harness soak        --spec soak.yaml       # resilience: fixed load through a failover/scale event
+pgbench-harness mark        --run-dir results/<run_id> --type failover --label "..."  # stamp an event on a soak
+pgbench-harness report      --run-dir results/<run_id>/   # regenerate the HTML report (sweep or soak)
 pgbench-harness compare     --runs <run_id> <run_id> --out compare.html
 pgbench-harness list        [--results-dir results/]
 ```
 
-`run` re-runs preflight automatically and generates the report at the end.
+There are two run modes, chosen by the spec: a **`sweep`** section → steady-state
+thread sweep (`run`); a **`soak`** section → fixed-concurrency resilience run
+(`soak`). They are mutually exclusive. `run` re-runs preflight automatically and
 `report` exists separately so reports can be regenerated after template or
 parser improvements **without re-running benchmarks** (raw sysbench logs are
 the source of truth; `parsed/` is rebuilt from them every time).
