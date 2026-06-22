@@ -27,6 +27,11 @@ def _build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--results-dir", type=Path, default=Path("results"),
                     help="where prepare logs/load-metrics are stored (default: results/)")
 
+    va = sub.add_parser("validate", help="validate a spec without connecting (CI-friendly)")
+    va.add_argument("--spec", required=True, type=Path)
+
+    dr = sub.add_parser("doctor", help="show version, git SHA/remote and tool availability")
+
     rn = sub.add_parser("run", help="execute the full sweep(s) and generate the report")
     rn.add_argument("--spec", required=True, type=Path)
     rn.add_argument("--results-dir", type=Path, default=Path("results"))
@@ -34,12 +39,16 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="resume the latest run for this label, skipping completed levels")
     rn.add_argument("--run-dir", type=Path, default=None,
                     help="explicit run directory to resume (with --resume)")
+    rn.add_argument("--prepare", action="store_true",
+                    help="load the dataset first if missing (prepare-then-run in one command)")
     rn.add_argument("--dry-run", action="store_true",
                     help="print the sysbench command per level and the wall-clock budget, then exit")
 
     sk = sub.add_parser("soak", help="fixed-concurrency resilience run (failover/scale) + report")
     sk.add_argument("--spec", required=True, type=Path)
     sk.add_argument("--results-dir", type=Path, default=Path("results"))
+    sk.add_argument("--prepare", action="store_true",
+                    help="load the dataset first if missing (prepare-then-soak in one command)")
     sk.add_argument("--dry-run", action="store_true",
                     help="print the soak sysbench command and planned events, then exit")
 
@@ -135,13 +144,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "prepare":
             from pgbench_harness.runner import cmd_prepare
             return cmd_prepare(args.spec, args.results_dir)
+        if args.command == "validate":
+            from pgbench_harness.runner import cmd_validate
+            return cmd_validate(args.spec)
+        if args.command == "doctor":
+            from pgbench_harness.runner import cmd_doctor
+            return cmd_doctor()
         if args.command == "run":
             from pgbench_harness.runner import cmd_run
             return cmd_run(args.spec, args.results_dir, resume=args.resume,
-                           run_dir_opt=args.run_dir, dry_run=args.dry_run)
+                           run_dir_opt=args.run_dir, dry_run=args.dry_run,
+                           prepare=args.prepare)
         if args.command == "soak":
             from pgbench_harness.runner import cmd_soak
-            return cmd_soak(args.spec, args.results_dir, dry_run=args.dry_run)
+            return cmd_soak(args.spec, args.results_dir, dry_run=args.dry_run,
+                            prepare=args.prepare)
         if args.command == "mark":
             from pgbench_harness.runner import cmd_mark
             return cmd_mark(args.run_dir, args.type, args.label, args.note)

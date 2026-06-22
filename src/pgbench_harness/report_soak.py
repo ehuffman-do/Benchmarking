@@ -79,8 +79,9 @@ def _dense(tl: dict[int, dict[str, Any]], horizon: int, key: str, gap: float) ->
 def _disruption_span(ev: dict[str, Any]) -> Optional[int]:
     m = ev["metrics"]
     for k in ("full_recovery_s", "ttr_s", "hard_downtime_s"):
-        if m.get(k):
-            return m[k]
+        v = m.get(k)
+        if v is not None and v > 0:   # 0 (instant recovery) is not a span to shade
+            return v
     return None
 
 
@@ -99,21 +100,29 @@ def chart_overview(summary: dict[str, Any], tl: dict[int, dict[str, Any]]) -> Op
     base = summary["baseline"]["tps"]
     if base:
         ax.axhline(base, color="#5b6573", linewidth=1.0, linestyle="--", label=f"baseline {base:,.0f}")
-    bw = summary["baseline"]["window_s"]
-    ax.axvspan(bw[0], bw[1], color="#2e8b57", alpha=0.06, label="baseline window")
-    for ev in summary["events"]:
+    if summary["baseline"].get("ok", True):
+        bw = summary["baseline"]["window_s"]
+        ax.axvspan(bw[0], bw[1], color="#2e8b57", alpha=0.06, label="baseline window")
+    # Internal supervisor relaunch markers (faint), only if not overwhelming.
+    markers = summary.get("restart_markers", [])
+    if markers and len(markers) <= 40:
+        for i, rm in enumerate(markers):
+            ax.axvline(rm["at_s"], color="#b0b8c4", linewidth=0.8, linestyle=":",
+                       alpha=0.7, label="load-gen relaunch" if i == 0 else None)
+    _style_ax(ax, "Throughput over the full run (events marked)", "elapsed time (h:mm:ss)", "TPS")
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _p: _hms(v)))
+    ax.set_xlim(0, horizon)
+    ax.set_ylim(bottom=0)                       # set limits BEFORE annotating
+    for ev in summary["events"]:                # events as vlines + axes-fraction labels
         at = ev["at_s"]
         ax.axvline(at, color=EVENT_COLOR, linewidth=1.4)
         span = _disruption_span(ev)
         if span:
             ax.axvspan(at, at + span, color=EVENT_COLOR, alpha=0.10)
-        ax.annotate(ev["label"] or ev["type"], xy=(at, ax.get_ylim()[1]),
-                    xytext=(3, -12), textcoords="offset points", fontsize=11,
-                    color=EVENT_COLOR, rotation=90, va="top")
-    _style_ax(ax, "Throughput over the full run (events marked)", "elapsed time (h:mm:ss)", "TPS")
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _p: _hms(v)))
-    ax.set_xlim(0, horizon)
-    ax.set_ylim(bottom=0)
+        ax.annotate(ev["label"] or ev["type"], xy=(at, 0.98),
+                    xycoords=("data", "axes fraction"), xytext=(3, 0),
+                    textcoords="offset points", fontsize=11, color=EVENT_COLOR,
+                    rotation=90, va="top")
     ax.legend(fontsize=10, loc="upper right")
     return fig_to_base64(fig)
 
@@ -129,7 +138,9 @@ def chart_event_zoom(summary: dict[str, Any], tl: dict[int, dict[str, Any]],
     xs = list(range(lo, hi + 1))
     if len(xs) < 2:
         return None
-    tps = [tl[o]["tps"] if o in tl else 0.0 for o in xs]
+    # Gaps (no sample) render as NaN so the line breaks — visually distinct from a
+    # present "0 TPS" second (load gen up, but no successful work).
+    tps = [tl[o]["tps"] if o in tl else float("nan") for o in xs]
     lat = [tl[o]["lat_p99"] if o in tl else float("nan") for o in xs]
     fig, ax = plt.subplots(figsize=(FIGSIZE[0], 4.6))
     ax.plot(xs, tps, color=MEAN_COLOR, linewidth=1.8, label="TPS")
@@ -167,9 +178,24 @@ def _read_env(env_dir: Path, name: str) -> str:
 
 
 def generate_soak_report(run_dir: Path) -> Path:
-    """(Re)generate soak_report.html for a soak run directory."""
+    """(Re)generate soak_report.html for a soak run directory.
+
+    Re-runs the analysis from the raw logs + events.jsonl (raw logs are the
+    source of truth), so events `mark`ed after the run are picked up on a plain
+    `report --run-dir`. Falls back to a stored summary if the spec/manifest are
+    unavailable.
+    """
+    from pgbench_harness import soak
+    from pgbench_harness.manifest import Manifest
+    from pgbench_harness.spec import load_spec
+
     run_dir = run_dir.resolve()
+    spec_path = run_dir / "spec.yaml"
     summary_path = run_dir / "parsed" / "soak_summary.json"
+    if spec_path.exists() and (run_dir / "manifest.json").exists():
+        manifest = Manifest.load(run_dir)
+        if manifest.soak:                       # refresh from raw logs + events.jsonl
+            soak.analyze(run_dir, load_spec(spec_path), manifest.soak)
     if not summary_path.exists():
         raise ReportError(f"no parsed/soak_summary.json in {run_dir}",
                           hint="is this a soak run directory?")

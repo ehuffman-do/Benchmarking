@@ -8,15 +8,21 @@ database/server environment, and produces a **self-contained HTML report**
 per run plus cross-run comparison reports.
 
 ```
+pgbench-harness validate    --spec run.yaml        # lint a spec without connecting (CI-friendly)
+pgbench-harness doctor                             # version, git SHA/remote, sysbench/psql availability
 pgbench-harness preflight   --spec run.yaml        # connectivity, version, limits checks
 pgbench-harness prepare     --spec run.yaml        # load the dataset (idempotent, records load metrics)
-pgbench-harness run         --spec run.yaml        # steady-state thread sweep, capture everything, report
-pgbench-harness soak        --spec soak.yaml       # resilience: fixed load through a failover/scale event
+pgbench-harness run         --spec run.yaml [--prepare]   # steady-state thread sweep + report
+pgbench-harness soak        --spec soak.yaml [--prepare]  # resilience: fixed load through a failover/scale event
 pgbench-harness mark        --run-dir results/<run_id> --type failover --label "..."  # stamp an event on a soak
 pgbench-harness report      --run-dir results/<run_id>/   # regenerate the HTML report (sweep or soak)
 pgbench-harness compare     --runs <run_id> <run_id> --out compare.html
 pgbench-harness list        [--results-dir results/]
 ```
+
+`--prepare` on `run`/`soak` loads the dataset first if it's missing (prepare-then-run in
+one command). A long `soak` can be stopped with Ctrl-C (or `kill`/SIGTERM) and still
+finalizes a partial resilience report.
 
 There are two run modes, chosen by the spec: a **`sweep`** section → steady-state
 thread sweep (`run`); a **`soak`** section → fixed-concurrency resilience run

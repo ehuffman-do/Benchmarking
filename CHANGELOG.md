@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.0
+
+### Soak/resilience bug fixes (from a full audit)
+- **Recovery near the window end / closely-spaced events no longer false-negatives.**
+  TTR/full-recovery clamped the sustain check to the seconds actually available, so a
+  healthy tail shorter than `recovery_hold_s` (or an event near the end) is no longer
+  reported as "never recovered".
+- **Degenerate baseline is detected, not silently zero.** If the baseline window is too
+  early/falls in a gap (e.g. an event in the first seconds), recovery / latency-spike /
+  missed-vs-baseline are reported as "n/a" with a clear warning, instead of garbage or 0.
+  The auto baseline window is now strictly *before* the first event.
+- **`loadgen_restart` supervisor markers are no longer treated as user events** (no bogus
+  per-event metrics/zoom); they render as faint markers on the overview only.
+- Supervisor: short-segment hot-loop guard; relaunch cap counts relaunches (not segments);
+  coverage no longer exceeds 100%.
+- Report: event labels positioned correctly; instant-recovery (0s) handled; per-event zoom
+  shows gaps as line breaks (distinct from a present 0 TPS); `report --run-dir` re-analyzes
+  from raw logs so events `mark`ed after a run are picked up.
+
+### New
+- **`validate`** — lint a spec without connecting (CI-friendly).
+- **`doctor`** — print version, git SHA/remote and sysbench/psql availability.
+- **`run --prepare` / `soak --prepare`** — load the dataset first if missing (prepare-then-run
+  in one command; replaces the overnight watcher script).
+- **Graceful stop for soak** — SIGINT/SIGTERM finalizes a partial resilience report from the
+  captured logs instead of leaving the run stuck.
+
 ## 0.5.0
 
 ### Resilience / soak mode (Phase 1) — failover & scaling measurement
