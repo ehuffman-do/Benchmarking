@@ -5,9 +5,17 @@ Knobs (env vars):
   FAKE_SYSBENCH_FAIL_THREADS  comma-separated thread counts whose `run` fails
                               with the worker-init FATAL and exit code 1.
   FAKE_SYSBENCH_COUNT_FILE    file to append one line per `run` invocation.
+  FAKE_SYSBENCH_FAIL_FIRST_N  fail the first N `run` invocations (across the
+                              whole process group) with a connection-lost FATAL,
+                              then succeed — simulates a transient outage that a
+                              retry rides out. Requires FAKE_PSQL_STATE.
+  FAKE_SYSBENCH_HANG          if set, `run` prints the startup banner then sleeps
+                              forever (no interval lines) — exercises the
+                              harness stall watchdog.
 """
 import os
 import sys
+import time
 
 args = sys.argv[1:]
 
@@ -56,6 +64,23 @@ if threads in fail_threads:
     print("FATAL: PQsetdbLogin() failed: ERROR:  no more connections allowed (max_client_conn)")
     print("FATAL: Worker threads failed to initialize within 30 seconds!")
     sys.exit(1)
+
+fail_first_n = int(os.environ.get("FAKE_SYSBENCH_FAIL_FIRST_N", "0"))
+if fail_first_n and os.environ.get("FAKE_PSQL_STATE"):
+    counter = os.path.join(os.environ["FAKE_PSQL_STATE"], "run_attempts")
+    with open(counter, "a+") as fh:
+        fh.seek(0)
+        n = int(fh.read().strip() or "0") + 1
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(n))
+    if n <= fail_first_n:
+        print("FATAL: PQexec() failed: 7 server closed the connection unexpectedly")
+        print("FATAL: failed to execute function `event': 3")
+        sys.exit(1)
+
+if os.environ.get("FAKE_SYSBENCH_HANG"):
+    time.sleep(3600)
 
 print("Threads started!\n")
 base_tps = 100.0 * threads

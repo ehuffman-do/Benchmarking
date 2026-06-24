@@ -1,0 +1,51 @@
+# Segmented soak / endurance spec (single concurrency, repeated 1-hour segments).
+#
+# This is the week-long consitency test:
+#   - one thread level
+#   - each repetition is its own level -> own raw log, summary row, histogram,
+#     and bgwriter delta, and is crash-resumable (`run --resume`) per segment.
+run:
+  label: "consistency test: 1 week long run"
+  edition: advanced          
+  tshirt_size: 8c32g           
+  notes: "7-day run to test the consistency of db"
+
+target:
+  host: private-mydb.db.ondigitalocean.com  
+  port: 5432                                 # default for advanced
+  database: defaultdb
+  user: doadmin
+  password_env: PGB_TARGET_PASSWORD        
+  sslmode: require
+
+# TODO: add a simple "size" field that we transform into GB or MB
+workload:
+  type: oltp_read_write
+  tables: 16
+  # ~10 GB target: 16 tables x 2,000,000 rows ~= 32M rows ~= ~10 GB
+  table_size: 2000000
+  extra_args: ["--rate=300"]
+
+sweep:
+  threads: [16]
+  duration_s: 900       # 15-min segments: a single failover costs at most ~15 min of
+                        # re-run (a retry re-runs the whole segment), and availability
+                        # is resolved to 15-min granularity instead of 1 hour.
+  warmup_s: 60          # discard the first 60s of each segment (cold cache / ramp)
+  cooldown_s: 0
+  repetitions: 672      # 672 x 15 min = 7 days
+  retries: 5            # ride out transient faults (e.g. managed-DB failover): a segment
+                        # is run up to 1 + retries times before it counts as an outage.
+  retry_wait_s: 180     # before each retry, poll up to 3 min for the primary to accept
+                        # writes again (SHOW transaction_read_only -> off) post-failover.
+
+capture:
+  pg_settings: true
+  pg_stat_statements: auto
+  bgwriter_stats: true
+  histogram: true
+
+report:
+  percentiles: [50, 95, 99]
+  timeseries_levels: [16]   # must match a value in sweep.threads
+  variance_warn_pct: 10     

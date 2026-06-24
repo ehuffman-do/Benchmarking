@@ -138,6 +138,62 @@ def test_failed_level_continues_and_marks_partial(
     assert "max_client_conn" in html
 
 
+def _write_spec(tmp_path: Path, **sweep_overrides: object) -> Path:
+    """Write a spec with sweep overrides (e.g. retries) to disk; return its path."""
+    import yaml
+
+    from conftest import make_spec_doc
+    doc = make_spec_doc(sweep={**make_spec_doc()["sweep"], **sweep_overrides})
+    # Keep report.timeseries_levels consistent with any overridden thread ladder.
+    threads = doc["sweep"]["threads"]
+    doc["report"]["timeseries_levels"] = [t for t in doc["report"]["timeseries_levels"]
+                                          if t in threads]
+    path = tmp_path / "retry.yaml"
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    return path
+
+
+def test_transient_failure_auto_recovers_with_retries(
+    fake_env, results_dir, monkeypatch, tmp_path
+) -> None:
+    """A level that fails once then succeeds is retried and ends `ok` (run stays
+    complete), recording its attempt count — the failover-resilience path."""
+    spec_file = _write_spec(tmp_path, retries=2, retry_wait_s=0)
+    monkeypatch.setenv("FAKE_SYSBENCH_FAIL_FIRST_N", "1")  # only the first attempt fails
+    rc = run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir))
+    assert rc == 0  # complete, not partial — the retry rode out the blip
+    run_dir = find_run_dir(results_dir)
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    by_key = {(l["rep"], l["threads"]): l for l in manifest["levels"]}
+    first = by_key[(1, 1)]
+    assert first["status"] == "ok"
+    assert first["attempts"] == 2  # failed once, recovered on the retry
+    assert all(l["attempts"] == 1 for k, l in by_key.items() if k != (1, 1))
+    # The failed attempt's log is preserved for forensics.
+    assert (run_dir / "raw" / "rep1_t001.attempt1.log").exists()
+    html = (run_dir / "report.html").read_text()
+    assert "Availability" in html
+    assert "auto-recovered" in html.lower()
+
+
+def test_exhausted_retries_records_incident(
+    fake_env, results_dir, monkeypatch, tmp_path
+) -> None:
+    """When every attempt fails, the level is `failed` after 1+retries tries and
+    the report shows it as an outage incident."""
+    spec_file = _write_spec(tmp_path, threads=[1], repetitions=3, retries=1, retry_wait_s=0)
+    monkeypatch.setenv("FAKE_SYSBENCH_FAIL_THREADS", "1")  # every attempt fails
+    rc = run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir))
+    assert rc == 1  # partial/failed
+    run_dir = find_run_dir(results_dir)
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert all(l["status"] == "failed" and l["attempts"] == 2 for l in manifest["levels"])
+    html = (run_dir / "report.html").read_text()
+    assert "Availability &amp; incidents" in html
+    assert "Outage incidents" in html
+
+
 def test_resume_completes_only_remaining_levels(
     fake_env, spec_file, results_dir, monkeypatch, tmp_path
 ) -> None:

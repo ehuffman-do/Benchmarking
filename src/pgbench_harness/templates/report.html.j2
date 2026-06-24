@@ -22,7 +22,9 @@
 
 <main>
 <div class="toc">
-  <a href="#overview">Overview</a><a href="#headline">Headline results</a>
+  <a href="#overview">Overview</a>
+  {% if availability.total_segments > 1 %}<a href="#availability">Availability</a>{% endif %}
+  <a href="#headline">Headline results</a>
   <a href="#throughput">Throughput</a><a href="#latency">Latency</a>
   <a href="#stability">Stability</a><a href="#errors">Errors &amp; limits</a>
   <a href="#config">Configuration</a>
@@ -39,6 +41,11 @@
   <div class="kpi {% if kpis.failed_levels or kpis.total_errors %}bad{% endif %}">
     <div class="v">{{ kpis.failed_levels }} / {{ "{:,.0f}".format(kpis.total_errors) }}</div>
     <div class="k">Failed levels / SQL errors</div></div>
+  {% if availability.total_segments > 1 %}
+  <div class="kpi {% if availability.failed_segments %}bad{% endif %}">
+    <div class="v">{{ "%.2f" | format(availability.availability_pct) }}<small> %</small></div>
+    <div class="k">Availability · {{ availability.ok_segments }}/{{ availability.total_segments }} segments</div></div>
+  {% endif %}
 </div>
 {% endif %}
 
@@ -89,8 +96,52 @@
   (p{{ percentiles | join(", p") }}) are interpolated from the <code>--histogram</code> latency distribution.
 </div>
 
-{# ── 2. Headline table ──────────────────────────────────────────── #}
-<h2 id="headline"><span class="secno">2</span>Headline results</h2>
+{# ── 2. Availability & incidents (soak runs) ────────────────────── #}
+{% if availability.total_segments > 1 %}
+<h2 id="availability"><span class="secno">2</span>Availability &amp; incidents</h2>
+<div class="card soft">
+  <div class="meta-grid">
+    <div><b>Availability:</b> {{ "%.2f" | format(availability.availability_pct) }}%
+      ({{ availability.ok_segments }}/{{ availability.total_segments }} segments of
+      {{ availability.segment_s }}s healthy)</div>
+    <div><b>Failed segments:</b> {{ availability.failed_segments }}</div>
+    <div><b>Auto-recovered segments:</b> {{ availability.recovered_segments }}
+      <span class="subtle">(succeeded only after a retry)</span></div>
+    <div><b>Approx. cumulative downtime:</b> {{ fmt_duration(availability.approx_downtime_s) }}</div>
+  </div>
+  <p class="subtle" style="margin-bottom:0">A segment is "healthy" if sysbench ultimately
+    succeeded for that time slice (after up to {{ spec.sweep.retries }} retr{{ "y" if spec.sweep.retries == 1 else "ies" }}).
+    Downtime is approximated as failed segments × {{ availability.segment_s }}s.</p>
+</div>
+{% if availability.incidents %}
+<h3>Outage incidents ({{ availability.incidents | length }})</h3>
+<table>
+  <tr><th>Started (UTC)</th><th>Ended (UTC)</th><th>Segments</th><th>Approx. duration</th><th>First error (verbatim)</th></tr>
+  {% for inc in availability.incidents %}
+  <tr class="fail">
+    <td>{{ inc.start_utc or "n/a" }}</td><td>{{ inc.end_utc or "n/a" }}</td>
+    <td>{{ inc.segments }}</td><td>{{ inc.approx_minutes }} min</td>
+    <td style="text-align:left"><pre style="margin:0">{{ (inc.error_excerpt or "no error captured") | truncate(160) }}</pre></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if availability.recovered %}
+<h3>Auto-recovered segments ({{ availability.recovered | length }})</h3>
+<table>
+  <tr><th>Rep</th><th>Threads</th><th>Attempts</th><th>Finished (UTC)</th></tr>
+  {% for l in availability.recovered %}
+  <tr><td>{{ l.rep }}</td><td>{{ l.threads }}</td><td>{{ l.attempts }}</td><td>{{ l.finished_utc or "n/a" }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if not availability.incidents and not availability.recovered %}
+<p>No outages or retries — every segment succeeded on the first attempt.</p>
+{% endif %}
+{% endif %}
+
+{# ── 3. Headline table ──────────────────────────────────────────── #}
+<h2 id="headline"><span class="secno">3</span>Headline results</h2>
 <table>
   <tr>
     <th>Threads</th><th>QPS (mean)</th><th>TPS (mean)</th>
@@ -122,16 +173,16 @@
 {{ spec.report.variance_warn_pct }}% (report.variance_warn_pct).</p>
 
 {# ── 3. Throughput charts ───────────────────────────────────────── #}
-<h2 id="throughput"><span class="secno">3</span>Throughput</h2>
+<h2 id="throughput"><span class="secno">4</span>Throughput</h2>
 {% if charts.qps %}<div class="chart"><img alt="QPS vs threads" src="{{ charts.qps }}"></div>{% else %}<p class="subtle">No successful levels to chart.</p>{% endif %}
 {% if charts.tps %}<div class="chart"><img alt="TPS vs threads" src="{{ charts.tps }}"></div>{% endif %}
 
 {# ── 4. Latency chart ───────────────────────────────────────────── #}
-<h2 id="latency"><span class="secno">4</span>Latency</h2>
+<h2 id="latency"><span class="secno">5</span>Latency</h2>
 {% if charts.latency %}<div class="chart"><img alt="Latency percentiles vs threads" src="{{ charts.latency }}"></div>{% else %}<p class="subtle">No latency data to chart.</p>{% endif %}
 
 {# ── 5. Stability charts ────────────────────────────────────────── #}
-<h2 id="stability"><span class="secno">5</span>Stability (QPS over time)</h2>
+<h2 id="stability"><span class="secno">6</span>Stability (QPS over time)</h2>
 {% if charts.timeseries %}
   {% for ts in charts.timeseries %}
     {% if ts.img %}<div class="chart"><img alt="QPS over time at {{ ts.threads }} threads" src="{{ ts.img }}"></div>
@@ -142,7 +193,7 @@
 {% endif %}
 
 {# ── 6. Errors & limits ─────────────────────────────────────────── #}
-<h2 id="errors"><span class="secno">6</span>Errors &amp; limits</h2>
+<h2 id="errors"><span class="secno">7</span>Errors &amp; limits</h2>
 {% if errors.failed_levels %}
 <h3>Failed levels</h3>
 <table>
@@ -168,7 +219,7 @@
 {% endif %}
 
 {# ── 7. Configuration appendix ──────────────────────────────────── #}
-<h2 id="config"><span class="secno">7</span>Configuration appendix</h2>
+<h2 id="config"><span class="secno">8</span>Configuration appendix</h2>
 <h3>Key settings</h3>
 <table>
   <tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr>

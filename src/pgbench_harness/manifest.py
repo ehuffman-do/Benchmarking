@@ -33,6 +33,7 @@ class Level:
     exit_code: Optional[int] = None
     error_excerpt: str = ""
     raw_log: str = ""
+    attempts: int = 1  # 1 = succeeded (or failed) first try; >1 = retried after failure(s)
 
     @property
     def key(self) -> str:

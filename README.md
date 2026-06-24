@@ -124,6 +124,12 @@ sweep:
                                           # aggregate — no separate warmup process runs
   cooldown_s: 120                         # optional (default 0); sleep between levels
   repetitions: 2                          # optional (default 1); full ladder repeated N times
+  retries: 0                              # optional (default 0); extra attempts per level on
+                                          # failure — rides out transient faults like a managed
+                                          # failover (a level runs up to 1 + retries times)
+  retry_wait_s: 30                        # optional (default 30); before each retry, poll up to
+                                          # this many seconds for the target to accept writes
+                                          # again (SHOW transaction_read_only -> off)
 
 capture:                                  # whole section optional
   pg_settings: true                       # default true; full pg_settings CSV dump
@@ -213,6 +219,28 @@ snapshot post-level stats → sleep `cooldown_s`.
   `FATAL: Worker threads failed to initialize`) is recorded with its verbatim
   error lines in the manifest, and the sweep **continues**; the run is marked
   `partial`. One bad level never destroys hours of prior results.
+* **Automatic retry on transient failures (e.g. failover).** With
+  `sweep.retries > 0`, a level that fails (non-zero exit *or* a watchdog kill)
+  is retried up to `retries` more times. Before each retry the harness preserves
+  the failed attempt's log as `raw/<key>.attemptN.log` and **waits up to
+  `retry_wait_s` for the target to accept writes again** (`SHOW
+  transaction_read_only` → `off`), so the retry is not wasted hitting a
+  still-read-only standby mid-promotion. A level that recovers ends up `ok`
+  (the run can still be `complete`) and records its `attempts` count. This is
+  the recommended setting for long soak runs that must survive routine
+  maintenance/failover events. A retry re-runs the **whole** level, so prefer
+  shorter segments (smaller `duration_s` × higher `repetitions`) to keep a
+  single retry cheap.
+* **Watchdog.** Each `run` attempt is supervised: if sysbench emits no output
+  for ~120s (with `--report-interval=1` a healthy run prints a line every
+  second) or overruns `duration_s` by more than ~180s, it is terminated and the
+  attempt is treated as a failure (so the retry/`partial` logic takes over). A
+  network black-hole or a connection torn out mid-failover can no longer hang an
+  unattended week-long run forever.
+* **Availability reporting.** For multi-segment soak runs the report adds an
+  *Availability & incidents* section: the fraction of segments that were healthy,
+  approximate cumulative downtime, a timeline of outage incidents (contiguous
+  failed segments), and a list of segments that auto-recovered after a retry.
 * `manifest.json` is rewritten atomically after every level, making the run
   crash-resumable (`run --resume`).
 * `run --dry-run` prints the exact sysbench command per level and the planned
@@ -294,7 +322,10 @@ resume logic, spec validation, and the password-leak test.
 
 * **Resume semantics:** `failed` levels count as completed and are not
   retried by `--resume` — a recorded failure is a result. Start a fresh run
-  (or hand-edit the manifest entry back to `pending`) to retry one.
+  (or hand-edit the manifest entry back to `pending`) to retry one. This is
+  distinct from in-run retries (`sweep.retries`): those happen *within* a single
+  run, before a level is ever recorded as `failed`; once the attempts are
+  exhausted and the failure is recorded, `--resume` leaves it alone.
 * **Prepare parallelism:** `prepare` uses `min(16, max(sweep.threads))`
   sysbench threads.
 * **Dataset check:** tpcc creates 9 tables per table-set, so the expected

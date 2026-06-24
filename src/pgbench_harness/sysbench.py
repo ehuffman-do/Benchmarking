@@ -12,9 +12,15 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+# Exit code returned when the harness watchdog aborts an attempt (mirrors the
+# conventional 124 used by coreutils `timeout`).
+WATCHDOG_EXIT_CODE = 124
 
 from pgbench_harness.errors import RunError
 from pgbench_harness.spec import Spec
@@ -99,18 +105,100 @@ def build_prepare_command(spec: Spec) -> SysbenchCommand:
     return SysbenchCommand(argv=tuple(argv), cwd=cwd)
 
 
+class _Watchdog:
+    """Kills a child process that stalls or overruns its time budget.
+
+    A long unattended soak must never hang forever: ``--time`` only bounds a
+    cooperative sysbench, but a network black-hole or a connection torn out
+    mid-failover can leave the process blocked well past its deadline. The
+    watchdog runs in a daemon thread and terminates the child when either:
+
+    * no output line has arrived for ``stall_timeout_s`` (the process is wedged
+      — with ``--report-interval=1`` a healthy run emits a line every second), or
+    * total runtime exceeds ``hard_timeout_s`` (it is ignoring ``--time``).
+
+    When either timeout is ``None`` the corresponding check is disabled; with
+    both ``None`` the watchdog thread never starts (preserving prior behaviour
+    for quiet phases like ``prepare``).
+    """
+
+    def __init__(
+        self, proc: "subprocess.Popen[str]", stall_timeout_s: Optional[float],
+        hard_timeout_s: Optional[float], logger: logging.Logger,
+    ) -> None:
+        self._proc = proc
+        self._stall = stall_timeout_s
+        self._hard = hard_timeout_s
+        self._logger = logger
+        self._lock = threading.Lock()
+        self._start = time.monotonic()
+        self._last_beat = self._start
+        self._killed_reason: Optional[str] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        if stall_timeout_s or hard_timeout_s:
+            self._thread = threading.Thread(target=self._watch, daemon=True)
+            self._thread.start()
+
+    def beat(self) -> None:
+        """Record that a line of output just arrived."""
+        with self._lock:
+            self._last_beat = time.monotonic()
+
+    def _watch(self) -> None:
+        while not self._stop.wait(2.0):
+            now = time.monotonic()
+            with self._lock:
+                since_line = now - self._last_beat
+            elapsed = now - self._start
+            reason: Optional[str] = None
+            if self._hard and elapsed > self._hard:
+                reason = f"exceeded hard time limit of {int(self._hard)}s"
+            elif self._stall and since_line > self._stall:
+                reason = (f"no output for {int(since_line)}s "
+                          f"(stall limit {int(self._stall)}s)")
+            if reason:
+                self._killed_reason = reason
+                self._logger.error("watchdog: terminating sysbench — %s", reason)
+                self._terminate()
+                return
+
+    def _terminate(self) -> None:
+        try:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        except Exception:  # pragma: no cover - best-effort kill
+            pass
+
+    def finish(self) -> Optional[str]:
+        """Stop the watchdog thread; return the kill reason if it fired."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        return self._killed_reason
+
+
 def run_streaming(
     cmd: SysbenchCommand,
     env: dict[str, str],
     log_path: Path,
     logger: logging.Logger,
     heartbeat_every: int = 60,
+    stall_timeout_s: Optional[float] = None,
+    hard_timeout_s: Optional[float] = None,
 ) -> int:
     """Run *cmd*, teeing stdout+stderr line-buffered to *log_path* live.
 
     Every line is flushed to the raw log immediately so logs are inspectable
     mid-run; a heartbeat (the latest line) goes to the harness logger every
-    *heartbeat_every* lines. Returns the process exit code.
+    *heartbeat_every* lines. If *stall_timeout_s* or *hard_timeout_s* is set, a
+    watchdog terminates a wedged/overrunning child; in that case a ``FATAL:``
+    marker is appended to the log and :data:`WATCHDOG_EXIT_CODE` is returned (so
+    callers treat it as a failed attempt). Otherwise returns the process exit
+    code.
     """
     redact = get_redactor().redact
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +217,7 @@ def run_streaming(
             f"could not execute '{cmd.argv[0]}': {exc}",
             hint="install sysbench (see README) and re-run preflight.",
         ) from exc
+    watchdog = _Watchdog(proc, stall_timeout_s, hard_timeout_s, logger)
     lines_seen = 0
     with open(log_path, "w", encoding="utf-8") as log:
         assert proc.stdout is not None
@@ -136,9 +225,16 @@ def run_streaming(
             log.write(redact(line))
             log.flush()
             lines_seen += 1
+            watchdog.beat()
             if lines_seen % heartbeat_every == 0:
                 logger.info("    %s", redact(line.rstrip()))
-    return proc.wait()
+        rc = proc.wait()
+        reason = watchdog.finish()
+        if reason:
+            log.write(f"FATAL: harness watchdog aborted this attempt: {reason}\n")
+            log.flush()
+            return WATCHDOG_EXIT_CODE  # terminate yields a signal code; normalize it
+    return rc
 
 
 def sysbench_version() -> str:

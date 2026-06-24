@@ -198,23 +198,82 @@ def _init_run(
     return run_dir, manifest
 
 
+# Watchdog budget for a single sysbench `run` attempt, derived from duration_s:
+# a healthy run emits a per-second interval line, so prolonged silence or a gross
+# overrun of `--time` means the process is wedged and must be killed.
+_WATCHDOG_STALL_S = 120          # no output line for this long -> stalled
+_WATCHDOG_HARD_GRACE_S = 180     # allowed overrun past duration_s before a hard kill
+
+
+def _watchdog_timeouts(spec: Spec) -> tuple[float, float]:
+    """(stall_timeout_s, hard_timeout_s) for one sysbench `run` attempt."""
+    return float(_WATCHDOG_STALL_S), float(spec.sweep.duration_s + _WATCHDOG_HARD_GRACE_S)
+
+
+def _run_one_attempt(
+    spec: Spec, password: str, run_dir: Path, raw_rel: str, lvl: Level,
+    logger: logging.Logger,
+) -> int:
+    """Run sysbench once for *lvl*, returning its (or the watchdog's) exit code."""
+    cmd = sysbench.build_run_command(spec, lvl.threads)
+    logger.info("level %s (attempt %d): %s", lvl.key, lvl.attempts, cmd.display())
+    stall_s, hard_s = _watchdog_timeouts(spec)
+    return sysbench.run_streaming(
+        cmd, sysbench.child_env(spec, password), run_dir / raw_rel, logger,
+        stall_timeout_s=stall_s, hard_timeout_s=hard_s,
+    )
+
+
+def _level_error_excerpt(run_dir: Path, raw_rel: str, rc: int) -> str:
+    """Verbatim error lines from the attempt log, or a generic exit-code message."""
+    from pgbench_harness.parser import parse_log_file
+    errs = parse_log_file(run_dir / raw_rel).error_lines
+    return "\n".join(errs[:5]) or f"sysbench exited with code {rc}"
+
+
 def _execute_level(
     spec: Spec, password: str, run_dir: Path, manifest: Manifest,
     lvl: Level, logger: logging.Logger,
 ) -> None:
-    """Run one (rep, threads) level: stats snapshots, sysbench, outcome bookkeeping."""
+    """Run one (rep, threads) level with retries: a failed attempt is preserved,
+    the harness waits for the target to accept writes again, and re-runs — so a
+    transient outage (e.g. a managed-database failover) is ridden out rather than
+    recorded as a permanent failure. The level ends ``ok`` if any attempt
+    succeeds, ``failed`` only after all attempts are exhausted.
+    """
     raw_rel = f"raw/{lvl.key}.log"
     lvl.raw_log = raw_rel
     lvl.status = STATUS_RUNNING
     lvl.started_utc = utc_now_iso()
+    lvl.attempts = 0
     manifest.save(run_dir)
     if spec.capture.bgwriter_stats:
         pre = capture.snapshot_bgwriter(spec, password)
-    cmd = sysbench.build_run_command(spec, lvl.threads)
-    logger.info("level %s: %s", lvl.key, cmd.display())
-    rc = sysbench.run_streaming(
-        cmd, sysbench.child_env(spec, password), run_dir / raw_rel, logger)
-    lvl.exit_code = rc
+    max_attempts = 1 + spec.sweep.retries
+    rc = 1
+    while lvl.attempts < max_attempts:
+        lvl.attempts += 1
+        rc = _run_one_attempt(spec, password, run_dir, raw_rel, lvl, logger)
+        lvl.exit_code = rc
+        if rc == 0:
+            break
+        excerpt = _level_error_excerpt(run_dir, raw_rel, rc)
+        if lvl.attempts < max_attempts:
+            # Preserve this failed attempt's log, then wait for the primary to
+            # accept writes again before the next attempt (post-failover window).
+            attempt_log = run_dir / "raw" / f"{lvl.key}.attempt{lvl.attempts}.log"
+            shutil.copy(run_dir / raw_rel, attempt_log)
+            logger.warning(
+                "level %s attempt %d/%d FAILED (exit %d): %s — preserved as %s; retrying",
+                lvl.key, lvl.attempts, max_attempts, rc,
+                excerpt.splitlines()[0], attempt_log.name)
+            writable = capture.wait_until_writable(
+                spec, password, spec.sweep.retry_wait_s, logger)
+            if not writable:
+                logger.warning(
+                    "level %s: target still not accepting writes after %ds; "
+                    "retrying anyway", lvl.key, spec.sweep.retry_wait_s)
+            manifest.save(run_dir)
     lvl.finished_utc = utc_now_iso()
     if spec.capture.bgwriter_stats:
         post = capture.snapshot_bgwriter(spec, password)
@@ -224,14 +283,18 @@ def _execute_level(
         )
     if rc == 0:
         lvl.status = STATUS_OK
-        logger.info("level %s: OK", lvl.key)
+        if lvl.attempts > 1:
+            logger.info("level %s: OK (auto-recovered after %d attempts)",
+                        lvl.key, lvl.attempts)
+        else:
+            logger.info("level %s: OK", lvl.key)
     else:
-        from pgbench_harness.parser import parse_log_file
-        errs = parse_log_file(run_dir / raw_rel).error_lines
         lvl.status = STATUS_FAILED
-        lvl.error_excerpt = "\n".join(errs[:5]) or f"sysbench exited with code {rc}"
-        logger.error("level %s FAILED (exit %d): %s — continuing with remaining levels",
-                     lvl.key, rc, lvl.error_excerpt.splitlines()[0])
+        lvl.error_excerpt = _level_error_excerpt(run_dir, raw_rel, rc)
+        logger.error(
+            "level %s FAILED after %d attempt(s) (exit %d): %s — "
+            "continuing with remaining levels",
+            lvl.key, lvl.attempts, rc, lvl.error_excerpt.splitlines()[0])
     manifest.save(run_dir)
 
 

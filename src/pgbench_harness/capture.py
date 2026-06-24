@@ -137,6 +137,32 @@ def psql_query_soft(spec: Spec, password: str, sql: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def wait_until_writable(
+    spec: Spec, password: str, timeout_s: float, logger: logging.Logger,
+    poll_interval_s: float = 5.0,
+) -> bool:
+    """Poll ``SHOW transaction_read_only`` until the target accepts writes.
+
+    Returns True as soon as the primary reports ``off`` (writable), or False if
+    ``timeout_s`` elapses while it is still read-only or unreachable. Used between
+    failed-level retries so a retry is not wasted hitting a still-read-only
+    standby mid-promotion during a managed-database failover. Always probes at
+    least once, even when ``timeout_s`` is 0.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        ok, out = psql_query_soft(spec, password, "SHOW transaction_read_only")
+        if ok and out.strip().lower() == "off":
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        logger.info("waiting up to %.0fs for target to accept writes "
+                    "(transaction_read_only=%s) ...",
+                    remaining, out.strip() if ok else "unreachable")
+        time.sleep(min(poll_interval_s, remaining))
+
+
 def psql_version() -> str:
     """Return `psql --version` output, raising PreflightError if missing."""
     try:

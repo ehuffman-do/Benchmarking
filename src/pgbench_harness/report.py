@@ -231,6 +231,64 @@ def build_error_sections(summary: dict[str, Any], samples: list[dict[str, Any]])
     }
 
 
+def build_availability(summary: dict[str, Any], spec: Spec) -> dict[str, Any]:
+    """Treat each segment (a level) as a slice of wall-clock and report uptime.
+
+    For a soak run the customer-facing question is "how much of the week was the
+    database healthy?", not peak throughput. Every level that ultimately
+    succeeded counts as available time (segments that auto-recovered after a
+    retry are available but flagged); every level that exhausted its retries is
+    counted as an outage. Consecutive failed segments are grouped into incidents
+    with an approximate duration (segments x duration_s).
+    """
+    levels = summary["levels"]
+    total = len(levels)
+    seg_s = spec.sweep.duration_s
+    ok = [l for l in levels if l["status"] == STATUS_OK]
+    recovered = [l for l in ok if (l.get("attempts") or 1) > 1]
+    failed = [l for l in levels if l["status"] != STATUS_OK]
+    # Group consecutive failed segments (in execution order) into incidents.
+    incidents: list[dict[str, Any]] = []
+    run_start: Optional[dict[str, Any]] = None
+    run_len = 0
+    for lvl in levels:
+        if lvl["status"] != STATUS_OK:
+            run_start = run_start or lvl
+            run_len += 1
+            last = lvl
+        elif run_len:
+            incidents.append(_incident(run_start, last, run_len, seg_s))
+            run_start, run_len = None, 0
+    if run_len:
+        incidents.append(_incident(run_start, last, run_len, seg_s))
+    avail_pct = (len(ok) / total * 100.0) if total else 0.0
+    return {
+        "total_segments": total,
+        "segment_s": seg_s,
+        "ok_segments": len(ok),
+        "failed_segments": len(failed),
+        "recovered_segments": len(recovered),
+        "recovered": recovered,
+        "availability_pct": avail_pct,
+        "approx_downtime_s": len(failed) * seg_s,
+        "incidents": incidents,
+    }
+
+
+def _incident(first: dict[str, Any], last: dict[str, Any], segments: int,
+              seg_s: int) -> dict[str, Any]:
+    """One contiguous outage: span of failed segments and an approx duration."""
+    excerpt = next((l.get("error_excerpt") for l in (first, last)
+                    if l.get("error_excerpt")), None)
+    return {
+        "start_utc": first.get("started_utc"),
+        "end_utc": last.get("finished_utc"),
+        "segments": segments,
+        "approx_minutes": round(segments * seg_s / 60.0, 1),
+        "error_excerpt": excerpt,
+    }
+
+
 def build_kpis(headline: list[dict[str, Any]], summary: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Headline KPI cards: peak throughput, latency at peak, error totals."""
     ok_rows = [r for r in headline if "qps" in r]
@@ -308,6 +366,7 @@ def generate_report(run_dir: Path) -> Path:
         percentiles=summary.get("percentiles", [50, 95, 99]),
         headline=headline,
         kpis=build_kpis(headline, summary),
+        availability=build_availability(summary, spec),
         prepare_stats=load_prepare_stats(env_dir),
         warnings=manifest.preflight.get("warnings", []),
         errors=build_error_sections(summary, samples),
@@ -324,6 +383,7 @@ def generate_report(run_dir: Path) -> Path:
         },
         wall_time=fmt_duration(manifest.wall_time_s) if manifest.wall_time_s else "n/a",
         steady_window=f"{spec.sweep.warmup_s}s – {spec.sweep.duration_s}s",
+        fmt_duration=fmt_duration,
     )
     out = run_dir / "report.html"
     out.write_text(html, encoding="utf-8")

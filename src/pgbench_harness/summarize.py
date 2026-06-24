@@ -84,6 +84,9 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
         entry: dict[str, Any] = {
             "rep": lvl.rep, "threads": lvl.threads, "status": lvl.status,
             "error_excerpt": lvl.error_excerpt or None,
+            "attempts": lvl.attempts,
+            "started_utc": lvl.started_utc or None,
+            "finished_utc": lvl.finished_utc or None,
         }
         log_path = run_dir / lvl.raw_log if lvl.raw_log else None
         if log_path is not None and log_path.exists():

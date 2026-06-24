@@ -75,6 +75,10 @@ elif "show server_version" in low:
     print("16.4")
 elif "show max_connections" in low:
     print("500")
+elif "show transaction_read_only" in low:
+    # Default writable ("off"); FAKE_PSQL_READ_ONLY=on simulates a standby
+    # that has not finished promotion (so retries wait for it).
+    print(os.environ.get("FAKE_PSQL_READ_ONLY", "off"))
 elif "show pool_mode" in low:
     print('ERROR:  unrecognized configuration parameter "pool_mode"', file=sys.stderr)
     sys.exit(1)
