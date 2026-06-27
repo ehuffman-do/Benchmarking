@@ -84,9 +84,18 @@ MIGRATIONS: list[tuple[int, str]] = [
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    """Open SQLite with WAL + foreign keys + row access by name."""
+    """Open SQLite with WAL + foreign keys + row access by name.
+
+    ``check_same_thread=False``: FastAPI runs sync route dependencies in an
+    anyio threadpool, so a per-request connection's setup (create) and teardown
+    (close) can run on *different* worker threads. Each connection is still used
+    sequentially within a single request — never shared concurrently — so
+    disabling the same-thread guard is safe and avoids
+    ``SQLite objects created in a thread can only be used in that same thread``.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None,
+                           check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
