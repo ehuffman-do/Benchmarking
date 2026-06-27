@@ -8,6 +8,7 @@ executes — so bouncing this process never interrupts a run.
 from __future__ import annotations
 
 import base64
+import difflib
 import io
 import json
 import sqlite3
@@ -24,7 +25,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from pgbench_webapp import __version__, harness_api, index, queries
+from pgbench_webapp import __version__, harness_api, index, notify, provider, queries
 from pgbench_webapp.config import Config, ensure_dirs, load_config
 from pgbench_webapp.db import connect, migrate
 from pgbench_webapp.secrets_store import SecretStore
@@ -213,6 +214,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             return RedirectResponse("/login", status_code=303)
         presets = {p.stem: p.read_text() for p in sorted((_PKG / "presets").glob("*.yaml"))} \
             if (_PKG / "presets").exists() else {}
+        for t in queries.list_templates(conn):     # saved templates appear in the dropdown
+            row = queries.get_template(conn, t["name"])
+            if row:
+                presets[f"template: {t['name']}"] = row["spec_yaml"]
         return page(request, "new.html", user, presets=presets,
                     can_run=ROLE_RANK.get(user["role"], 0) >= ROLE_RANK["operator"])
 
@@ -405,6 +410,127 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return Response(buf.getvalue(), media_type="text/csv",
                         headers={"Content-Disposition": 'attachment; filename="audit.csv"'})
 
+    # ── admin settings: notifications + provider metrics (secrets server-side) ──
+    @app.get("/admin/settings", response_class=HTMLResponse)
+    def settings_page(request: Request, conn: sqlite3.Connection = Depends(get_conn),
+                      user: sqlite3.Row = Depends(require("admin"))) -> Response:
+        nc = notify.get_config(conn)
+        return page(request, "admin_settings.html", user,
+                    notify_cfg=nc, base_url=queries.get_setting(conn, "base_url", ""),
+                    do_cluster=queries.get_setting(conn, "do_cluster_id", ""),
+                    has_smtp_pw=bool(store.get(notify.SMTP_PASSWORD_REF)),
+                    has_slack=bool(store.get(notify.SLACK_WEBHOOK_REF)),
+                    has_do_token=bool(store.get(provider.DO_TOKEN_REF)))
+
+    @app.post("/admin/settings")
+    def settings_save(request: Request, conn: sqlite3.Connection = Depends(get_conn),
+                      user: sqlite3.Row = Depends(require("admin")),
+                      csrf_token: str = Form(""), base_url: str = Form(""),
+                      smtp_host: str = Form(""), smtp_port: str = Form("587"),
+                      smtp_user: str = Form(""), smtp_from: str = Form(""),
+                      smtp_to: str = Form(""), smtp_tls: str = Form("on"),
+                      smtp_password: str = Form(""), slack_enabled: str = Form(""),
+                      slack_webhook: str = Form(""), do_cluster_id: str = Form(""),
+                      do_api_token: str = Form("")) -> Response:
+        _check_csrf(request, csrf_token)
+        notify.set_config(conn, {
+            "smtp": {"host": smtp_host, "port": int(smtp_port or 587), "user": smtp_user,
+                     "from": smtp_from, "to": smtp_to, "tls": smtp_tls == "on"},
+            "slack": {"enabled": slack_enabled == "on"}})
+        queries.set_setting(conn, "base_url", base_url)
+        queries.set_setting(conn, "do_cluster_id", do_cluster_id)
+        # Secrets only updated when a new value is supplied (blank leaves as-is).
+        if smtp_password:
+            store.set(notify.SMTP_PASSWORD_REF, smtp_password)
+        if slack_webhook:
+            store.set(notify.SLACK_WEBHOOK_REF, slack_webhook)
+        if do_api_token:
+            store.set(provider.DO_TOKEN_REF, do_api_token)
+        queries.audit(conn, user["username"], "settings_update",
+                      detail="notifications/provider config changed")
+        return RedirectResponse("/admin/settings", status_code=303)
+
+    @app.post("/api/notify/test")
+    def notify_test(conn: sqlite3.Connection = Depends(get_conn),
+                    user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        sent = notify.notify(conn, store, state="test", run_id=None,
+                             label="notification test", peak_qps=None)
+        return JSONResponse({"sent": sent})
+
+    # ── config templates (versioned) + spec diff ──
+    @app.post("/api/templates")
+    def template_save(request: Request, payload: dict,
+                      conn: sqlite3.Connection = Depends(get_conn),
+                      user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
+        name, spec_yaml = payload.get("name", "").strip(), payload.get("spec_yaml", "")
+        if not name:
+            raise HTTPException(400, "template name required")
+        v = harness_api.validate_yaml(spec_yaml)
+        if not v.get("ok"):
+            raise HTTPException(400, v.get("error", "invalid spec"))
+        ver = queries.save_template(conn, name, spec_yaml, user["username"])
+        queries.audit(conn, user["username"], "template_save", target=name, detail=f"v{ver}")
+        return JSONResponse({"name": name, "version": ver})
+
+    @app.get("/api/templates")
+    def templates_list(conn: sqlite3.Connection = Depends(get_conn),
+                       user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        return JSONResponse([{"name": r["name"], "version": r["version"]}
+                             for r in queries.list_templates(conn)])
+
+    @app.get("/api/templates/{name}")
+    def template_get(name: str, conn: sqlite3.Connection = Depends(get_conn),
+                     user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        row = queries.get_template(conn, name)
+        if row is None:
+            raise HTTPException(404, "template not found")
+        return JSONResponse({"name": row["name"], "version": row["version"],
+                             "spec_yaml": row["spec_yaml"]})
+
+    def _spec_text(conn: sqlite3.Connection, ref: str) -> str:
+        """Resolve a diff ref to spec YAML. ref = run_id or template:NAME."""
+        if ref.startswith("template:"):
+            row = queries.get_template(conn, ref.split(":", 1)[1])
+            if row is None:
+                raise HTTPException(404, f"template not found: {ref}")
+            return str(row["spec_yaml"])
+        p = cfg.results_dir / ref / "spec.yaml"
+        if not p.exists():
+            raise HTTPException(404, f"spec not found: {ref}")
+        return p.read_text(encoding="utf-8")
+
+    @app.get("/api/diff")
+    def spec_diff(a: str, b: str, conn: sqlite3.Connection = Depends(get_conn),
+                  user: sqlite3.Row = Depends(require("viewer"))) -> Response:
+        diff = difflib.unified_diff(_spec_text(conn, a).splitlines(),
+                                    _spec_text(conn, b).splitlines(),
+                                    fromfile=a, tofile=b, lineterm="")
+        return PlainTextResponse("\n".join(diff) or "(specs are identical)")
+
+    # ── provider (DigitalOcean) metrics for a run window ──
+    @app.get("/runs/{run_id}/provider-metrics")
+    def run_provider_metrics(run_id: str, conn: sqlite3.Connection = Depends(get_conn),
+                             user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        run_dir = cfg.results_dir / run_id
+        cached = run_dir / "env" / "provider_metrics.json"
+        if cached.exists():
+            return JSONResponse(json.loads(cached.read_text()))
+        if not provider.configured(conn, store):
+            return JSONResponse({"available": False,
+                                 "reason": "no DO token/cluster configured (engine-side only)"})
+        man = run_dir / "manifest.json"
+        if not man.exists():
+            raise HTTPException(404, "run not found")
+        m = json.loads(man.read_text())
+        data = provider.fetch_metrics(conn, store, queries.get_setting(conn, "do_cluster_id", ""),
+                                      _epoch(m.get("created_utc")), _epoch(m.get("finished_utc")))
+        if data is None:
+            return JSONResponse({"available": False, "reason": "provider fetch failed"})
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        cached.write_text(json.dumps(data))
+        return JSONResponse(data)
+
 
 def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]:
     """Server-sent events: stream harness.log tail + latest samples until terminal.
@@ -432,6 +558,17 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
 
 def _event(name: str, data: Any) -> str:
     return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+
+def _epoch(iso: Optional[str]) -> int:
+    """Parse a UTC ISO string (second precision) to epoch seconds; 0 if absent."""
+    if not iso:
+        return 0
+    try:
+        return int(datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")
+                   .replace(tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return 0
 
 
 def _run_status(run_dir: Path) -> str:

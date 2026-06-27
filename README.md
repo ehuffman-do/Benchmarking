@@ -381,6 +381,14 @@ sudo ./deploy.sh                 # fresh install (or: sudo ./deploy.sh --update)
   injected into the child env at run time exactly as the CLI does.
 - **Live view:** per-second TPS chart + log tail over SSE that catches up on
   reconnect; soak event markers land the instant you click "Mark failover".
+- **Notifications, scheduling, templates:** opt-in SMTP/Slack alerts on run
+  completion/failure (secrets encrypted, configured on the admin **Settings**
+  page, with a "send test" button); queue a run for a future UTC time; save the
+  current spec as a versioned **template** and diff any two specs.
+- **Provider metrics (DigitalOcean):** with a DO API token (stored encrypted)
+  and cluster id, the app fetches device-side metrics for a run's UTC window at
+  `/runs/<id>/provider-metrics`, complementing the engine-side IOPS proxy;
+  degrades cleanly to engine-side only when unconfigured.
 
 Install, update, cert-trust, firewall, backup, RBAC, and troubleshooting are
 documented in **[OPERATIONS.md](OPERATIONS.md)**. Data lives under

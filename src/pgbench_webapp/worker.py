@@ -110,14 +110,18 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
 
 
 def _notify(cfg: Config, conn: sqlite3.Connection, job_id: int, state: str, run_id: Optional[str]) -> None:
-    """Best-effort completion notification. Never raises (never fails a run).
-
-    SMTP/Slack delivery is a documented seam — config lives in settings and the
-    hook is wired here so adding delivery is additive.
-    """
+    """Best-effort completion record + SMTP/Slack notification. Never raises."""
     try:
         queries.audit(conn, None, f"job_{state}", target=run_id or f"job:{job_id}",
                       detail="worker finished job")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from pgbench_webapp import notify as _n
+        run = queries.get_run(conn, run_id) if run_id else None
+        _n.notify(conn, _store(cfg), state=state, run_id=run_id,
+                  label=(run["label"] if run else ""),
+                  peak_qps=(run["peak_qps"] if run else None))
     except Exception:  # noqa: BLE001  (notifications must never break a run)
         pass
 

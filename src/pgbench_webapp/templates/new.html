@@ -29,6 +29,15 @@
     <label>DB password (stored encrypted, never written to spec/DB/report)
       <input id="g_password" type="password" autocomplete="off"></label>
     <p class="muted">Injected as <code>PGB_TARGET_PASSWORD</code> at run time only.</p>
+    <hr>
+    <label>Start at (UTC, optional — leave blank to run now)
+      <input id="g_schedule" placeholder="2026-06-25T14:30:00Z"></label>
+    <div class="row">
+      <label>Save current spec as template
+        <input id="tpl_name" placeholder="template name"></label>
+      <button class="link" id="save_tpl" style="align-self:end">Save template</button>
+    </div>
+    <span id="tpl_out" class="muted"></span>
   </div>
 
   <div class="card">

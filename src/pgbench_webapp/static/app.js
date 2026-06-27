@@ -86,10 +86,32 @@ function initNewRun() {
     e.preventDefault();
     const out = $("validate_out");
     try {
-      const d = await postJSON("/api/runs", {
-        spec_yaml: $("spec").value, password: $("g_password").value, csrf_token: CSRF });
+      await postJSON("/api/runs", {
+        spec_yaml: $("spec").value, password: $("g_password").value,
+        scheduled_utc: ($("g_schedule").value || "").trim() || null, csrf_token: CSRF });
       window.location = "/";
     } catch (err) { out.className = "out bad"; out.textContent = "could not start: " + err.message; }
+  });
+  if ($("save_tpl")) $("save_tpl").addEventListener("click", async (e) => {
+    e.preventDefault();
+    const out = $("tpl_out");
+    try {
+      const d = await postJSON("/api/templates",
+        { name: $("tpl_name").value, spec_yaml: $("spec").value, csrf_token: CSRF });
+      out.textContent = `saved template “${d.name}” v${d.version}`;
+    } catch (err) { out.textContent = "error: " + err.message; }
+  });
+}
+
+function initSettings() {
+  const b = $("notify_test"); if (!b) return;
+  b.addEventListener("click", async () => {
+    const out = $("notify_test_out");
+    try {
+      const d = await postJSON("/api/notify/test", {});
+      out.textContent = d.sent.length ? "sent via: " + d.sent.join(", ")
+                                      : "nothing configured (no channels)";
+    } catch (e) { out.textContent = e.message; }
   });
 }
 
@@ -186,4 +208,4 @@ function initCompare() {
   });
 }
 
-initNewRun(); initCancel(); initDetail(); initCompare();
+initNewRun(); initCancel(); initDetail(); initCompare(); initSettings();

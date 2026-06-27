@@ -455,7 +455,8 @@ ensure_secret_key() {
     ok "Secret key already present (left untouched)."
   else
     info "Generating ${SECRET_KEY} (0600) — used to encrypt stored secrets."
-    ( umask 077; openssl rand -base64 48 >"${SECRET_KEY}" )
+    # Must be a valid Fernet key: url-safe base64 of exactly 32 bytes (44 chars).
+    ( umask 077; openssl rand -base64 32 | tr '+/' '-_' >"${SECRET_KEY}" )
     chown "${SVC_USER}:${SVC_GROUP}" "${SECRET_KEY}"
     chmod 0600 "${SECRET_KEY}"
     ok "Secret key created. BACK THIS UP (see OPERATIONS.md)."

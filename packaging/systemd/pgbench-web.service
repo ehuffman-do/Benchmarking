@@ -24,6 +24,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+UMask=0077
 ReadWritePaths=/var/lib/pgbench-harness /var/log/pgbench-harness
 # Binding 8443 (>1024) needs no extra capability, but be explicit:
 AmbientCapabilities=

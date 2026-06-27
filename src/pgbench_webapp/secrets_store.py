@@ -18,15 +18,50 @@ from typing import Optional
 from cryptography.fernet import Fernet, InvalidToken
 
 
-def _load_key(key_path: Path) -> bytes:
-    if key_path.exists():
-        return key_path.read_bytes().strip()
-    key = Fernet.generate_key()
+def _is_valid_fernet_key(raw: bytes) -> bool:
+    try:
+        Fernet(raw)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _has_secrets(store_path: Path) -> bool:
+    if not store_path.exists():
+        return False
+    try:
+        return bool(json.loads(store_path.read_text(encoding="utf-8")))
+    except (ValueError, OSError):
+        return False
+
+
+def _write_key(key_path: Path, key: bytes) -> None:
     key_path.parent.mkdir(parents=True, exist_ok=True)
-    # Write 0600 from the start (umask-safe): open with restrictive mode.
     fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as fh:
         fh.write(key)
+
+
+def _load_key(key_path: Path, store_path: Path) -> bytes:
+    """Load the Fernet key, generating a valid one if missing.
+
+    If an existing key file is NOT a valid Fernet key (e.g. an installer wrote
+    ``openssl rand -base64 48`` instead of a url-safe 32-byte key), self-heal by
+    regenerating it — but ONLY when no secrets have been encrypted yet. If
+    encrypted secrets already exist under a bad key, refuse loudly rather than
+    silently orphaning them (restore the real key from backup).
+    """
+    if key_path.exists():
+        raw = key_path.read_bytes().strip()
+        if _is_valid_fernet_key(raw):
+            return raw
+        if _has_secrets(store_path):
+            raise ValueError(
+                f"{key_path} is not a valid Fernet key but encrypted secrets exist in "
+                f"{store_path}. Restore the original secret.key from backup (see OPERATIONS.md).")
+        # No secrets yet: replace the bad key with a valid one.
+    key = Fernet.generate_key()
+    _write_key(key_path, key)
     return key
 
 
@@ -34,7 +69,7 @@ class SecretStore:
     """Reference-keyed encrypted store. The DB holds only the reference names."""
 
     def __init__(self, key_path: Path, store_path: Path) -> None:
-        self._fernet = Fernet(_load_key(key_path))
+        self._fernet = Fernet(_load_key(key_path, store_path))
         self._path = store_path
 
     def _read(self) -> dict[str, str]:
