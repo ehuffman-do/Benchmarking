@@ -14,7 +14,7 @@
     <a href="/">History</a>
     <a href="/new">New run</a>
     <a href="/compare">Compare</a>
-    {% if role == 'admin' %}<a href="/admin/users">Users</a><a href="/audit">Audit</a>{% endif %}
+    {% if role == 'admin' %}<a href="/admin/users">Users</a><a href="/admin/settings">Settings</a><a href="/audit">Audit</a>{% endif %}
   </nav>
   <div class="who">
     <span class="role role-{{ role }}">{{ role }}</span> {{ user }}

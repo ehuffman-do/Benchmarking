@@ -4,6 +4,7 @@ fake sysbench/psql), reports, soak+mark, audit, and the extended secrets-leak ga
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import warnings
@@ -105,6 +106,27 @@ def test_migrations_idempotent(tmp_path):
 def test_health_no_auth(web):
     client, _ = web
     assert client.get("/healthz").json()["status"] == "ok"
+
+
+def test_secret_store_self_heals_invalid_key(tmp_path):
+    """A non-Fernet key file (e.g. installer wrote raw base64-48) self-heals when
+    no secrets exist yet, but refuses (no silent orphaning) once secrets are stored."""
+    from pgbench_webapp.secrets_store import SecretStore
+    kp, sp = tmp_path / "secret.key", tmp_path / "secrets.enc"
+    kp.write_bytes(b"not-a-valid-fernet-key")          # what the buggy installer wrote
+    store = SecretStore(kp, sp)                          # regenerates a valid key
+    store.set("db", "pw"); assert store.get("db") == "pw"
+    kp.write_bytes(b"corrupt-now")                       # key broken but secrets exist
+    with pytest.raises(ValueError, match="not a valid Fernet key"):
+        SecretStore(kp, sp)
+
+
+def test_installer_keygen_is_fernet_valid():
+    """`openssl rand -base64 32 | tr +/ -_` must be a usable Fernet key (deploy.sh)."""
+    import subprocess
+    from cryptography.fernet import Fernet
+    key = subprocess.check_output("openssl rand -base64 32 | tr '+/' '-_'", shell=True).strip()
+    Fernet(key)   # raises if invalid
 
 
 # ── auth / RBAC ─────────────────────────────────────────────────────
@@ -212,6 +234,135 @@ def test_secret_never_leaks_anywhere(web):
 
 
 # ── reconciliation: CLI-created runs show up ────────────────────────
+
+def _conn_store(cfg):
+    from pgbench_webapp.db import connect
+    from pgbench_webapp.secrets_store import SecretStore
+    return connect(cfg.db_path), SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+
+
+# ── notifications ───────────────────────────────────────────────────
+
+def test_notifications_smtp_and_slack(web, monkeypatch):
+    client, cfg = web
+    from pgbench_webapp import notify
+    conn, store = _conn_store(cfg)
+    notify.set_config(conn, {"smtp": {"host": "smtp.x", "port": 587, "user": "u",
+                                      "from": "a@x", "to": "b@x", "tls": True},
+                             "slack": {"enabled": True}})
+    store.set(notify.SMTP_PASSWORD_REF, "smtp-pass")
+    store.set(notify.SLACK_WEBHOOK_REF, "https://hooks.slack/xyz")
+
+    sent_mail, slack_calls = [], []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=0): sent_mail.append((host, port))
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def starttls(self): pass
+        def login(self, u, p): sent_mail.append(("login", u))
+        def send_message(self, m): sent_mail.append(("msg", m["Subject"]))
+
+    monkeypatch.setattr(notify.smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(notify.urllib.request, "urlopen",
+                        lambda req, timeout=0: slack_calls.append(req.full_url) or _Closeable())
+    sent = notify.notify(conn, store, state="complete", run_id="r1", label="lbl", peak_qps=123)
+    assert set(sent) == {"email", "slack"}
+    assert any(c == ("msg", "[pgbench-harness] lbl — complete") for c in sent_mail)
+    assert slack_calls == ["https://hooks.slack/xyz"]
+
+
+def test_notifications_best_effort_swallow(web, monkeypatch):
+    client, cfg = web
+    from pgbench_webapp import notify
+    conn, store = _conn_store(cfg)
+    notify.set_config(conn, {"slack": {"enabled": True}})
+    store.set(notify.SLACK_WEBHOOK_REF, "https://hooks.slack/xyz")
+
+    def boom(*a, **k):
+        raise OSError("network down")
+    monkeypatch.setattr(notify.urllib.request, "urlopen", boom)
+    assert notify.notify(conn, store, state="failed", run_id=None, label="x") == []  # no raise
+
+
+# ── scheduling ──────────────────────────────────────────────────────
+
+def test_scheduled_future_job_not_claimed(web):
+    client, cfg = web
+    future = "2999-01-01T00:00:00Z"
+    r = client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "scheduled_utc": future},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    conn = connect(cfg.db_path)
+    assert queries.claim_next_job(conn, 1) is None    # not due yet
+    conn.close()
+
+
+# ── templates + spec diff ───────────────────────────────────────────
+
+def test_templates_and_diff(web):
+    client, cfg = web
+    spec = _spec_yaml()
+    assert client.post("/api/templates", json={"name": "t1", "spec_yaml": spec},
+                       auth=("viewer", "vpw")).status_code == 403     # viewer can't save
+    assert client.post("/api/templates", json={"name": "t1", "spec_yaml": spec},
+                       auth=("op", "oppw")).json()["version"] == 1
+    assert client.post("/api/templates", json={"name": "t1", "spec_yaml": spec},
+                       auth=("op", "oppw")).json()["version"] == 2     # versioned
+    names = [t["name"] for t in client.get("/api/templates", auth=("viewer", "vpw")).json()]
+    assert "t1" in names
+    assert "label: web-test" in client.get("/api/templates/t1", auth=("viewer", "vpw")).json()["spec_yaml"]
+    # diff two template versions / a tweaked spec
+    spec2 = spec.replace("tshirt_size: 4c16g", "tshirt_size: 8c32g")
+    client.post("/api/templates", json={"name": "t2", "spec_yaml": spec2}, auth=("op", "oppw"))
+    diff = client.get("/api/diff?a=template:t1&b=template:t2", auth=("viewer", "vpw")).text
+    assert "-  tshirt_size: 4c16g" in diff or "tshirt_size: 4c16g" in diff
+
+
+# ── provider metrics ────────────────────────────────────────────────
+
+def test_provider_metrics_degraded_without_token(web):
+    client, cfg = web
+    rd = cfg.results_dir / "r-prov"
+    rd.mkdir(parents=True)
+    (rd / "manifest.json").write_text('{"run_id":"r-prov","status":"complete",'
+                                      '"created_utc":"2026-01-01T00:00:00Z","finished_utc":"2026-01-01T00:10:00Z"}')
+    d = client.get("/runs/r-prov/provider-metrics", auth=("viewer", "vpw")).json()
+    assert d["available"] is False
+
+
+def test_provider_fetch_mocked_no_token_leak(web, monkeypatch, tmp_path):
+    client, cfg = web
+    from pgbench_webapp import provider, queries
+    conn, store = _conn_store(cfg)
+    store.set(provider.DO_TOKEN_REF, "do-secret-token-XYZ")
+    queries.set_setting(conn, "do_cluster_id", "abc-123")
+    monkeypatch.setattr(provider, "_get", lambda url, token, timeout=15: {"data": {"cpu": [1, 2, 3]}})
+    data = provider.fetch_metrics(conn, store, "abc-123", 1000, 2000)
+    assert data and data["source"] == "digitalocean" and data["metrics"]["cpu"]
+    out = json.dumps(data)
+    assert "do-secret-token-XYZ" not in out      # token never in the stored payload
+
+
+def test_settings_save_keeps_secrets_off_db(web):
+    client, cfg = web
+    r = client.post("/admin/settings", data={
+        "csrf_token": "", "base_url": "https://h:8443", "do_cluster_id": "c1",
+        "do_api_token": "do-tok-SECRET", "slack_webhook": "https://hooks/secret",
+        "smtp_host": "", "smtp_port": "587"}, auth=("admin", "apw"))
+    assert r.status_code in (200, 303)
+    from pgbench_webapp import provider, notify
+    _, store = _conn_store(cfg)
+    assert store.get(provider.DO_TOKEN_REF) == "do-tok-SECRET"
+    assert b"do-tok-SECRET" not in cfg.db_path.read_bytes()        # not in DB
+    assert b"do-tok-SECRET" not in (cfg.data_dir / "secrets.enc").read_bytes()  # encrypted
+
+
+class _Closeable:
+    def close(self): pass
+
 
 def test_reconcile_indexes_filesystem(web, tmp_path):
     client, cfg = web

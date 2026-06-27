@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Settings — pgbench-harness{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<p class="muted">Secrets (SMTP password, Slack webhook, DO API token) are stored
+encrypted server-side and never shown back. Leave a secret field blank to keep
+the current value.</p>
+<form method="post" action="/admin/settings" class="card">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <label>App base URL (for report links in notifications)
+    <input name="base_url" value="{{ base_url }}" placeholder="https://104.236.206.15:8443"></label>
+
+  <h2>Email (SMTP)</h2>
+  <div class="row">
+    <label>Host <input name="smtp_host" value="{{ notify_cfg.smtp.host if notify_cfg.smtp else '' }}"></label>
+    <label>Port <input name="smtp_port" value="{{ notify_cfg.smtp.port if notify_cfg.smtp else 587 }}"></label>
+  </div>
+  <div class="row">
+    <label>User <input name="smtp_user" value="{{ notify_cfg.smtp.user if notify_cfg.smtp else '' }}"></label>
+    <label>From <input name="smtp_from" value="{{ notify_cfg.smtp.from if notify_cfg.smtp else '' }}"></label>
+  </div>
+  <label>To <input name="smtp_to" value="{{ notify_cfg.smtp.to if notify_cfg.smtp else '' }}"></label>
+  <label><input type="checkbox" name="smtp_tls" {% if not notify_cfg.smtp or notify_cfg.smtp.tls %}checked{% endif %}> Use STARTTLS</label>
+  <label>SMTP password {% if has_smtp_pw %}<span class="muted">(set — leave blank to keep)</span>{% endif %}
+    <input name="smtp_password" type="password" autocomplete="off"></label>
+
+  <h2>Slack</h2>
+  <label><input type="checkbox" name="slack_enabled" {% if notify_cfg.slack and notify_cfg.slack.enabled %}checked{% endif %}> Enabled</label>
+  <label>Webhook URL {% if has_slack %}<span class="muted">(set — leave blank to keep)</span>{% endif %}
+    <input name="slack_webhook" type="password" autocomplete="off"></label>
+
+  <h2>DigitalOcean provider metrics</h2>
+  <label>Cluster / host id <input name="do_cluster_id" value="{{ do_cluster }}"></label>
+  <label>API token {% if has_do_token %}<span class="muted">(set — leave blank to keep)</span>{% endif %}
+    <input name="do_api_token" type="password" autocomplete="off"></label>
+
+  <div class="actions">
+    <button class="primary">Save settings</button>
+    <button class="link" id="notify_test" type="button">Send test notification</button>
+    <span id="notify_test_out" class="muted"></span>
+  </div>
+</form>
+<script>window.CSRF = "{{ csrf }}";</script>
+{% endblock %}

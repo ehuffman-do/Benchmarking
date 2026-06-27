@@ -28,12 +28,15 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=false
+UMask=0077
 ReadWritePaths=/var/lib/pgbench-harness /var/log/pgbench-harness
+RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
 ProtectControlGroups=true
 ProtectKernelModules=true
+ProtectKernelTunables=true
 
 [Install]
 WantedBy=multi-user.target

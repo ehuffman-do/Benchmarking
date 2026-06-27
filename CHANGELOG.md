@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.8.0
+
+### Web app: more of the deferred Part-C capabilities
+- **Notifications (SMTP + Slack):** best-effort completion/failure alerts with
+  run label, status, peak QPS, and a report link. Config + secrets (SMTP
+  password, Slack webhook) set in an admin **Settings** page; secrets are stored
+  encrypted (never in DB/logs/artifacts). A "send test notification" button.
+  Delivery never blocks or fails a run.
+- **Scheduling:** a run can be queued for a future UTC time ("start at"); the
+  worker only claims it once due (max-concurrency guard already enforced).
+- **Config templates (versioned) + spec diff:** save the current spec as a named
+  template (auto-versioned), instantiate it from the New-run dropdown, and diff
+  any two specs/templates (`/api/diff`, unified diff).
+- **DigitalOcean provider-metrics hook:** fetch device-side metrics for a run's
+  UTC window via the DO API (token stored encrypted; cluster id in Settings),
+  cached per run and exposed at `/runs/<id>/provider-metrics`; degrades cleanly
+  to engine-side only when unconfigured. (Verify the DO metric path against
+  current DO API docs; overlay-on-static-report is still a follow-up.)
+- **systemd hardening:** `UMask=0077` on both units; worker gains
+  `RestrictNamespaces` / `ProtectKernelTunables` parity.
+
+Still deferred (clean seams): multi-loadgen SSH orchestration, interactive
+inline charts in the *downloadable* report, a full per-field guided form, and
+cron-recurring schedules.
+
+## 0.7.1
+
+### Fix: web services failed to start on a real install (invalid Fernet key)
+- `deploy.sh` generated `secret.key` with `openssl rand -base64 48` (standard
+  base64, 48 bytes), which is not a valid Fernet key, so `pgbench-web`/
+  `pgbench-worker` crashed at startup (`Fernet key must be 32 url-safe
+  base64-encoded bytes`). The installer now writes a valid key
+  (`openssl rand -base64 32 | tr '+/' '-_'`).
+- The secret store now **self-heals**: an invalid key file is regenerated when
+  no secrets are encrypted yet, and refused with a clear message (rather than
+  silently orphaning data) when secrets already exist. Recover an affected
+  install by deleting `secret.key` and restarting the services.
+
 ## 0.7.0
 
 ### Self-hosted web application (new `pgbench_webapp` package)
