@@ -97,10 +97,10 @@ def _resolve_run_dir(token: str, results_dir: Path) -> Path:
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
-    from pgbench_harness.compare import generate_compare
+    from pgbench_harness.compare import compare_runs
 
     dirs = [_resolve_run_dir(t, args.results_dir) for t in args.runs]
-    out = generate_compare(dirs, args.out)
+    out = compare_runs(dirs, args.out)   # dispatches sweep vs soak; refuses mixed types
     print(f"comparison report written: {out}")
     return 0
 

@@ -27,6 +27,12 @@ export function Compare() {
     setSel(next);
   }
 
+  // Compare is only meaningful within one run type (sweep-vs-sweep or soak-vs-soak).
+  const selModes = useMemo(
+    () => new Set((runs ?? []).filter((r) => sel.has(r.run_id)).map((r) => r.mode)),
+    [runs, sel]);
+  const mixed = selModes.size > 1;
+
   if (viewing) {
     return (
       <>
@@ -47,7 +53,9 @@ export function Compare() {
       <div className="toolbar">
         <h1>Compare runs</h1><div className="spacer" />
         <span className="subtle">{sel.size} selected</span>
-        <button className="primary" disabled={sel.size < 2} onClick={() => setViewing([...sel])}>
+        {mixed && <span className="subtle" style={{ color: "var(--bad, #c0392b)" }}>
+          same type only (sweep or soak)</span>}
+        <button className="primary" disabled={sel.size < 2 || mixed} onClick={() => setViewing([...sel])}>
           Compare selected
         </button>
       </div>

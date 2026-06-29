@@ -20,7 +20,3 @@ secrets.enc
 secret.key
 certs/
 frontend/*.tsbuildinfo
-
-# stray captured logs
-*.log
-pgbouncer-*.log
