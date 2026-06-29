@@ -752,6 +752,11 @@ def test_interactive_report_summary_and_csv(web):
     assert body.status_code == 200
     j = body.json()
     assert j["mode"] in ("sweep", "soak") and "manifest" in j and "summary" in j
+    # B6: the interactive report gets the captured DB config (curated key settings
+    # + a full list for "show all"), reaching parity with the classic report.
+    ps = j["pg_settings"]
+    assert ps and any(r["name"] == "shared_buffers" for r in ps["key"])
+    assert len(ps["all"]) >= len(ps["key"]) > 0
     # CSV export (samples present for a sweep run); bad name -> 400; missing run -> 404
     csv = client.get(f"/runs/{run_id}/csv?which=samples", auth=("viewer", "vpw"))
     assert csv.status_code == 200 and "t_offset" in csv.text

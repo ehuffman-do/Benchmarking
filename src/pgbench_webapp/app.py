@@ -27,6 +27,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from pgbench_harness.capture import KEY_SETTINGS
 from pgbench_webapp import __version__, harness_api, index, notify, provider, queries
 from pgbench_webapp.config import Config, ensure_dirs, load_config
 from pgbench_webapp.db import connect, migrate
@@ -554,7 +555,8 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             except (ValueError, OSError):
                 summary = {}
         return JSONResponse({"mode": mode, "manifest": manifest, "summary": summary,
-                             "pg": (run_dir / "parsed" / "pg_timeseries.csv").exists()})
+                             "pg": (run_dir / "parsed" / "pg_timeseries.csv").exists(),
+                             "pg_settings": _read_pg_settings(run_dir)})
 
     _CSV_FILES = {"samples": "parsed/samples.csv",
                   "timeseries": "parsed/soak_timeseries.csv",
@@ -951,6 +953,26 @@ def _safe_segment(ref: str) -> str:
     if not ref or "/" in ref or "\\" in ref or ".." in ref or ref.startswith("."):
         raise HTTPException(400, f"invalid id: {ref!r}")
     return ref
+
+
+def _read_pg_settings(run_dir: Path) -> Optional[dict]:
+    """Captured pg_settings (env/pg_settings.csv) split into the curated key WAL/
+    checkpoint/memory settings + the full list (for a 'show all' expand) so the
+    interactive report reaches parity with the classic one. None if not captured."""
+    import csv as _csv
+    p = run_dir / "env" / "pg_settings.csv"
+    if not p.exists():
+        return None
+    rows: list[dict] = []
+    try:
+        with open(p, newline="", encoding="utf-8") as fh:
+            for r in _csv.DictReader(fh):
+                rows.append({"name": r.get("name", ""), "setting": r.get("setting", ""),
+                             "unit": (r.get("unit") or ""), "source": (r.get("source") or "")})
+    except OSError:
+        return None
+    keyset = set(KEY_SETTINGS)
+    return {"key": [r for r in rows if r["name"] in keyset], "all": rows}
 
 
 def _run_dir_safe(cfg: Config, run_id: str) -> Path:

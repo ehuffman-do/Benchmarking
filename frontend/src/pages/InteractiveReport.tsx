@@ -13,11 +13,13 @@ interface Level {
   lat_p99?: number | null;
   errors?: number | null;
 }
+interface Setting { name: string; setting: string; unit: string; source: string; }
 interface SummaryResp {
   mode: string;
   pg: boolean;
   manifest: Record<string, unknown> & { preflight?: Record<string, unknown> };
   summary: Record<string, unknown>;
+  pg_settings?: { key: Setting[]; all: Setting[] } | null;
 }
 
 const C = { qps: "#6ea8fe", tps: "#2dd4bf", p50: "#3fb950", p95: "#e0a93b", p99: "#f85149" };
@@ -48,7 +50,36 @@ export function InteractiveReport({ runId }: { runId: string }) {
 
   return data.mode === "soak"
     ? <SoakReport summary={data.summary} prov={prov} />
-    : <SweepReport summary={data.summary} prov={prov} />;
+    : <SweepReport summary={data.summary} prov={prov} pgSettings={data.pg_settings ?? null} />;
+}
+
+function PgSettings({ s }: { s: { key: Setting[]; all: Setting[] } | null }) {
+  if (!s || (!s.key.length && !s.all.length)) return null;
+  const fmt = (r: Setting) => `${r.setting}${r.unit ? " " + r.unit : ""}`;
+  const Row = (r: Setting) => (
+    <tr key={r.name}>
+      <td className="mono">{r.name}</td><td className="mono num">{fmt(r)}</td>
+      <td className="subtle">{r.source}</td>
+    </tr>
+  );
+  return (
+    <div className="card">
+      <div className="card-head"><h2>Database configuration</h2></div>
+      <table>
+        <thead><tr><th>Setting</th><th className="num">Value</th><th>Source</th></tr></thead>
+        <tbody>{(s.key.length ? s.key : s.all).map(Row)}</tbody>
+      </table>
+      {s.all.length > s.key.length && (
+        <details style={{ marginTop: 8 }}>
+          <summary className="subtle" style={{ cursor: "pointer" }}>Show all {s.all.length} settings</summary>
+          <table style={{ marginTop: 8 }}>
+            <thead><tr><th>Setting</th><th className="num">Value</th><th>Source</th></tr></thead>
+            <tbody>{s.all.map(Row)}</tbody>
+          </table>
+        </details>
+      )}
+    </div>
+  );
 }
 
 function Provenance({ prov }: { prov: [string, string][] }) {
@@ -64,7 +95,9 @@ function Provenance({ prov }: { prov: [string, string][] }) {
   );
 }
 
-function SweepReport({ summary, prov }: { summary: Record<string, unknown>; prov: [string, string][] }) {
+function SweepReport({ summary, prov, pgSettings }:
+  { summary: Record<string, unknown>; prov: [string, string][];
+    pgSettings: { key: Setting[]; all: Setting[] } | null }) {
   const levels = ((summary.levels as Level[]) || []).filter((l) => l.qps_avg != null);
   // aggregate by thread count (mean across reps)
   const byThreads = new Map<number, Level[]>();
@@ -120,6 +153,7 @@ function SweepReport({ summary, prov }: { summary: Record<string, unknown>; prov
           </tbody>
         </table>
       </div>
+      <PgSettings s={pgSettings} />
       <Provenance prov={prov} />
     </>
   );
