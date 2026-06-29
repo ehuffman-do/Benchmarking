@@ -138,12 +138,21 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                                     start_new_session=True)
             queries.update_job(conn, job["id"], pid=proc.pid)
             assert proc.stdout is not None
+            early_run_id: Optional[str] = None
             for line in proc.stdout:
                 red = redact(line)
                 logf.write(red)
                 logf.flush()
                 if len(head) < 400:        # enough to capture the early "run -> <dir>" line
                     head.append(red)
+                # Link the run to the job the instant the harness prints its run dir
+                # (the very first lines), so the UI can open the LIVE cockpit while
+                # the run is still going — not only after it finishes.
+                if early_run_id is None and kind in ("run", "soak"):
+                    rid = _parse_run_id(red, cfg.results_dir)
+                    if rid:
+                        early_run_id = rid
+                        queries.update_job(conn, job["id"], run_id=rid)
             rc = proc.wait()
 
         # Only run/soak produce a run directory. Prefer the id the harness printed
