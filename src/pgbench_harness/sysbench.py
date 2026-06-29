@@ -141,12 +141,14 @@ def run_streaming(
     log_path: Path,
     logger: logging.Logger,
     heartbeat_every: int = 60,
+    on_line: Optional[Callable[[str], None]] = None,
 ) -> int:
     """Run *cmd*, teeing stdout+stderr line-buffered to *log_path* live.
 
     Every line is flushed to the raw log immediately so logs are inspectable
     mid-run; a heartbeat (the latest line) goes to the harness logger every
-    *heartbeat_every* lines. Returns the process exit code.
+    *heartbeat_every* lines. *on_line*, if given, is called with each redacted
+    line so callers can stream a parsed series live. Returns the process exit code.
     """
     redact = get_redactor().redact
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,8 +171,14 @@ def run_streaming(
     with open(log_path, "w", encoding="utf-8") as log:
         assert proc.stdout is not None
         for line in proc.stdout:
-            log.write(redact(line))
+            red = redact(line)
+            log.write(red)
             log.flush()
+            if on_line is not None:
+                try:
+                    on_line(red)
+                except Exception:  # noqa: BLE001  a live-tap error must never kill the run
+                    pass
             lines_seen += 1
             if lines_seen % heartbeat_every == 0:
                 logger.info("    %s", redact(line.rstrip()))

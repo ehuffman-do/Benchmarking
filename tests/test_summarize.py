@@ -10,11 +10,28 @@ from pathlib import Path
 from pgbench_harness.manifest import STATUS_FAILED, STATUS_OK, Manifest, plan_levels
 from pgbench_harness.parser import parse_log_file
 from pgbench_harness.spec import parse_spec
-from pgbench_harness.summarize import summarize_level, write_parsed
+from pgbench_harness.summarize import IncrementalCsvWriter, summarize_level, write_parsed
 
 from conftest import make_spec_doc
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_incremental_csv_writer_appends_flushes_and_is_readable_mid_stream(tmp_path):
+    """The live cockpit writer must flush each row (readable mid-run) and write
+    the header exactly once across re-opens (so --resume keeps prior rows)."""
+    p = tmp_path / "live.csv"
+    w = IncrementalCsvWriter(p, ["a", "b"])
+    w.append([1, 2])
+    assert p.read_text().splitlines() == ["a,b", "1,2"]   # flushed before close
+    w.append([3, 4])
+    assert len(p.read_text().splitlines()) == 3
+    w.close()
+    w2 = IncrementalCsvWriter(p, ["a", "b"])              # re-open == resume
+    w2.append([5, 6])
+    w2.close()
+    lines = p.read_text().splitlines()
+    assert lines.count("a,b") == 1 and lines[-1] == "5,6" and len(lines) == 4
 
 
 def test_summarize_level_trims_warmup() -> None:

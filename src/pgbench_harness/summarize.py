@@ -25,6 +25,40 @@ SAMPLE_COLUMNS = [
 ]
 
 
+class IncrementalCsvWriter:
+    """Append-and-flush writer for the LIVE per-second series the SSE cockpit
+    tails (parsed/samples.csv, parsed/soak_timeseries.csv).
+
+    Deliberately NOT atomic_write_text: the SSE reader tails the whole file and
+    consumes only complete, newline-terminated rows, so per-row append+flush is
+    safe and gives the cockpit data from second one. The canonical file is still
+    rebuilt atomically at finalize (write_parsed / soak.analyze), which replaces
+    whatever the live writer produced — so finalize/resume/regenerate-from-raw
+    guarantees are untouched. Opens in append mode (header only when the file is
+    new/empty) so a --resume keeps prior rows visible until finalize.
+    """
+
+    def __init__(self, path: Path, columns: list[str]) -> None:
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fresh = (not path.exists()) or path.stat().st_size == 0
+        self._fh = open(path, "a", encoding="utf-8", newline="")
+        self._w = csv.writer(self._fh)
+        if fresh:
+            self._w.writerow(columns)
+            self._fh.flush()
+
+    def append(self, row: list[Any]) -> None:
+        self._w.writerow(row)
+        self._fh.flush()
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+
+
 def summarize_level(
     parsed: ParsedLog, spec: Spec, percentiles: tuple[int, ...]
 ) -> dict[str, Any]:

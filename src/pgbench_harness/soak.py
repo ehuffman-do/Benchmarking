@@ -28,6 +28,11 @@ from pgbench_harness.parser import parse_interval_line
 from pgbench_harness.spec import Spec
 from pgbench_harness.util import atomic_write_json, atomic_write_text, fmt_duration
 
+# Columns of parsed/soak_timeseries.csv. Shared so the live incremental writer
+# (runner._soak_supervisor) and the canonical finalize writer (_write_timeseries)
+# can never drift apart.
+TIMESERIES_COLUMNS = ["t", "ts_utc", "tps", "qps", "lat_p99", "err_s", "reconn_s", "threads", "seg"]
+
 EPS = 1e-9  # tps at/below this counts as "no successful transactions"
 MIN_BASELINE_SAMPLES = 5  # need at least this many clean pre-event samples to trust a baseline
 ANALYSIS_TYPES = ("failover", "scale_up", "scale_down", "note")  # loadgen_restart is internal
@@ -390,7 +395,7 @@ def _write_timeseries(run_dir: Path, tl: dict[int, dict[str, Any]], horizon: int
     """Full-resolution per-second series (present rows only) for overlay/export."""
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["t", "ts_utc", "tps", "qps", "lat_p99", "err_s", "reconn_s", "threads", "seg"])
+    w.writerow(TIMESERIES_COLUMNS)
     for o in sorted(tl):
         r = tl[o]
         w.writerow([o, r["ts_utc"], r["tps"], r["qps"], r["lat_p99"],

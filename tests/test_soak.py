@@ -276,6 +276,32 @@ def test_soak_segment_watchdog_kills_hung_child(fake_env, tmp_path, monkeypatch)
     assert segs and any(s.get("timed_out") for s in segs)
 
 
+def test_live_soak_callback_dedups_offsets(tmp_path) -> None:
+    """The live soak tap appends per-second rows keyed on read-time offset, with
+    build_timeline's first-seen-wins / non-negative dedup, so the live file
+    matches the canonical one at the finalize swap."""
+    from datetime import datetime, timezone
+
+    from pgbench_harness.runner import _live_soak_callback
+    from pgbench_harness.soak import TIMESERIES_COLUMNS
+    from pgbench_harness.summarize import IncrementalCsvWriter
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    live = IncrementalCsvWriter(tmp_path / "ts.csv", TIMESERIES_COLUMNS)
+    cb = _live_soak_callback(live, base, set(), "soak_seg01")
+    line = ("[ 1s ] thds: 4 tps: 10.00 qps: 200.00 (r/w/o: 100.00/66.00/34.00) "
+            "lat (ms,99%): 5.00 err/s 0.00 reconn/s: 0.00")
+    cb("2026-01-01T00:00:01.000000Z", line)   # offset 1
+    cb("2026-01-01T00:00:01.400000Z", line)   # rounds to offset 1 -> deduped
+    cb("2026-01-01T00:00:02.000000Z", line)   # offset 2
+    cb("non-iso", line)                         # unparseable ts -> ignored
+    live.close()
+    rows = (tmp_path / "ts.csv").read_text().splitlines()
+    assert rows[0].startswith("t,ts_utc")
+    assert len(rows) == 3                        # header + 2 unique offsets
+    assert rows[1].startswith("1,") and rows[2].startswith("2,")
+
+
 def test_soak_dry_run(fake_env, tmp_path, capsys) -> None:
     spec_path = tmp_path / "soak.yaml"
     spec_path.write_text(yaml.safe_dump(_soak_doc()), encoding="utf-8")

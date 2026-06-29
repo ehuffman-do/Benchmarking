@@ -40,6 +40,36 @@ def results_dir(tmp_path: Path) -> Path:
     return tmp_path / "results"
 
 
+def test_sweep_live_samples_written_during_run(fake_env, spec_file, results_dir) -> None:
+    """The cockpit's samples.csv is fed per-second DURING the sweep, not only at
+    finalize: after a level runs, the live file already holds parsed interval rows
+    (write_parsed later rebuilds the same file canonically)."""
+    assert run_cli("run", "--spec", str(spec_file), "--results-dir", str(results_dir)) == 0
+    run_dir = find_run_dir(results_dir)
+    samples = (run_dir / "parsed" / "samples.csv").read_text().splitlines()
+    assert samples[0].split(",")[:4] == ["run_id", "rep", "threads", "t_offset"]
+    assert len(samples) > 1                       # real per-second rows, not just '--'
+
+
+def test_run_streaming_on_line_fires_per_line(fake_env, spec_file) -> None:
+    """run_streaming delivers each line to the on_line tap as the child runs (the
+    hook that drives live per-second charts), before the process exits."""
+    import logging
+
+    from pgbench_harness import sysbench
+    from pgbench_harness.parser import parse_interval_line
+    from pgbench_harness.spec import load_spec
+
+    spec = load_spec(spec_file)
+    seen: list[str] = []
+    cmd = sysbench.build_run_command(spec, 1)
+    rc = sysbench.run_streaming(cmd, sysbench.child_env(spec, "pw"),
+                                spec_file.parent / "raw.log", logging.getLogger("t"),
+                                on_line=seen.append)
+    assert rc == 0
+    assert sum(1 for ln in seen if parse_interval_line(ln) is not None) >= 1
+
+
 def test_preflight_ok(fake_env: Path, spec_file: Path, capsys) -> None:
     assert run_cli("preflight", "--spec", str(spec_file)) == 0
 
