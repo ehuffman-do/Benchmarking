@@ -33,7 +33,7 @@ from pgbench_webapp.secrets_store import SecretStore
 from pgbench_webapp.security import (CSRF_FIELD, SECURITY_HEADERS, SESSION_COOKIE,
                                      hash_password, new_token, verify_password)
 from pgbench_webapp.util import utc_now_iso
-from pgbench_webapp.worker import cancel_job_process, job_password_ref
+from pgbench_webapp.worker import job_password_ref, stop_job_process
 
 _PKG = Path(__file__).resolve().parent
 ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
@@ -322,9 +322,22 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                    conn: sqlite3.Connection = Depends(get_conn),
                    user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, request.headers.get("x-csrf-token"))
-        ok = cancel_job_process(conn, job_id)
+        ok = stop_job_process(cfg, conn, job_id)   # one escalating path (SIGTERM->SIGKILL)
         queries.audit(conn, user["username"], "run_cancel", target=str(job_id))
         return JSONResponse({"canceled": ok})
+
+    @app.post("/api/jobs/{job_id}/stop")
+    def api_stop(job_id: int, request: Request,
+                 conn: sqlite3.Connection = Depends(get_conn),
+                 user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """Stop an active run: graceful SIGTERM to the process group, escalating to
+        SIGKILL after stop_grace_s. The run converges to 'canceled' when the child
+        dies (no run stays 'live' after a stop)."""
+        _check_csrf(request, request.headers.get("x-csrf-token"))
+        ok = stop_job_process(cfg, conn, job_id)
+        queries.audit(conn, user["username"], "run_stop", target=str(job_id),
+                      detail="sigterm+escalate")
+        return JSONResponse({"stopping": ok})
 
     @app.post("/api/runs/{run_id}/mark")
     def api_mark(run_id: str, request: Request, payload: dict,

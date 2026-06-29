@@ -208,6 +208,43 @@ def test_cancel_queued_job(web):
     conn.close()
 
 
+def test_stop_route_rbac_audit_and_queued(web):
+    """/stop: operator+ only, audited, and short-circuits a queued job to canceled."""
+    client, cfg = web
+    job_id = client.post("/api/runs", json={"spec_yaml": _spec_yaml()}, auth=("op", "oppw")).json()["job_id"]
+    assert client.post(f"/api/jobs/{job_id}/stop", auth=("viewer", "vpw")).status_code == 403
+    r = client.post(f"/api/jobs/{job_id}/stop", auth=("op", "oppw"))
+    assert r.status_code == 200 and r.json()["stopping"] is True
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    conn = connect(cfg.db_path)
+    assert queries.get_job(conn, job_id)["state"] == "canceled"     # queued -> canceled
+    assert any(a["action"] == "run_stop" for a in queries.list_audit(conn))
+    conn.close()
+
+
+def test_stop_escalates_to_sigkill(web):
+    """A running child that ignores SIGTERM is SIGKILLed after stop_grace_s, and
+    the whole process group (leader + children) is reaped."""
+    import subprocess
+    client, cfg = web
+    from pgbench_webapp import queries, worker
+    from pgbench_webapp.db import connect
+    conn = connect(cfg.db_path)
+    queries.set_setting(conn, "stop_grace_s", "0.5")
+    # mimic the harness child: own session, ignores SIGTERM, spawns a grandchild
+    code = ("import signal,os,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "os.fork() if hasattr(os,'fork') else None;time.sleep(60)")
+    proc = subprocess.Popen(["python3", "-c", code], start_new_session=True)
+    jid = queries.enqueue_job(conn, "soak", "x", None, "op")
+    queries.update_job(conn, jid, state="running", pid=proc.pid)
+    assert worker.stop_job_process(cfg, conn, jid) is True
+    assert queries.get_job(conn, jid)["state"] == "canceling"
+    proc.wait(timeout=5)                                # escalation SIGKILLs within grace
+    assert proc.returncode is not None and proc.returncode != 0
+    conn.close()
+
+
 # ── secrets-leak gate (extended across web/DB/logs/audit/API) ───────
 
 def test_secret_never_leaks_anywhere(web):
