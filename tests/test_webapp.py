@@ -245,6 +245,69 @@ def test_stop_escalates_to_sigkill(web):
     conn.close()
 
 
+def test_delete_run_removes_all_artifacts(web):
+    """Delete reclaims everything: index row, results dir, job row(s), per-job
+    spec/out files, and the encrypted password ref — but not the shared target."""
+    client, cfg = web
+    from pgbench_webapp import queries, worker
+    from pgbench_webapp.db import connect
+    from pgbench_webapp.secrets_store import SecretStore
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW}, auth=("op", "oppw"))
+    jid, _, _ = _run_worker_once(cfg)
+    conn = connect(cfg.db_path)
+    rid = queries.get_job(conn, jid)["run_id"]
+    assert rid
+    store = SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+    store.set(worker.job_password_ref(jid), "lingering-secret")     # simulate uncleaned secret
+    out_f = cfg.data_dir / "jobs" / f"job_{jid}.out"
+    out_f.write_text("log")
+    run_dir = cfg.results_dir / rid
+    assert run_dir.exists()
+
+    r = client.request("DELETE", f"/api/runs/{rid}", auth=("op", "oppw"))
+    assert r.status_code == 200 and r.json()["deleted"] is True
+    assert queries.get_run(conn, rid) is None
+    assert queries.jobs_for_run(conn, rid) == []
+    assert not run_dir.exists() and not out_f.exists()
+    assert not (cfg.data_dir / "jobs" / f"job_{jid}.yaml").exists()
+    assert store.get(worker.job_password_ref(jid)) is None
+    assert any(a["action"] == "run_delete" for a in queries.list_audit(conn))
+    conn.close()
+
+
+def test_delete_run_refuses_active_job(web):
+    """A run with an active job must not be deletable — stop it first (409)."""
+    client, cfg = web
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    rid = "active-20260101T000000Z"
+    (cfg.results_dir / rid).mkdir(parents=True)
+    (cfg.results_dir / rid / "manifest.json").write_text(
+        '{"run_id":"%s","status":"running"}' % rid)
+    conn = connect(cfg.db_path)
+    jid = queries.enqueue_job(conn, "soak", "x", None, "op")
+    queries.update_job(conn, jid, state="running", run_id=rid)
+    assert client.request("DELETE", f"/api/runs/{rid}", auth=("op", "oppw")).status_code == 409
+    assert (cfg.results_dir / rid).exists()       # untouched
+    conn.close()
+
+
+def test_delete_run_rbac_and_traversal(web):
+    """Delete is operator+; the path resolver rejects traversal."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    from pgbench_webapp.app import _run_dir_safe
+    client, cfg = web
+    rid = "view-20260101T000000Z"
+    (cfg.results_dir / rid).mkdir(parents=True)
+    (cfg.results_dir / rid / "manifest.json").write_text("{}")
+    assert client.request("DELETE", f"/api/runs/{rid}", auth=("viewer", "vpw")).status_code == 403
+    for bad in ("..", "../etc", "a/b", ".hidden"):
+        with _pytest.raises(HTTPException):
+            _run_dir_safe(cfg, bad)
+
+
 # ── secrets-leak gate (extended across web/DB/logs/audit/API) ───────
 
 def test_secret_never_leaks_anywhere(web):

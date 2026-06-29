@@ -121,6 +121,20 @@ def job_for_run(conn: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
                         (run_id,)).fetchone()
 
 
+def jobs_for_run(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
+    """ALL jobs that produced this run (resume/re-run can share a run_id), so a
+    delete can clean up every job row, spec file and secret ref."""
+    return list(conn.execute("SELECT * FROM jobs WHERE run_id=? ORDER BY id", (run_id,)))
+
+
+def delete_jobs_for_run(conn: sqlite3.Connection, run_id: str) -> None:
+    conn.execute("DELETE FROM jobs WHERE run_id=?", (run_id,))
+
+
+def delete_run(conn: sqlite3.Connection, run_id: str) -> None:
+    conn.execute("DELETE FROM runs WHERE run_id=?", (run_id,))
+
+
 # ── runs index ──────────────────────────────────────────────────────
 
 RUN_COLUMNS = ("run_id", "label", "edition", "tshirt_size", "mode", "workload_type",
