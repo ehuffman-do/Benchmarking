@@ -29,10 +29,20 @@ ZOOM_PRE_S = 30
 ZOOM_MAX_S = 1800
 
 
+UPLOT_MAX_POINTS = 2000
+
+
 def _load_timeseries(run_dir: Path) -> dict[int, dict[str, Any]]:
     path = run_dir / "parsed" / "soak_timeseries.csv"
     if not path.exists():
         return {}
+
+    def _f(row: dict[str, str], key: str) -> Optional[float]:
+        v = row.get(key, "")
+        try:
+            return float(v) if v not in ("", None) else None
+        except (TypeError, ValueError):
+            return None
     tl: dict[int, dict[str, Any]] = {}
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
@@ -40,8 +50,78 @@ def _load_timeseries(run_dir: Path) -> dict[int, dict[str, Any]]:
                 "tps": float(row["tps"]), "qps": float(row["qps"]),
                 "lat_p99": float(row["lat_p99"]), "err_s": float(row["err_s"]),
                 "reconn_s": float(row["reconn_s"]),
+                # extra (B3) columns are absent on old run dirs -> None
+                "qps_r": _f(row, "qps_r"), "qps_w": _f(row, "qps_w"), "qps_o": _f(row, "qps_o"),
             }
     return tl
+
+
+def _read_text_asset(name: str) -> str:
+    """Read a vendored template asset (uPlot js/css) for inlining — keeps the
+    report a single self-contained, offline file (no CDN)."""
+    try:
+        return (Path(__file__).parent / "templates" / name).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _load_pg_series(run_dir: Path) -> Optional[dict[str, Any]]:
+    """Engine-side per-second series (pg_timeseries.csv) for the interactive panel."""
+    path = run_dir / "parsed" / "pg_timeseries.csv"
+    if not path.exists():
+        return {}
+    rows: list[dict[str, str]] = []
+    with open(path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        return {}
+
+    def col(name: str) -> list[Optional[float]]:
+        out: list[Optional[float]] = []
+        for r in rows:
+            v = r.get(name, "")
+            try:
+                out.append(float(v) if v not in ("", None) else None)
+            except (TypeError, ValueError):
+                out.append(None)
+        return out
+    t = [int(float(r["t"])) for r in rows]
+    keys = ("active", "cache_hit_pct", "wal_mb_s", "commits_s", "rollbacks_s",
+            "blks_read_s", "blks_hit_s", "ckpt_write_ms_s", "ckpt_sync_ms_s",
+            "tup_inserted_s", "tup_updated_s", "tup_deleted_s")
+    return {"t": t, **{k: col(k) for k in keys}}
+
+
+def _decimate(xs: list[int], cols: dict[str, list[Any]], maxpts: int
+              ) -> tuple[list[int], dict[str, list[Any]]]:
+    n = len(xs)
+    if n <= maxpts:
+        return xs, cols
+    stride = n // maxpts + 1
+    return xs[::stride], {k: v[::stride] for k, v in cols.items()}
+
+
+def build_interactive(run_dir: Path, summary: dict[str, Any],
+                      tl: dict[int, dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Aligned, decimated per-second arrays + event/detected markers for the inline
+    uPlot charts. None when there is no series to plot."""
+    if not tl:
+        return None
+    horizon = int(summary.get("horizon_s") or (max(tl) if tl else 0))
+    xs = list(range(horizon + 1))
+    keys = ("tps", "qps", "lat_p99", "err_s", "reconn_s", "qps_r", "qps_w", "qps_o")
+    cols = {k: [tl[o][k] if o in tl else None for o in xs] for k in keys}
+    xs2, cols2 = _decimate(xs, cols, UPLOT_MAX_POINTS)
+    markers = ([{"t": e["at_s"], "label": e.get("label") or e["type"], "kind": "event"}
+                for e in summary.get("events", [])]
+               + [{"t": c["at_s"], "label": c["type"], "kind": "detected"}
+                  for c in summary.get("detected", [])])
+    pg = _load_pg_series(run_dir)
+    if pg and pg.get("t"):
+        pxs, pcols = _decimate(pg["t"], {k: v for k, v in pg.items() if k != "t"}, UPLOT_MAX_POINTS)
+        pg = {"t": pxs, **pcols}
+    return {"t": xs2, **cols2, "markers": markers, "pg": pg or None,
+            "baseline_tps": summary.get("baseline", {}).get("tps") or None}
 
 
 def _hms(seconds: float) -> str:
@@ -215,9 +295,13 @@ def generate_soak_report(run_dir: Path) -> Path:
         "events": [{"ev": ev, "img": chart_event_zoom(summary, tl, ev)}
                    for ev in summary["events"]],
     }
+    interactive = build_interactive(run_dir, summary, tl)
     html = _jinja_env().get_template("soak_report.html.j2").render(
         summary=summary,
         charts=charts,
+        interactive=interactive,
+        uplot_js=_read_text_asset("uplot.min.js") if interactive else "",
+        uplot_css=_read_text_asset("uplot.min.css") if interactive else "",
         fmt_duration=fmt_duration,
         env={
             "server_version": _read_env(env_dir, "server_version.txt"),

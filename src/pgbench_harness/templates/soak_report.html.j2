@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <title>Resilience — {{ summary.label }} ({{ summary.run_id }})</title>
 <style>{% include "base.css.j2" %}</style>
+{% if uplot_css %}<style>{{ uplot_css | safe }}</style>
+<style>.uchart{margin:10px 0}.uchart .u-title{font-size:14px;font-weight:600}.u-legend{font-size:12px}</style>{% endif %}
 </head>
 <body>
 
@@ -97,6 +99,80 @@ during the soak, or declare <code>events:</code> in the spec.</div>
   </div>
   <p class="subtle" style="margin-bottom:0">Per-second latency is p99 only (sysbench emits one percentile per interval); p50/p95/min/avg/max are whole-run figures from the segments' end-of-run histogram + summary.</p>
 </div>
+{% endif %}
+
+{# ── Interactive per-second timeline (inline uPlot; offline & self-contained) ── #}
+{% if interactive %}
+<h3 id="interactive">Interactive timeline <span class="subtle">— hover to inspect; solid red = confirmed events, dashed amber = auto-detected</span></h3>
+<div class="card"><div id="ic-throughput" class="uchart"></div></div>
+<div class="card"><div id="ic-qpsrwo" class="uchart"></div></div>
+<div class="card"><div id="ic-p99" class="uchart"></div></div>
+<div class="card"><div id="ic-errors" class="uchart"></div></div>
+{% if interactive.pg %}
+<div class="section-label">PostgreSQL (engine-side) <span class="subtle">— from the server's own counters; an IOPS-proxy, not device metrics</span></div>
+<div class="card"><div id="ic-commits" class="uchart"></div></div>
+<div class="card"><div id="ic-cache" class="uchart"></div></div>
+<div class="card"><div id="ic-wal" class="uchart"></div></div>
+<div class="card"><div id="ic-blocks" class="uchart"></div></div>
+{% endif %}
+<script>{{ uplot_js | safe }}</script>
+<script>
+(function(){
+  var D = {{ interactive | tojson }};
+  function vlines(markers){
+    return function(u){
+      var c=u.ctx; c.save(); c.lineWidth=1;
+      (markers||[]).forEach(function(m){
+        var x=Math.round(u.valToPos(m.t,'x',true));
+        c.strokeStyle = m.kind==='event' ? '#c0392b' : '#e8a33d';
+        c.setLineDash(m.kind==='event'?[]:[4,3]);
+        c.beginPath(); c.moveTo(x,u.bbox.top); c.lineTo(x,u.bbox.top+u.bbox.height); c.stroke();
+      });
+      c.restore();
+    };
+  }
+  function mk(id,title,xs,defs,markers){
+    var el=document.getElementById(id); if(!el||!xs||!xs.length) return;
+    var w=el.clientWidth||900;
+    var data=[xs].concat(defs.map(function(d){return d.values;}));
+    var series=[{}].concat(defs.map(function(d){
+      return {label:d.label,stroke:d.stroke,width:1.5,scale:d.scale||'y',points:{show:false}};
+    }));
+    var axes=[{stroke:'#8b97a6',grid:{stroke:'rgba(139,151,166,0.16)'}},
+              {scale:'y',stroke:'#8b97a6',grid:{stroke:'rgba(139,151,166,0.16)'},size:60}];
+    if(defs.some(function(d){return d.scale==='y2';}))
+      axes.push({scale:'y2',side:1,stroke:'#8b97a6',grid:{show:false},size:60});
+    var u=new uPlot({title:title,width:w,height:200,cursor:{drag:{x:true,y:false}},
+      legend:{live:true},scales:{x:{time:false}},axes:axes,series:series,
+      hooks:{draw:[vlines(markers)]}}, data, el);
+    window.addEventListener('resize',function(){u.setSize({width:el.clientWidth||900,height:200});});
+  }
+  mk('ic-throughput','Throughput (TPS / QPS)',D.t,[
+    {label:'TPS',values:D.tps,stroke:'#159a8a'},
+    {label:'QPS',values:D.qps,stroke:'#2f6fed',scale:'y2'}],D.markers);
+  mk('ic-qpsrwo','QPS — read / write / other',D.t,[
+    {label:'read',values:D.qps_r,stroke:'#2e8b57'},
+    {label:'write',values:D.qps_w,stroke:'#b9770e'},
+    {label:'other',values:D.qps_o,stroke:'#7d5bbe'}],D.markers);
+  mk('ic-p99','p99 latency (ms) — per second',D.t,[
+    {label:'p99 ms',values:D.lat_p99,stroke:'#c0392b'}],D.markers);
+  mk('ic-errors','Errors & reconnects (per second)',D.t,[
+    {label:'errors/s',values:D.err_s,stroke:'#c0392b'},
+    {label:'reconnects/s',values:D.reconn_s,stroke:'#7d5bbe'}],D.markers);
+  if(D.pg){var P=D.pg;
+    mk('ic-commits','Transactions — commits / rollbacks (per second)',P.t,[
+      {label:'commits/s',values:P.commits_s,stroke:'#159a8a'},
+      {label:'rollbacks/s',values:P.rollbacks_s,stroke:'#c0392b'}],[]);
+    mk('ic-cache','Cache hit % (interval)',P.t,[
+      {label:'cache hit %',values:P.cache_hit_pct,stroke:'#159a8a'}],[]);
+    mk('ic-wal','WAL throughput (MB/s)',P.t,[
+      {label:'WAL MB/s',values:P.wal_mb_s,stroke:'#c0392b'}],[]);
+    mk('ic-blocks','Block I/O — read vs hit (per second)',P.t,[
+      {label:'blks read/s',values:P.blks_read_s,stroke:'#c0392b'},
+      {label:'blks hit/s',values:P.blks_hit_s,stroke:'#159a8a'}],[]);
+  }
+})();
+</script>
 {% endif %}
 
 {# ── Detected anomalies (auto) — always ─────────────────────────── #}

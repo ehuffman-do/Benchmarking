@@ -34,7 +34,7 @@ pgbench-worker = "pgbench_webapp.cli_entry:worker_main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-pgbench_harness = ["templates/*.j2"]
+pgbench_harness = ["templates/*.j2", "templates/*.js", "templates/*.css"]
 pgbench_webapp = ["templates/*.html", "static/*", "static/spa/*", "static/spa/assets/*", "presets/*.yaml"]
 
 [tool.pytest.ini_options]

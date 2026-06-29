@@ -256,7 +256,9 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     assert "hard downtime" in html
     assert "Steady-state" in html              # B1: always-on run profile section
     assert "data:image/png;base64," in html
-    assert "overflow: hidden" not in html
+    assert "overflow-y: auto" in html          # root scrolls (uPlot's scoped overflow:hidden is fine)
+    assert "Interactive timeline" in html and "new uPlot(" in html   # B7: inline interactive charts
+    assert 'src="http' not in html and 'href="http' not in html      # offline: no external loads
 
     # secret never reaches any soak artifact
     leaks = [str(p) for p in run_dir.rglob("*")
