@@ -120,6 +120,26 @@ def test_run_id_linked_live_before_completion(web, monkeypatch):
     assert early is not None and terminal is not None and early < terminal
 
 
+def test_live_run_loads_from_filesystem_before_indexed(web):
+    """A started-but-not-yet-indexed run (no DB row) must still load the cockpit
+    via its on-disk manifest — the fix for 'run not found' on a live run link."""
+    import json as _json
+    client, cfg = web
+    rid = "run-live-demo"
+    rd = cfg.results_dir / rid
+    rd.mkdir(parents=True)
+    (rd / "manifest.json").write_text(_json.dumps(
+        {"run_id": rid, "label": "demo", "mode": "soak", "status": "running",
+         "created_utc": "2026-06-29T01:00:00Z"}), encoding="utf-8")
+    (rd / "spec.yaml").write_text("run:\n  label: demo\nworkload:\n  type: tpcc\n",
+                                  encoding="utf-8")
+    r = client.get(f"/api/runs/{rid}", auth=("viewer", "vpw"))
+    assert r.status_code == 200
+    assert r.json()["run_id"] == rid and r.json()["status"] == "running"
+    # a genuinely missing run still 404s
+    assert client.get("/api/runs/nope-xyz", auth=("viewer", "vpw")).status_code == 404
+
+
 # ── migrations ──────────────────────────────────────────────────────
 
 def test_migrations_idempotent(tmp_path):

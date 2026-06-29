@@ -153,6 +153,12 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                     if rid:
                         early_run_id = rid
                         queries.update_job(conn, job["id"], run_id=rid)
+                        # Index the run now (its manifest already exists) so it also
+                        # shows up in the Runs list live, not only the cockpit link.
+                        row = index._run_row(cfg.results_dir / rid)
+                        if row:
+                            row["source"] = "web"
+                            queries.upsert_run(conn, row)
             rc = proc.wait()
 
         # Only run/soak produce a run directory. Prefer the id the harness printed

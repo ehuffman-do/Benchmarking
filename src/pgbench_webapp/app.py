@@ -236,9 +236,15 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     def api_get_run(run_id: str, conn: sqlite3.Connection = Depends(get_conn),
                     user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
         r = queries.get_run(conn, run_id)
-        if r is None:
+        if r is not None:
+            return JSONResponse(dict(r))
+        # Not in the index yet — fall back to the on-disk manifest so a LIVE run
+        # (linked the instant it starts) and CLI-created runs both load the
+        # cockpit instead of 404ing until the worker indexes them at completion.
+        row = index._run_row(cfg.results_dir / _safe_segment(run_id))
+        if row is None:
             raise HTTPException(404, "run not found")
-        return JSONResponse(dict(r))
+        return JSONResponse(row)
 
     # Concurrency: how many runs the worker executes at once (the max_concurrency
     # guard). Default 1; raise it to run against several clusters simultaneously.
