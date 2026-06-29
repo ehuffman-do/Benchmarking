@@ -130,6 +130,47 @@ def test_resolve_baseline_window_defaults() -> None:
     assert resolve_baseline_window({}, 1000, ev, (10, 50)) == (10, 50)  # explicit wins
 
 
+# ── automatic detection + run profile (B1/B2) ──────────────────────
+
+def _flat(tps, lat=10.0, err=0.0, reconn=0.0):
+    return {"tps": tps, "qps": tps * 20, "lat_p99": lat, "err_s": err, "reconn_s": reconn,
+            "qps_r": tps * 10, "qps_w": tps * 7, "qps_o": tps * 3}
+
+
+def test_detect_downtime_failover_and_error_burst() -> None:
+    from pgbench_harness import detect
+    tl = {t: _flat(100) for t in range(0, 60)}
+    for t in range(60, 66):                       # 6s hard outage with errors
+        tl[t] = _flat(0.0, lat=0.0, err=5.0, reconn=1.0)
+    for t in range(66, 120):
+        tl[t] = _flat(100)
+    cands = detect.detect_anomalies(tl, 100.0, 10.0, 119, CFG)
+    dt = next(c for c in cands if c["type"] == "downtime")
+    assert dt["at_s"] == 60 and dt["evidence"]["duration_s"] == 6
+    assert dt["status"] == "detected_unconfirmed" and 0 < dt["confidence"] <= 1
+    assert any(c["type"] == "error_burst" for c in cands)
+
+
+def test_detect_latency_spike_and_no_false_positive_on_steady() -> None:
+    from pgbench_harness import detect
+    tl = {t: _flat(100) for t in range(0, 120)}
+    assert detect.detect_anomalies(tl, 100.0, 10.0, 119, CFG) == []   # steady -> nothing
+    for t in range(40, 45):
+        tl[t] = _flat(100, lat=50.0)              # 5s p99 spike > 2x baseline
+    cands = detect.detect_anomalies(tl, 100.0, 10.0, 119, CFG)
+    assert any(c["type"] == "latency_spike" and c["at_s"] == 40 for c in cands)
+
+
+def test_build_run_profile_aggregates(tmp_path) -> None:
+    from pgbench_harness.soak import build_run_profile
+    tl = {t: _flat(100) for t in range(0, 120)}
+    rp = build_run_profile(tl, 119, (50, 95, 99), tmp_path)  # no raw logs -> latency empty
+    assert rp["tps"]["median"] == 100.0 and rp["tps"]["cov_pct"] == 0.0
+    assert rp["qps_read_mean"] == 1000.0
+    assert rp["zero_or_gap_seconds"] == 0 and rp["longest_outage_s"] == 0
+    assert rp["latency_ms"] == {}
+
+
 # ── spec validation ────────────────────────────────────────────────
 
 def _soak_doc(**over):
@@ -200,6 +241,8 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     summary = json.loads((run_dir / "parsed" / "soak_summary.json").read_text())
     assert summary["mode"] == "soak"
     assert any(e["type"] == "failover" for e in summary["events"])
+    # B1: the always-on run profile is present and populated even on a tiny run
+    assert summary["run_profile"]["tps"] and "detected" in summary
 
     # mark adds a live event, report regenerates and is mode-aware
     assert main(["mark", "--run-dir", str(run_dir), "--type", "scale_up",
@@ -209,6 +252,7 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     assert "Resilience" in html
     assert "Methodology" in html
     assert "hard downtime" in html
+    assert "Steady-state" in html              # B1: always-on run profile section
     assert "data:image/png;base64," in html
     assert "overflow: hidden" not in html
 

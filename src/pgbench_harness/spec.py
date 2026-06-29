@@ -82,6 +82,15 @@ class ReportCfg:
     full_recovery_pct: float = 100.0
     recovery_hold_s: int = 10
     latency_spike_mult: float = 2.0
+    # Automatic anomaly detection (soak): a run tells its own story even with no
+    # marked events. All thresholds are echoed into the report for auditability.
+    detect_drop_pct: float = 50.0        # TPS below this % of baseline starts a disruption window
+    detect_recover_pct: float = 90.0     # ...that returns to this % counts as a recovery
+    detect_min_event_s: int = 3          # min consecutive seconds to call a disruption/spike
+    detect_shift_pct: float = 25.0       # sustained level shift => scale up/down candidate
+    detect_shift_window_s: int = 60      # leading/trailing window for the shift comparison
+    detect_err_burst: int = 3            # error/reconnect-seconds within a window => burst
+    detect_max_events: int = 50
 
 
 SOAK_EVENT_TYPES = ("failover", "scale_up", "scale_down", "note", "loadgen_restart")
@@ -310,7 +319,10 @@ def _parse_report(sec: dict[str, Any], sweep: Optional[Sweep]) -> ReportCfg:
     _check_keys(sec, "report", set(),
                 {"percentiles", "timeseries_levels", "variance_warn_pct",
                  "baseline_window_s", "recovery_threshold_pct", "full_recovery_pct",
-                 "recovery_hold_s", "latency_spike_mult"})
+                 "recovery_hold_s", "latency_spike_mult",
+                 "detect_drop_pct", "detect_recover_pct", "detect_min_event_s",
+                 "detect_shift_pct", "detect_shift_window_s", "detect_err_burst",
+                 "detect_max_events"})
     pcts = _int_list(sec, "report", "percentiles", (50, 95, 99))
     if any(p < 1 or p > 100 for p in pcts):
         raise SpecError("'report.percentiles' entries must be between 1 and 100")
@@ -347,6 +359,13 @@ def _parse_report(sec: dict[str, Any], sweep: Optional[Sweep]) -> ReportCfg:
         full_recovery_pct=full,
         recovery_hold_s=hold,
         latency_spike_mult=mult,
+        detect_drop_pct=_typed(sec, "report", "detect_drop_pct", float, 50.0),
+        detect_recover_pct=_typed(sec, "report", "detect_recover_pct", float, 90.0),
+        detect_min_event_s=_typed(sec, "report", "detect_min_event_s", int, 3),
+        detect_shift_pct=_typed(sec, "report", "detect_shift_pct", float, 25.0),
+        detect_shift_window_s=_typed(sec, "report", "detect_shift_window_s", int, 60),
+        detect_err_burst=_typed(sec, "report", "detect_err_burst", int, 3),
+        detect_max_events=_typed(sec, "report", "detect_max_events", int, 50),
     )
 
 

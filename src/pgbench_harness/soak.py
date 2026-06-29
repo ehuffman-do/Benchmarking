@@ -289,6 +289,100 @@ def _verdict(ev: dict[str, Any], m: dict[str, Any], cfg: Any) -> str:
     return f"{name}: " + "; ".join(parts) + "." + tail
 
 
+def _stats(vals: list[float]) -> dict[str, Any]:
+    """mean/median/min/max/stdev + coefficient of variation for a metric."""
+    if not vals:
+        return {}
+    mean = statistics.fmean(vals)
+    sd = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+    return {"mean": round(mean, 1), "median": round(statistics.median(vals), 1),
+            "min": round(min(vals), 1), "max": round(max(vals), 1),
+            "stdev": round(sd, 1),
+            "cov_pct": round(100.0 * sd / mean, 1) if mean > 0 else 0.0}
+
+
+def _segment_latency_aggregate(run_dir: Path, percentiles: tuple[int, ...]) -> dict[str, Any]:
+    """Whole-run tail latency from the finished segments' end-of-run blocks.
+
+    sysbench emits percentiles only at a run's end, so for a (segmented) soak we
+    merge each segment's --histogram (count-weighted) for p50/p95/p99 and take
+    min / count-weighted avg / max from the segment summaries. Reuses the parser
+    (no forked percentile math). Empty when no segment produced a summary (e.g.
+    the field failure: every segment died before its final block)."""
+    from pgbench_harness.parser import parse_log_file, percentile_from_histogram
+    merged: dict[float, int] = {}
+    mins: list[float] = []
+    maxs: list[float] = []
+    avg_weighted: list[tuple[float, int]] = []
+    for log in sorted((run_dir / "raw").glob("soak_seg*.log")):
+        p = parse_log_file(log)
+        for value, count in p.histogram:
+            merged[value] = merged.get(value, 0) + count
+        if p.summary:
+            mins.append(p.summary.lat_min)
+            maxs.append(p.summary.lat_max)
+            avg_weighted.append((p.summary.lat_avg, max(1, p.summary.transactions)))
+    if not merged and not mins:
+        return {}
+    buckets = sorted(merged.items())
+    out: dict[str, Any] = {}
+    for pct in percentiles:
+        v = percentile_from_histogram(buckets, pct)
+        out[f"p{pct}"] = round(v, 1) if v is not None else None
+    if mins:
+        out["min"] = round(min(mins), 1)
+    if maxs:
+        out["max"] = round(max(maxs), 1)
+    if avg_weighted:
+        tot = sum(n for _, n in avg_weighted) or 1
+        out["avg"] = round(sum(a * n for a, n in avg_weighted) / tot, 1)
+    return out
+
+
+def build_run_profile(tl: dict[int, dict[str, Any]], horizon: int,
+                      percentiles: tuple[int, ...], run_dir: Path) -> dict[str, Any]:
+    """Whole-run characterization computed for EVERY soak (event or not): steady-
+    state throughput, tail latency, and stability/variance — so an event-less run
+    still leads with rich signal instead of a near-blank page."""
+    present = sorted(tl)
+    warm = 30 if sum(1 for o in present if o > 30) >= 10 else 0
+    steady = [o for o in present if o >= warm]   # >= so a tiny run keeps its samples
+    tps = [tl[o]["tps"] for o in steady]
+    qps = [tl[o]["qps"] for o in steady]
+    span = horizon + 1
+    med = statistics.median(tps) if tps else 0.0
+    dip_thresh = 0.5 * med
+    # contiguous zero/gap run length (an outage), longest wins
+    longest = cur = 0
+    for o in range(present[0] if present else 0, span):
+        if o not in tl or tl[o]["tps"] <= EPS:
+            cur += 1
+            longest = max(longest, cur)
+        else:
+            cur = 0
+
+    def _mean(key: str) -> float:
+        vals = [tl[o].get(key, 0.0) or 0.0 for o in steady]
+        return round(statistics.fmean(vals), 1) if vals else 0.0
+
+    return {
+        "warmup_excluded_s": warm,
+        "steady_samples": len(steady),
+        "tps": _stats(tps),
+        "qps": _stats(qps),
+        "qps_read_mean": _mean("qps_r"),
+        "qps_write_mean": _mean("qps_w"),
+        "qps_other_mean": _mean("qps_o"),
+        "latency_ms": _segment_latency_aggregate(run_dir, percentiles),
+        "dip_seconds": sum(1 for o in steady if EPS < tl[o]["tps"] < dip_thresh),
+        "zero_or_gap_seconds": sum(1 for o in range(span)
+                                   if o not in tl or tl[o]["tps"] <= EPS),
+        "longest_outage_s": longest,
+        "error_seconds": sum(1 for o in present
+                             if tl[o]["err_s"] > 0 or tl[o]["reconn_s"] > 0),
+    }
+
+
 def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[str, Any]:
     """Build timeline + summary, write soak_timeseries.csv and soak_summary.json."""
     assert spec.soak is not None
@@ -359,6 +453,11 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
         warnings.append("load generator never produced samples; last sysbench error: "
                         + failure_reason.splitlines()[0])
 
+    # Always-rich characterization + automatic event detection (event or not).
+    from pgbench_harness import detect
+    run_profile = build_run_profile(tl, horizon, spec.report.percentiles, run_dir)
+    detected = detect.detect_anomalies(tl, baseline_tps, baseline_lat, horizon, spec.report)
+
     _write_timeseries(run_dir, tl, horizon)
     summary = {
         "run_id": manifest_soak.get("run_id"),
@@ -378,6 +477,8 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
         "segments": seg_list,
         "failed_segments": failed_segments,
         "failure_reason": failure_reason,
+        "run_profile": run_profile,
+        "detected": detected,
         "warnings": warnings,
         "baseline": {
             "window_s": [bw[0], bw[1]], "tps": round(baseline_tps, 1),
@@ -390,6 +491,11 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
             "full_recovery_pct": spec.report.full_recovery_pct,
             "recovery_hold_s": spec.report.recovery_hold_s,
             "latency_spike_mult": spec.report.latency_spike_mult,
+            "detect_drop_pct": spec.report.detect_drop_pct,
+            "detect_recover_pct": spec.report.detect_recover_pct,
+            "detect_min_event_s": spec.report.detect_min_event_s,
+            "detect_shift_pct": spec.report.detect_shift_pct,
+            "detect_err_burst": spec.report.detect_err_burst,
         },
         "events": out_events,
     }

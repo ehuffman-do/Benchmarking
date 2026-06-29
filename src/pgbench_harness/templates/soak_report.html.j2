@@ -21,26 +21,28 @@
 
 <main>
 <div class="toc">
-  <a href="#overview">Overview</a><a href="#events">Per-event detail</a>
+  <a href="#overview">Overview</a><a href="#detected">Detected</a><a href="#events">Per-event detail</a>
   <a href="#timeline">Timeline</a><a href="#method">Methodology</a>
 </div>
 
-{# ── Per-event KPI band + verdicts ──────────────────────────────── #}
-{% if summary.events %}
+{# ── Always-on run-profile KPI band (rich even with no marked event) ── #}
+{% set rp = summary.run_profile or {} %}
+{% set lat = rp.latency_ms or {} %}
 <div class="kpis">
-  {% for ev in summary.events %}
-  {% set m = ev.metrics %}
-  <div class="kpi {% if m.hard_downtime_s > 0 %}bad{% elif m.ttr_s is not none %}good{% endif %}">
-    <div class="v">{{ m.hard_downtime_s }}<small> s</small></div>
-    <div class="k">{{ ev.label or ev.type }} · hard downtime</div>
-  </div>
-  {% endfor %}
+  <div class="kpi"><div class="v">{{ rp.tps.median if rp.tps else "—" }}</div><div class="k">median TPS</div></div>
+  <div class="kpi"><div class="v">{{ lat.p99 if lat.p99 is not none else "—" }}<small> ms</small></div><div class="k">p99 latency (run)</div></div>
+  <div class="kpi {% if rp.tps and rp.tps.cov_pct > 15 %}warn{% endif %}"><div class="v">{{ rp.tps.cov_pct if rp.tps else "—" }}<small> %</small></div><div class="k">TPS variability (CoV)</div></div>
+  <div class="kpi {% if rp.longest_outage_s %}bad{% endif %}"><div class="v">{{ rp.zero_or_gap_seconds if rp.zero_or_gap_seconds is defined else "—" }}<small> s</small></div><div class="k">zero / gap seconds</div></div>
+  <div class="kpi"><div class="v">{{ summary.coverage_pct }}<small> %</small></div><div class="k">coverage</div></div>
+  <div class="kpi"><div class="v">{{ summary.events | length }}</div><div class="k">confirmed events</div></div>
 </div>
+{% if summary.events %}
 {% for ev in summary.events %}
 <div class="note" style="font-size:15px"><b>{{ ev.label or ev.type }}</b> — {{ ev.verdict }}</div>
 {% endfor %}
 {% else %}
-<div class="warnbox">No events were marked on this run. Use
+<div class="note subtle">No events were marked — the run profile and the detected
+anomalies below characterize it. To label a moment, run
 <code>pgbench-harness mark --run-dir &lt;dir&gt; --type failover --label "..."</code>
 during the soak, or declare <code>events:</code> in the spec.</div>
 {% endif %}
@@ -78,11 +80,48 @@ during the soak, or declare <code>events:</code> in the spec.</div>
   {% if summary.notes %}<p style="margin-bottom:0"><b>Notes:</b> {{ summary.notes }}</p>{% endif %}
 </div>
 {% if charts.overview %}<div class="chart"><img alt="Throughput over the full run" src="{{ charts.overview }}">
-  <div class="cap">Whole run, decimated for legibility; per-bucket minimum is shaded so brief dips/outages are visible. Red lines = events; red shading = disruption window.</div>
+  <div class="cap">Whole run, decimated for legibility; per-bucket minimum is shaded so brief dips/outages are visible. Solid red = confirmed events; dashed amber = auto-detected (unconfirmed) anomalies.</div>
 </div>{% endif %}
 
+{# ── Run profile (steady-state, tail latency, stability) — always ── #}
+{% if rp %}
+<div class="card soft">
+  <h3 style="margin-top:0">Steady-state &amp; stability{% if rp.warmup_excluded_s %} <span class="subtle">(first {{ rp.warmup_excluded_s }}s excluded as warm-up)</span>{% endif %}</h3>
+  <div class="meta-grid">
+    {% if rp.tps %}<div><b>TPS:</b> median {{ rp.tps.median }} · mean {{ rp.tps.mean }} · min {{ rp.tps.min }} · max {{ rp.tps.max }} · CoV {{ rp.tps.cov_pct }}%</div>{% endif %}
+    {% if rp.qps %}<div><b>QPS:</b> median {{ rp.qps.median }} · r/w/o means {{ rp.qps_read_mean }}/{{ rp.qps_write_mean }}/{{ rp.qps_other_mean }}</div>{% endif %}
+    {% if lat %}<div><b>Latency (ms, whole run):</b>
+      {% if lat.p50 is not none %}p50 {{ lat.p50 }} · {% endif %}{% if lat.p95 is not none %}p95 {{ lat.p95 }} · {% endif %}{% if lat.p99 is not none %}p99 {{ lat.p99 }} · {% endif %}min {{ lat.min if lat.min is defined else "—" }} · avg {{ lat.avg if lat.avg is defined else "—" }} · max {{ lat.max if lat.max is defined else "—" }}</div>{% endif %}
+    <div><b>Stability:</b> {{ rp.dip_seconds }} dip s (&lt;50% median) · {{ rp.zero_or_gap_seconds }} zero/gap s · longest outage {{ rp.longest_outage_s }}s · {{ rp.error_seconds }} error/reconnect s</div>
+  </div>
+  <p class="subtle" style="margin-bottom:0">Per-second latency is p99 only (sysbench emits one percentile per interval); p50/p95/min/avg/max are whole-run figures from the segments' end-of-run histogram + summary.</p>
+</div>
+{% endif %}
+
+{# ── Detected anomalies (auto) — always ─────────────────────────── #}
+{% if summary.detected %}
+<h2 id="detected"><span class="secno">2</span>Detected anomalies <span class="subtle">— automatic, unconfirmed</span></h2>
+<p class="subtle">Candidate events found by scanning the per-second series (thresholds in Methodology). Confirm/label one with <code>pgbench-harness mark</code> and it moves to the per-event analysis below.</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Type</th><th>At</th><th>Window (s)</th><th>Confidence</th><th>Evidence</th></tr></thead>
+  <tbody>
+  {% for c in summary.detected %}
+  <tr>
+    <td>{{ c.type }}</td>
+    <td>{{ fmt_duration(c.at_s) }}</td>
+    <td>{{ c.end_s - c.at_s + 1 }}</td>
+    <td>{{ (c.confidence * 100) | int }}%</td>
+    <td class="subtle">{% for k, v in c.evidence.items() %}{{ k }}={{ v }}{% if not loop.last %}, {% endif %}{% endfor %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+
 {# ── Per-event detail ───────────────────────────────────────────── #}
-<h2 id="events"><span class="secno">2</span>Per-event disruption</h2>
+<h2 id="events"><span class="secno">3</span>Per-event disruption <span class="subtle">— confirmed events</span></h2>
 {% if summary.events %}
 <div class="table-wrap">
 <table>
@@ -122,7 +161,7 @@ during the soak, or declare <code>events:</code> in the spec.</div>
 {% endif %}
 
 {# ── Timeline / artifacts ───────────────────────────────────────── #}
-<h2 id="timeline"><span class="secno">3</span>Timeline &amp; artifacts</h2>
+<h2 id="timeline"><span class="secno">4</span>Timeline &amp; artifacts</h2>
 <p class="subtle">Full 1 Hz series: <code>parsed/soak_timeseries.csv</code> ·
 machine-readable summary: <code>parsed/soak_summary.json</code> ·
 events: <code>events.jsonl</code> · raw logs: <code>raw/soak_seg*.log</code>
@@ -142,7 +181,7 @@ events: <code>events.jsonl</code> · raw logs: <code>raw/soak_seg*.log</code>
 {% endif %}
 
 {# ── Methodology ────────────────────────────────────────────────── #}
-<h2 id="method"><span class="secno">4</span>Methodology &amp; definitions</h2>
+<h2 id="method"><span class="secno">5</span>Methodology &amp; definitions</h2>
 <div class="card soft" style="font-size:14px">
   <p>Continuous load at fixed concurrency ({{ summary.soak.threads }} threads); the load
   generator is kept alive across the event by a supervisor that relaunches sysbench if it
@@ -163,6 +202,13 @@ events: <code>events.jsonl</code> · raw logs: <code>raw/soak_seg*.log</code>
     <li><b>Peak p99</b> / seconds above {{ summary.thresholds.latency_spike_mult }}× baseline p99.</li>
     <li><b>Failed txns</b> — sysbench-reported errors in the window. <b>Missed vs baseline</b> —
       Σ max(0, baseline TPS − observed TPS): estimated transactions not served vs baseline.</li>
+    <li><b>Auto-detection</b> — disruption window = TPS &lt; {{ summary.thresholds.detect_drop_pct | int }}% of baseline
+      for ≥ {{ summary.thresholds.detect_min_event_s }}s (mostly-zero ⇒ downtime; recovers to
+      ≥ {{ summary.thresholds.detect_recover_pct | int }}% ⇒ failover-like; else a dip). Latency spike =
+      p99 &gt; {{ summary.thresholds.latency_spike_mult }}× baseline for ≥ {{ summary.thresholds.detect_min_event_s }}s;
+      error burst = ≥ {{ summary.thresholds.detect_err_burst }} error/reconnect seconds; level shift ≥
+      {{ summary.thresholds.detect_shift_pct | int }}% ⇒ scale up/down. All are <i>detected, unconfirmed</i>
+      until an operator marks them.</li>
   </ul>
 </div>
 </main>

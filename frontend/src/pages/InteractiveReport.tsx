@@ -126,20 +126,50 @@ function SweepReport({ summary, prov }: { summary: Record<string, unknown>; prov
 }
 
 function SoakReport({ summary, prov }: { summary: Record<string, unknown>; prov: [string, string][] }) {
-  const baseline = (summary.baseline || {}) as { tps?: number };
   const events = (summary.events as Array<Record<string, unknown>>) || [];
+  const detected = (summary.detected as Array<Record<string, unknown>>) || [];
+  const rp = (summary.run_profile || {}) as Record<string, unknown>;
+  const tps = (rp.tps || {}) as Record<string, number>;
+  const lat = (rp.latency_ms || {}) as Record<string, number | null>;
   const m = (e: Record<string, unknown>) => (e.metrics || {}) as Record<string, number>;
+  const ev = (o: Record<string, unknown>) => (o.evidence || {}) as Record<string, unknown>;
   return (
     <>
       <div className="kpi-row" style={{ marginBottom: 16 }}>
-        <div className="kpi"><div className="label">Baseline TPS</div><div className="value">{baseline.tps ? fmtInt(baseline.tps) : "—"}</div></div>
+        <div className="kpi"><div className="label">Median TPS</div><div className="value">{tps.median != null ? fmtInt(tps.median) : "—"}</div></div>
+        <div className="kpi"><div className="label">p99 latency (run)</div><div className="value">{lat.p99 != null ? fmtNum(lat.p99) : "—"}<small> ms</small></div></div>
+        <div className="kpi"><div className="label">TPS variability</div><div className="value">{tps.cov_pct != null ? fmtNum(tps.cov_pct) : "—"}<small> % CoV</small></div></div>
+        <div className="kpi"><div className="label">Zero / gap</div><div className="value">{rp.zero_or_gap_seconds != null ? fmtInt(rp.zero_or_gap_seconds as number) : "—"}<small> s</small></div></div>
         <div className="kpi"><div className="label">Coverage</div><div className="value">{summary.coverage_pct != null ? fmtNum(summary.coverage_pct as number) : "—"}<small> %</small></div></div>
-        <div className="kpi"><div className="label">Horizon</div><div className="value">{summary.horizon_s != null ? fmtInt(summary.horizon_s as number) : "—"}<small> s</small></div></div>
         <div className="kpi"><div className="label">Events</div><div className="value">{events.length}</div></div>
       </div>
+
+      {detected.length > 0 && (
+        <div className="card">
+          <div className="card-head"><h2>Detected anomalies <span className="subtle">— automatic, unconfirmed</span></h2></div>
+          <table>
+            <thead><tr><th>Type</th><th className="num">At</th><th className="num">Window (s)</th>
+              <th className="num">Confidence</th><th>Evidence</th></tr></thead>
+            <tbody>
+              {detected.map((c, i) => (
+                <tr key={i}>
+                  <td>{String(c.type)}</td>
+                  <td className="num">{String(c.at_s)}s</td>
+                  <td className="num">{(c.end_s as number) - (c.at_s as number) + 1}</td>
+                  <td className="num">{Math.round((c.confidence as number) * 100)}%</td>
+                  <td className="subtle mono" style={{ fontSize: 12 }}>
+                    {Object.entries(ev(c)).map(([k, v]) => `${k}=${v}`).join(", ")}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <div className="card">
-        <div className="card-head"><h2>Disruption events</h2></div>
-        {events.length === 0 ? <div className="empty">No events recorded.</div> : (
+        <div className="card-head"><h2>Disruption events <span className="subtle">— confirmed</span></h2></div>
+        {events.length === 0 ? <div className="empty">No confirmed events. The profile and detected anomalies above characterize this run.</div> : (
           <table>
             <thead><tr><th>At</th><th>Type</th><th>Label</th><th className="num">Downtime</th>
               <th className="num">TTR (95%)</th><th className="num">Full re-warm</th><th className="num">Min TPS</th></tr></thead>

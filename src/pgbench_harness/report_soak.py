@@ -123,6 +123,14 @@ def chart_overview(summary: dict[str, Any], tl: dict[int, dict[str, Any]]) -> Op
                     xycoords=("data", "axes fraction"), xytext=(3, 0),
                     textcoords="offset points", fontsize=11, color=EVENT_COLOR,
                     rotation=90, va="top")
+    # Auto-detected (unconfirmed) anomalies: dashed amber, visually distinct from
+    # the solid-red confirmed events so the operator can tell them apart.
+    for i, c in enumerate(summary.get("detected", [])):
+        ax.axvline(c["at_s"], color="#e8a33d", linewidth=1.1, linestyle="--", alpha=0.85,
+                   label="detected (unconfirmed)" if i == 0 else None)
+        end = c.get("end_s")
+        if end and end > c["at_s"]:
+            ax.axvspan(c["at_s"], end, color="#e8a33d", alpha=0.07)
     ax.legend(fontsize=10, loc="upper right")
     return fig_to_base64(fig)
 
