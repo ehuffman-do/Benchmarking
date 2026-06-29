@@ -191,6 +191,10 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     # artifacts
     assert (run_dir / "parsed" / "soak_summary.json").exists()
     assert (run_dir / "parsed" / "soak_timeseries.csv").exists()
+    ts_lines = (run_dir / "parsed" / "soak_timeseries.csv").read_text().splitlines()
+    # B3: the read/write/other QPS split + per-interval percentile reach the series
+    assert ts_lines[0].split(",")[-4:] == ["qps_r", "qps_w", "qps_o", "lat_p99_pct"]
+    assert float(ts_lines[1].split(",")[9]) > 0          # qps_r populated, not blank
     assert (run_dir / "events.jsonl").exists()
     assert list(run_dir.glob("raw/soak_seg*.log"))
     summary = json.loads((run_dir / "parsed" / "soak_summary.json").read_text())

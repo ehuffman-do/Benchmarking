@@ -31,7 +31,8 @@ from pgbench_harness.util import atomic_write_json, atomic_write_text, fmt_durat
 # Columns of parsed/soak_timeseries.csv. Shared so the live incremental writer
 # (runner._soak_supervisor) and the canonical finalize writer (_write_timeseries)
 # can never drift apart.
-TIMESERIES_COLUMNS = ["t", "ts_utc", "tps", "qps", "lat_p99", "err_s", "reconn_s", "threads", "seg"]
+TIMESERIES_COLUMNS = ["t", "ts_utc", "tps", "qps", "lat_p99", "err_s", "reconn_s",
+                      "threads", "seg", "qps_r", "qps_w", "qps_o", "lat_p99_pct"]
 
 EPS = 1e-9  # tps at/below this counts as "no successful transactions"
 MIN_BASELINE_SAMPLES = 5  # need at least this many clean pre-event samples to trust a baseline
@@ -99,6 +100,11 @@ def build_timeline(run_dir: Path, soak_start: datetime) -> dict[int, dict[str, A
                 "tps": sample.tps, "qps": sample.qps, "lat_p99": sample.lat_ms,
                 "err_s": sample.err_s, "reconn_s": sample.reconn_s,
                 "threads": sample.threads, "seg": seg,
+                # read/write/other QPS split + the per-interval percentile label
+                # (sysbench emits ONE percentile per interval — the --percentile
+                # value, 99 — so lat_p99 is p99-per-second; p50/p95 are run-level).
+                "qps_r": sample.r, "qps_w": sample.w, "qps_o": sample.o,
+                "lat_p99_pct": sample.lat_pct,
             }
     return timeline
 
@@ -398,6 +404,5 @@ def _write_timeseries(run_dir: Path, tl: dict[int, dict[str, Any]], horizon: int
     w.writerow(TIMESERIES_COLUMNS)
     for o in sorted(tl):
         r = tl[o]
-        w.writerow([o, r["ts_utc"], r["tps"], r["qps"], r["lat_p99"],
-                    r["err_s"], r["reconn_s"], r["threads"], r["seg"]])
+        w.writerow([r.get(c, "") for c in TIMESERIES_COLUMNS])
     atomic_write_text(run_dir / "parsed" / "soak_timeseries.csv", buf.getvalue())

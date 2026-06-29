@@ -554,7 +554,8 @@ def _live_soak_callback(
         if off < 0 or off in seen:
             return
         seen.add(off)
-        live.append([off, ts, s.tps, s.qps, s.lat_ms, s.err_s, s.reconn_s, s.threads, seg_name])
+        live.append([off, ts, s.tps, s.qps, s.lat_ms, s.err_s, s.reconn_s, s.threads,
+                     seg_name, s.r, s.w, s.o, s.lat_pct])
     return _cb
 
 
