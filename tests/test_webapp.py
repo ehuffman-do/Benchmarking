@@ -94,6 +94,32 @@ def _run_worker_once(cfg):
         conn.close()
 
 
+def test_run_id_linked_live_before_completion(web, monkeypatch):
+    """The job is linked to its run the moment the harness prints the run dir —
+    so the UI can open the LIVE cockpit mid-run, not only after the job finishes."""
+    client, cfg = web
+    from pgbench_webapp import queries
+    calls: list[dict] = []
+    orig = queries.update_job
+
+    def spy(conn, job_id, **kw):
+        calls.append(dict(kw))
+        return orig(conn, job_id, **kw)
+    monkeypatch.setattr(queries, "update_job", spy)
+
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "password": WEB_PW},
+                auth=("op", "oppw"))
+    _run_worker_once(cfg)
+
+    # an update linked run_id WITHOUT a terminal state (the early link) and it
+    # happened BEFORE the terminal state update.
+    early = next((i for i, c in enumerate(calls)
+                  if c.get("run_id") and "state" not in c), None)
+    terminal = next((i for i, c in enumerate(calls)
+                     if c.get("state") in ("done", "failed", "canceled")), None)
+    assert early is not None and terminal is not None and early < terminal
+
+
 # ── migrations ──────────────────────────────────────────────────────
 
 def test_migrations_idempotent(tmp_path):
