@@ -4,10 +4,16 @@
 Knobs (env vars):
   FAKE_SYSBENCH_FAIL_THREADS  comma-separated thread counts whose `run` fails
                               with the worker-init FATAL and exit code 1.
+  FAKE_SYSBENCH_RUN_FAIL_THREADS  thread counts whose `run` prints a PostgreSQL
+                              FATAL and exits 2 with ZERO interval lines (mirrors
+                              the field soak: tpcc dies in init before reporting).
+  FAKE_SYSBENCH_HANG_THREADS  thread counts whose `run` starts then hangs forever
+                              (no output, no exit) — exercises the segment watchdog.
   FAKE_SYSBENCH_COUNT_FILE    file to append one line per `run` invocation.
 """
 import os
 import sys
+import time
 
 args = sys.argv[1:]
 
@@ -51,13 +57,28 @@ print(f"Number of threads: {threads}")
 print("Report intermediate results every 1 second(s)\n")
 print("Initializing worker threads...\n")
 
-fail_threads = {
-    int(x) for x in os.environ.get("FAKE_SYSBENCH_FAIL_THREADS", "").split(",") if x
-}
+def _threadset(name):
+    return {int(x) for x in os.environ.get(name, "").split(",") if x}
+
+
+fail_threads = _threadset("FAKE_SYSBENCH_FAIL_THREADS")
 if threads in fail_threads:
     print("FATAL: PQsetdbLogin() failed: ERROR:  no more connections allowed (max_client_conn)")
     print("FATAL: Worker threads failed to initialize within 30 seconds!")
     sys.exit(1)
+
+# Mimic the field soak: tpcc dies during per-thread init with a PostgreSQL FATAL
+# and exit code 2, emitting ZERO interval lines.
+if threads in _threadset("FAKE_SYSBENCH_RUN_FAIL_THREADS"):
+    print("FATAL: PQexec() failed: ERROR:  deadlock detected")
+    print("FATAL: `thread_init' function failed: tpcc.lua:...: SQL error")
+    sys.exit(2)
+
+# Connect then hang: no output, never exits — the supervisor watchdog must kill it.
+if threads in _threadset("FAKE_SYSBENCH_HANG_THREADS"):
+    print("Threads started!\n", flush=True)
+    time.sleep(3600)
+    sys.exit(0)
 
 print("Threads started!\n")
 base_tps = 100.0 * threads

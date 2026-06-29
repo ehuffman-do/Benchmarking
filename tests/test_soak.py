@@ -4,6 +4,7 @@ validation, and an end-to-end run + mark + report through the CLI."""
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -211,6 +212,68 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     leaks = [str(p) for p in run_dir.rglob("*")
              if p.is_file() and TEST_PASSWORD.encode() in p.read_bytes()]
     assert not leaks
+
+
+def test_soak_surfaces_failure_and_finalizes(fake_env, tmp_path, monkeypatch) -> None:
+    """A soak whose load generator can't run must FAIL FAST, surface sysbench's
+    own error, and leave a TERMINAL manifest — never an indistinguishable blank,
+    never stuck 'running' (the field-incident regression)."""
+    monkeypatch.setenv("FAKE_SYSBENCH_RUN_FAIL_THREADS", "64")
+    results = tmp_path / "results"
+    spec_path = tmp_path / "soak.yaml"
+    doc = _soak_doc(soak={"threads": 64, "duration_s": 300, "tolerate_errors": True,
+                          "fast_fail_segments": 2}, events=[])
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    t0 = time.monotonic()
+    rc = main(["soak", "--spec", str(spec_path), "--results-dir", str(results)])
+    elapsed = time.monotonic() - t0
+    assert rc == 2                       # RunError -> CLI exit 2 -> worker maps to 'failed'
+    assert elapsed < 30                  # fast-fail in seconds, not the 300s window
+
+    run_dir = sorted(d for d in results.iterdir() if (d / "manifest.json").exists())[-1]
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["status"] == "failed"          # terminal, NOT 'running'
+    assert manifest.get("finished_utc")
+
+    summary = json.loads((run_dir / "parsed" / "soak_summary.json").read_text())
+    assert summary["status"] == "failed"
+    assert "deadlock" in summary["failure_reason"] or "thread_init" in summary["failure_reason"]
+    assert summary["failed_segments"] >= 1
+    assert len(summary["segments"]) == 2           # aborted at the cutoff, did not churn
+    assert all(s["error_excerpt"] for s in summary["segments"])
+
+    # the failure reason is rendered in the report (not a near-blank deliverable)
+    assert main(["report", "--run-dir", str(run_dir)]) == 0
+    html = (run_dir / "soak_report.html").read_text()
+    assert "Run failed" in html and ("deadlock" in html or "thread_init" in html)
+
+    # secret never leaks even on the failure path
+    assert not [p for p in run_dir.rglob("*")
+                if p.is_file() and TEST_PASSWORD.encode() in p.read_bytes()]
+
+
+def test_soak_segment_watchdog_kills_hung_child(fake_env, tmp_path, monkeypatch) -> None:
+    """A segment that connects then hangs (no output, never exits) must be killed
+    by the per-segment watchdog so the supervisor stays bounded and finalizes."""
+    monkeypatch.setenv("FAKE_SYSBENCH_HANG_THREADS", "4")
+    results = tmp_path / "results"
+    spec_path = tmp_path / "soak.yaml"
+    doc = _soak_doc(soak={"threads": 4, "duration_s": 2, "tolerate_errors": True,
+                          "segment_kill_grace_s": 1, "hard_ceiling_grace_s": 3,
+                          "fast_fail_segments": 5}, events=[])
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    t0 = time.monotonic()
+    main(["soak", "--spec", str(spec_path), "--results-dir", str(results)])
+    elapsed = time.monotonic() - t0
+    assert elapsed < 30                  # the hang did not block the supervisor forever
+
+    run_dir = sorted(d for d in results.iterdir() if (d / "manifest.json").exists())[-1]
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["status"] in ("failed", "partial")   # terminal
+    segs = manifest["soak"]["segments"]
+    assert segs and any(s.get("timed_out") for s in segs)
 
 
 def test_soak_dry_run(fake_env, tmp_path, capsys) -> None:

@@ -45,6 +45,15 @@
 during the soak, or declare <code>events:</code> in the spec.</div>
 {% endif %}
 
+{% if summary.status == "failed" and summary.failure_reason %}
+<div class="warnbox" style="border-left:4px solid #c0392b">
+  <b>Run failed — the load generator could not sustain load against the target.</b>
+  {% if summary.failed_segments %}<div style="margin-top:4px">{{ summary.failed_segments }} failed segment(s).</div>{% endif %}
+  <div style="margin-top:6px">Last sysbench error:</div>
+  <pre style="white-space:pre-wrap;margin:4px 0 0;font-size:13px">{{ summary.failure_reason }}</pre>
+</div>
+{% endif %}
+
 {% if summary.warnings %}
 <div class="warnbox"><b>Analysis warnings:</b>
   <ul style="margin:6px 0 0">{% for w in summary.warnings %}<li>{{ w }}</li>{% endfor %}</ul>

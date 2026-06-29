@@ -108,6 +108,11 @@ class Soak:
     tolerate_errors: bool = True        # keep the load generator alive through outages
     report_interval_s: int = 1
     max_relaunches: int = 50            # supervisor safety cap
+    # Supervisor safety bounds (see runner._soak_supervisor). A run that cannot
+    # produce samples must fail fast with a clear reason, never burn the window.
+    fast_fail_segments: int = 3         # abort after N consecutive zero-sample launches
+    hard_ceiling_grace_s: int = 15      # supervisor wall-clock may exceed duration_s by at most this
+    segment_kill_grace_s: int = 10      # SIGTERM->SIGKILL grace when a segment overruns/hangs
 
 
 @dataclass(frozen=True)
@@ -347,7 +352,8 @@ def _parse_report(sec: dict[str, Any], sweep: Optional[Sweep]) -> ReportCfg:
 
 def _parse_soak(sec: dict[str, Any]) -> Soak:
     _check_keys(sec, "soak", {"threads", "duration_s"},
-                {"tolerate_errors", "report_interval_s", "max_relaunches"})
+                {"tolerate_errors", "report_interval_s", "max_relaunches",
+                 "fast_fail_segments", "hard_ceiling_grace_s", "segment_kill_grace_s"})
     threads = _typed(sec, "soak", "threads", int)
     duration = _typed(sec, "soak", "duration_s", int)
     if threads < 1:
@@ -357,12 +363,22 @@ def _parse_soak(sec: dict[str, Any]) -> Soak:
     interval = _typed(sec, "soak", "report_interval_s", int, 1)
     if interval < 1:
         raise SpecError("'soak.report_interval_s' must be >= 1")
+    fast_fail = _typed(sec, "soak", "fast_fail_segments", int, 3)
+    if fast_fail < 1:
+        raise SpecError("'soak.fast_fail_segments' must be >= 1")
+    ceiling_grace = _typed(sec, "soak", "hard_ceiling_grace_s", int, 15)
+    kill_grace = _typed(sec, "soak", "segment_kill_grace_s", int, 10)
+    if ceiling_grace < 0 or kill_grace < 0:
+        raise SpecError("'soak.hard_ceiling_grace_s' / 'segment_kill_grace_s' must be >= 0")
     return Soak(
         threads=threads,
         duration_s=duration,
         tolerate_errors=_typed(sec, "soak", "tolerate_errors", bool, True),
         report_interval_s=interval,
         max_relaunches=_typed(sec, "soak", "max_relaunches", int, 50),
+        fast_fail_segments=fast_fail,
+        hard_ceiling_grace_s=ceiling_grace,
+        segment_kill_grace_s=kill_grace,
     )
 
 

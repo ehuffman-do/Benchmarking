@@ -12,10 +12,11 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from pgbench_harness.errors import RunError
 from pgbench_harness.parser import INTERVAL_RE
@@ -176,21 +177,60 @@ def run_streaming(
     return proc.wait()
 
 
+def _kill_after_timeout(
+    proc: "subprocess.Popen[str]", timeout_s: float, kill_grace_s: float,
+    done: threading.Event, timed_out: dict[str, bool], logger: logging.Logger,
+) -> None:
+    """Watchdog: SIGTERM the segment at *timeout_s*, escalate to SIGKILL after grace.
+
+    sysbench is exec'd directly (no shell/wrapper) and runs its workers as
+    in-process threads, so terminating the process reaps the whole load
+    generator; we kill by PID rather than a process group so the harness's own
+    group is never touched. ``done`` is set by the reader when the child exits
+    normally, which short-circuits the wait so a healthy segment is never killed.
+    """
+    if done.wait(timeout_s):
+        return                                  # exited before the deadline
+    timed_out["flag"] = True
+    logger.error("soak: segment exceeded its %.0fs budget — terminating sysbench", timeout_s)
+    try:
+        proc.terminate()                        # SIGTERM
+    except OSError:
+        return
+    if not done.wait(kill_grace_s):
+        logger.error("soak: sysbench did not exit %.0fs after SIGTERM — sending SIGKILL",
+                     kill_grace_s)
+        try:
+            proc.kill()                         # SIGKILL
+        except OSError:
+            pass
+
+
 def run_streaming_timestamped(
     cmd: SysbenchCommand,
     env: dict[str, str],
     log_path: Path,
     logger: logging.Logger,
     heartbeat_every: int = 120,
-) -> tuple[int, int]:
+    timeout_s: Optional[float] = None,
+    kill_grace_s: float = 10.0,
+    on_line: Optional[Callable[[str, str], None]] = None,
+) -> tuple[int, int, bool]:
     """Run *cmd*, teeing each line to *log_path* prefixed with the read-time UTC.
 
     Each line becomes ``<ISO-8601 UTC>\\t<original line>``. The timestamp is the
     moment the load generator received the line — i.e. ~the end of that 1s
     sysbench interval — which is the clock used to align events and provider
     graphs. The raw log stays parseable by INTERVAL_RE (it ``search``es, so the
-    prefix is ignored). Returns ``(exit_code, interval_line_count)`` so the
-    supervisor can detect launches that produced no samples.
+    prefix is ignored).
+
+    *timeout_s* bounds a single segment: if the child neither emits output nor
+    exits within the budget, a watchdog SIGTERMs then SIGKILLs it so a hung load
+    generator can never block the soak supervisor past its deadline. *on_line*,
+    if given, is called ``(ts_iso, redacted_line)`` per line so callers can
+    stream a parsed series live without re-reading the log.
+
+    Returns ``(exit_code, interval_line_count, timed_out)``.
     """
     redact = get_redactor().redact
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -206,18 +246,40 @@ def run_streaming_timestamped(
         ) from exc
     intervals = 0
     seen = 0
-    with open(log_path, "w", encoding="utf-8") as log:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            log.write(f"{ts}\t{redact(line)}")
-            log.flush()
-            if INTERVAL_RE.search(line):
-                intervals += 1
-            seen += 1
-            if seen % heartbeat_every == 0:
-                logger.info("    %s", redact(line.rstrip()))
-    return proc.wait(), intervals
+    timed_out = {"flag": False}
+    done = threading.Event()
+    watchdog: Optional[threading.Thread] = None
+    if timeout_s is not None:
+        watchdog = threading.Thread(
+            target=_kill_after_timeout,
+            args=(proc, timeout_s, kill_grace_s, done, timed_out, logger),
+            daemon=True,
+        )
+        watchdog.start()
+    try:
+        with open(log_path, "w", encoding="utf-8") as log:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                red = redact(line)
+                log.write(f"{ts}\t{red}")
+                log.flush()
+                if INTERVAL_RE.search(line):
+                    intervals += 1
+                if on_line is not None:
+                    try:
+                        on_line(ts, red)
+                    except Exception:  # noqa: BLE001  a live-tap error must never kill the run
+                        pass
+                seen += 1
+                if seen % heartbeat_every == 0:
+                    logger.info("    %s", redact(line.rstrip()))
+        rc = proc.wait()
+    finally:
+        done.set()                              # release the watchdog (no-op if it already fired)
+        if watchdog is not None:
+            watchdog.join(timeout=1.0)
+    return rc, intervals, timed_out["flag"]
 
 
 def sysbench_version() -> str:

@@ -501,6 +501,31 @@ def cmd_mark(run_dir: Path, etype: str, label: str, note: str) -> int:
     return 0
 
 
+def _segment_error_excerpt(seg_log: Path, rc: int, n_intervals: int) -> str:
+    """Best-effort human reason a soak segment failed, read from its raw log.
+
+    Segment logs are ``<ISO>\\t<sysbench line>``; we strip the timestamp prefix
+    and surface sysbench's own FATAL/ERROR lines (the same machinery
+    ``_execute_level`` uses for sweeps). Falls back to the last few non-empty
+    lines so connection / SSL / timeout messages that don't match the error
+    regex are still visible. The log is already redacted at write time, so the
+    excerpt can never contain the password.
+    """
+    from pgbench_harness.parser import ERROR_LINE_RE
+    try:
+        raw = seg_log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return f"sysbench exited with code {rc} ({n_intervals} intervals); log unreadable"
+    lines = [(ln.partition("\t")[2] or ln).rstrip() for ln in raw]
+    errs = [ln for ln in lines if ln and ERROR_LINE_RE.search(ln)]
+    if errs:
+        return "\n".join(errs[:5])
+    tail = [ln for ln in lines if ln][-5:]
+    if tail:
+        return "\n".join(tail)
+    return f"sysbench exited with code {rc} with no output ({n_intervals} intervals)"
+
+
 def _soak_supervisor(
     spec: Spec, password: str, run_dir: Path, manifest: Manifest, logger: logging.Logger,
     stop: Optional[dict] = None,
@@ -508,6 +533,13 @@ def _soak_supervisor(
     """Run sysbench at fixed concurrency for the full window, relaunching if it
     exits early so an outage can never truncate the test. Each segment's lines
     are timestamped at read time; gaps between segments are measured as downtime.
+
+    Safety bounds (a run that can't produce samples must fail fast with a clear
+    reason, never burn the window): every segment is wall-clock bounded
+    (``run_streaming_timestamped`` SIGTERM/SIGKILLs a hung child); the loop never
+    runs past ``duration_s + hard_ceiling_grace_s``; and ``fast_fail_segments``
+    consecutive zero-sample launches abort immediately with the load generator's
+    own error surfaced.
     """
     soak = spec.soak
     assert soak is not None
@@ -515,8 +547,11 @@ def _soak_supervisor(
     start_mono = time.monotonic()
     start_utc = _iso_micros()
     deadline = start_mono + soak.duration_s
+    hard_deadline = deadline + soak.hard_ceiling_grace_s
     segments: list[dict] = []
-    seg = relaunches = total_intervals = consecutive_empty = consecutive_short = 0
+    seg = relaunches = total_intervals = 0
+    consecutive_short = consecutive_zero_sample = 0
+    last_excerpt = ""
 
     # Seed planned (spec-declared) events that have an explicit offset.
     base_dt = datetime.strptime(start_utc, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
@@ -530,7 +565,12 @@ def _soak_supervisor(
         if stop is not None and stop.get("flag"):
             logger.warning("soak: stop requested (signal) — finalizing partial results.")
             break
-        remaining = int(round(deadline - time.monotonic()))
+        now = time.monotonic()
+        if now >= hard_deadline:   # absolute backstop: never exceed duration_s + grace
+            logger.error("soak: hard wall-clock ceiling reached (duration %ds + grace %ds); "
+                         "stopping.", soak.duration_s, soak.hard_ceiling_grace_s)
+            break
+        remaining = int(round(deadline - now))
         if remaining < 1:
             break
         seg += 1
@@ -543,25 +583,45 @@ def _soak_supervisor(
         seg_start = _iso_micros()
         seg_mono = time.monotonic()
         logger.info("soak segment %d (remaining %ds): %s", seg, remaining, cmd.display())
-        rc, n_intervals = sysbench.run_streaming_timestamped(cmd, env, seg_log, logger)
+        # Bound the segment to its requested time plus a kill grace, so a child
+        # that connects but hangs (no output, never exits) cannot block the loop
+        # past the deadline — the watchdog SIGTERM/SIGKILLs it.
+        seg_timeout = float(remaining + soak.segment_kill_grace_s)
+        rc, n_intervals, timed_out = sysbench.run_streaming_timestamped(
+            cmd, env, seg_log, logger,
+            timeout_s=seg_timeout, kill_grace_s=float(soak.segment_kill_grace_s))
         seg_wall = time.monotonic() - seg_mono
+        excerpt = ""
+        if rc != 0 or n_intervals == 0:
+            excerpt = _segment_error_excerpt(seg_log, rc, n_intervals)
+            last_excerpt = excerpt
+            head = excerpt.splitlines()[0] if excerpt else ""
+            logger.error("soak segment %d FAILED (exit %d, %d intervals%s): %s",
+                         seg, rc, n_intervals, ", timed out" if timed_out else "", head)
         segments.append({"seg": seg, "log": f"raw/{seg_log.name}", "started_utc": seg_start,
-                         "finished_utc": _iso_micros(), "exit_code": rc, "intervals": n_intervals})
+                         "finished_utc": _iso_micros(), "exit_code": rc,
+                         "intervals": n_intervals, "timed_out": timed_out,
+                         "error_excerpt": excerpt})
         manifest.soak = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
         manifest.save(run_dir)
         total_intervals += n_intervals
-        consecutive_empty = consecutive_empty + 1 if n_intervals == 0 else 0
-        # A "short" segment exited well before its requested time — i.e. it keeps
-        # dying early. Tracked separately so a fast exit/0-sample loop can't churn.
+        # Decoupled from total_intervals: a single stray interval line in any one
+        # segment must NOT permanently disable the zero-sample cutoff.
+        consecutive_zero_sample = consecutive_zero_sample + 1 if n_intervals == 0 else 0
         consecutive_short = consecutive_short + 1 if seg_wall < min(5, remaining) else 0
         if rc == 0 and time.monotonic() >= deadline - 1:
             break  # completed the window cleanly
-        if total_intervals == 0 and consecutive_empty >= 8:
+        if consecutive_zero_sample >= soak.fast_fail_segments:
             raise RunError(
-                "soak produced no samples across 8 launches — the load generator "
-                "cannot reach the target.",
-                hint="run `preflight`; verify connectivity, credentials and that the "
-                     "dataset is loaded before launching a soak.")
+                f"soak produced no samples in {consecutive_zero_sample} consecutive launches "
+                f"at {soak.threads} threads — the load generator cannot sustain load against "
+                f"the target.",
+                hint=("last sysbench error:\n  "
+                      + ((last_excerpt or f"exit {rc}").replace("\n", "\n  "))
+                      + "\nrun `preflight`; verify connectivity, credentials, the dataset, and "
+                        "that the target accepts this concurrency. NOTE: preflight's idle-holder "
+                        "ceiling probe passing does not guarantee tpcc's heavier per-thread init "
+                        "succeeds at this thread count."))
         if consecutive_short >= 15:
             logger.error("soak: load generator exited almost immediately %d times in a "
                          "row; stopping to avoid a relaunch hot-loop.", consecutive_short)
@@ -574,6 +634,8 @@ def _soak_supervisor(
 
     doc = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
     doc["finish_utc"] = _iso_micros()
+    if last_excerpt:
+        doc["failure_excerpt"] = last_excerpt
     return doc
 
 
@@ -581,6 +643,42 @@ def _soak_doc(manifest: Manifest, start_utc: str, duration_s: int,
               segments: list, relaunches: int) -> dict:
     return {"run_id": manifest.run_id, "start_utc": start_utc,
             "target_duration_s": duration_s, "segments": segments, "relaunches": relaunches}
+
+
+def _finalize_soak(
+    run_dir: Path, spec: Spec, manifest: Manifest, logger: logging.Logger, aborted: bool,
+) -> str:
+    """Persist a TERMINAL manifest status + (best-effort) report on every exit.
+
+    Runs on both the normal-return and the abort (supervisor-raised) paths so the
+    on-disk manifest is never left at 'running'. Analysis and report generation
+    are best-effort: a failure in either must not undo the terminal status (that
+    would re-introduce the 'stuck live forever' cockpit bug).
+    """
+    summary: Optional[dict] = None
+    try:
+        if manifest.soak:
+            summary = soak.analyze(run_dir, spec, manifest.soak)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("soak: analysis failed during finalize: %s", exc)
+    if summary is not None:
+        status = summary.get("status", "failed")
+        if aborted and status == "complete":   # an aborted run is never 'complete'
+            status = "failed"
+        manifest.wall_time_s = float(summary.get("observed_seconds", 0))
+    else:
+        status = "failed"
+    manifest.status = status
+    manifest.finished_utc = (manifest.soak.get("finish_utc") if manifest.soak else "") or utc_now_iso()
+    manifest.save(run_dir)
+    try:
+        out = report_soak.generate_soak_report(run_dir)
+        cov = summary.get("coverage_pct", 0.0) if summary else 0.0
+        logger.info("soak %s finished (status '%s', coverage %.1f%%); report: %s",
+                    manifest.run_id, status, cov, out)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("soak: report generation failed during finalize: %s", exc)
+    return status
 
 
 def cmd_soak(
@@ -639,6 +737,10 @@ def cmd_soak(
     logger.info("starting soak load; trigger events from the provider console and run "
                 "`pgbench-harness mark --run-dir %s --type <failover|scale_up|...> "
                 "--label '...'` at the moment you trigger them.", run_dir)
+    if spec.soak.tolerate_errors:
+        logger.warning("soak: tolerate_errors has no effect with the pgsql driver "
+                       "(sysbench --ignore-errors is MySQL-only); on a hard error the load "
+                       "generator exits and the supervisor relaunches it.")
     # Graceful stop: SIGINT/SIGTERM finalize a partial resilience report instead
     # of discarding the run. The signal also reaches the child sysbench, which
     # exits, unblocking the supervisor's read loop so it sees the flag.
@@ -655,22 +757,26 @@ def cmd_soak(
                if spec.capture.live_pg else None)
     if sampler:
         sampler.start()
+    supervisor_error: Optional[BaseException] = None
     try:
         manifest.soak = _soak_supervisor(spec, password, run_dir, manifest, logger, stop=stop)
+    except Exception as exc:  # noqa: BLE001 — finalize a terminal status even on abort, then re-raise
+        supervisor_error = exc
+        logger.error("soak aborted: %s", exc)
     finally:
         if sampler:
             sampler.stop()
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
-    summary = soak.analyze(run_dir, spec, manifest.soak)
-    manifest.status = summary["status"]
-    manifest.finished_utc = manifest.soak.get("finish_utc", "")
-    manifest.wall_time_s = float(summary.get("observed_seconds", 0))
-    manifest.save(run_dir)
-    out = report_soak.generate_soak_report(run_dir)
-    logger.info("soak %s finished (status '%s', coverage %.1f%%); report: %s",
-                run_id, summary["status"], summary["coverage_pct"], out)
-    return 0 if summary["status"] == "complete" else 1
+    # ALWAYS finalize: persist a terminal manifest status + (best-effort) report,
+    # even when the supervisor aborted. Otherwise the run is stuck 'running' on
+    # disk forever and the cockpit can never leave 'live' (see _progress / the
+    # SSE 'done' event, which key off manifest.status).
+    status = _finalize_soak(run_dir, spec, manifest, logger,
+                            aborted=supervisor_error is not None)
+    if supervisor_error is not None:
+        raise supervisor_error
+    return 0 if status == "complete" else 1
 
 
 def _sweep(

@@ -336,6 +336,18 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
     else:
         status = "complete"
 
+    # Surface WHY a soak produced little/no data so a failed run is never an
+    # indistinguishable blank: the load generator's own error, lifted from the
+    # per-segment records the supervisor now captures (runner._segment_error_excerpt).
+    seg_list = manifest_soak.get("segments", [])
+    failed_segments = sum(1 for s in seg_list
+                          if s.get("exit_code") not in (0, None) or s.get("intervals", 0) == 0)
+    failure_reason = manifest_soak.get("failure_excerpt") or next(
+        (s.get("error_excerpt") for s in seg_list if s.get("error_excerpt")), "")
+    if status == "failed" and failure_reason:
+        warnings.append("load generator never produced samples; last sysbench error: "
+                        + failure_reason.splitlines()[0])
+
     _write_timeseries(run_dir, tl, horizon)
     summary = {
         "run_id": manifest_soak.get("run_id"),
@@ -352,7 +364,9 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
         "coverage_pct": round(coverage * 100, 1),
         "gaps_s": span - len(present),
         "relaunches": manifest_soak.get("relaunches", 0),
-        "segments": manifest_soak.get("segments", []),
+        "segments": seg_list,
+        "failed_segments": failed_segments,
+        "failure_reason": failure_reason,
         "warnings": warnings,
         "baseline": {
             "window_s": [bw[0], bw[1]], "tps": round(baseline_tps, 1),
