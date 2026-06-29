@@ -651,7 +651,12 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                 raise HTTPException(404, f"run not found: {d.name}")
         out = cfg.data_dir / "tmp"
         out.mkdir(parents=True, exist_ok=True)
-        path = harness_api.compare(dirs, out / f"compare-{'-'.join(ids)[:80]}.html")
+        try:
+            path = harness_api.compare(dirs, out / f"compare-{'-'.join(ids)[:80]}.html")
+        except harness_api.HarnessError as exc:
+            # e.g. mixed run types, or a run with no parsed summary — show the
+            # reason in the iframe instead of an opaque 500.
+            return HTMLResponse(_compare_error_html(exc), status_code=400)
         return HTMLResponse(path.read_text(encoding="utf-8"))
 
     # ── admin: users / audit (legacy paths redirect into the console) ──
@@ -979,6 +984,18 @@ def _read_pg_settings(run_dir: Path) -> Optional[dict]:
         return None
     keyset = set(KEY_SETTINGS)
     return {"key": [r for r in rows if r["name"] in keyset], "all": rows}
+
+
+def _compare_error_html(exc: Exception) -> str:
+    """A small self-contained page shown in the compare iframe on a known error."""
+    import html as _html
+    hint = getattr(exc, "hint", "")
+    hint_html = f"<p style='color:#5b6573'>{_html.escape(str(hint))}</p>" if hint else ""
+    return ("<!doctype html><meta charset='utf-8'>"
+            "<body style='font-family:system-ui,-apple-system,sans-serif;padding:28px'>"
+            "<h3 style='margin:0 0 8px'>Comparison not available</h3>"
+            f"<p style='color:#c0392b;margin:0 0 6px'>{_html.escape(str(exc))}</p>"
+            f"{hint_html}</body>")
 
 
 def _run_dir_safe(cfg: Config, run_id: str) -> Path:

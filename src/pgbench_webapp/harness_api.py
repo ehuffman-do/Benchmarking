@@ -12,7 +12,7 @@ import yaml
 from pgbench_harness import report as _report
 from pgbench_harness import report_soak as _report_soak
 from pgbench_harness import runner, sysbench
-from pgbench_harness.compare import generate_compare
+from pgbench_harness.compare import compare_runs
 from pgbench_harness.errors import HarnessError, SpecError
 from pgbench_harness.spec import Spec, parse_spec
 
@@ -73,7 +73,8 @@ def report_filename(run_dir: Path) -> str:
 
 
 def compare(run_dirs: list[Path], out_path: Path) -> Path:
-    return generate_compare(run_dirs, out_path)
+    """Dispatch to the sweep or soak comparison; refuses mixed run types."""
+    return compare_runs(run_dirs, out_path)
 
 
 def mark_event(run_dir: Path, etype: str, label: str, note: str) -> None:

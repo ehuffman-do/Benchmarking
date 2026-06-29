@@ -140,6 +140,40 @@ def test_live_run_loads_from_filesystem_before_indexed(web):
     assert client.get("/api/runs/nope-xyz", auth=("viewer", "vpw")).status_code == 404
 
 
+def test_compare_same_type_only(web):
+    """Compare renders for sweep-vs-sweep and soak-vs-soak, REFUSES cross-type
+    cleanly, and never returns an opaque 500."""
+    import json as _json
+    client, cfg = web
+
+    def _make(mode):
+        client.post("/api/runs", json={"spec_yaml": _spec_yaml(mode), "password": WEB_PW},
+                    auth=("op", "oppw"))
+        return _run_worker_once(cfg)[2]["run_id"]
+    sweeps = [_make("sweep"), _make("sweep")]
+    soaks = [_make("soak"), _make("soak")]
+
+    r = client.get(f"/compare/view?runs={sweeps[0]},{sweeps[1]}", auth=("viewer", "vpw"))
+    assert r.status_code == 200 and "QPS" in r.text, r.text[:400]
+
+    r = client.get(f"/compare/view?runs={soaks[0]},{soaks[1]}", auth=("viewer", "vpw"))
+    assert r.status_code == 200, r.text[:400]
+    assert "Soak comparison" in r.text and "Median TPS" in r.text
+
+    # cross-type -> clean refusal, not a rendered report, not a 500
+    r = client.get(f"/compare/view?runs={sweeps[0]},{soaks[0]}", auth=("viewer", "vpw"))
+    assert r.status_code == 400 and "Internal Server Error" not in r.text
+    assert "same type" in r.text.lower()
+
+    # a run with no parsed summary -> clean error
+    rd = cfg.results_dir / "run-bare"
+    rd.mkdir(parents=True)
+    (rd / "manifest.json").write_text(_json.dumps({"run_id": "run-bare", "mode": "sweep"}),
+                                      encoding="utf-8")
+    r = client.get(f"/compare/view?runs={sweeps[0]},run-bare", auth=("viewer", "vpw"))
+    assert r.status_code == 400 and "Internal Server Error" not in r.text
+
+
 # ── migrations ──────────────────────────────────────────────────────
 
 def test_migrations_idempotent(tmp_path):
