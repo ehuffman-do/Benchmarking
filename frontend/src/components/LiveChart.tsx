@@ -16,13 +16,15 @@ interface Props {
   height?: number;
   yFormat?: (v: number) => string;
   xFormat?: (v: number) => string; // default: "<v>s"
+  xMax?: number; // anchor the x-axis at [0, max(data, xMax)] so a running time
+                 // axis is drawn from t=0 even before any data arrives
 }
 
 // Axis/grid colours that read on both themes (mid-grey, low-alpha grid).
 const AXIS = "#8b97a6";
 const GRID = "rgba(139,151,166,0.16)";
 
-export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat }: Props) {
+export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat, xMax }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
 
@@ -58,7 +60,9 @@ export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat }:
       // Guard degenerate auto-ranges: when a series is all zeros (e.g. before any
       // data arrives), uPlot would collapse min==max and render a broken axis.
       scales: {
-        x: { time: false },
+        x: xMax
+          ? { time: false, range: (_u, _min, max) => [0, Math.max(max || 0, xMax)] }
+          : { time: false },
         y: { range: (_u, min, max) => (min === max ? [0, max || 1] : [min, max]) },
         y2: { range: (_u, min, max) => (min === max ? [0, max || 1] : [min, max]) },
       },
@@ -87,7 +91,7 @@ export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat }:
       plot.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [title, height, series.map((s) => `${s.label}:${s.scale ?? "y"}`).join("|")]);
+  }, [title, height, xMax, series.map((s) => `${s.label}:${s.scale ?? "y"}`).join("|")]);
 
   // Stream data in on every update without rebuilding the plot.
   useEffect(() => {
