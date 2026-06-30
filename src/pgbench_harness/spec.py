@@ -63,7 +63,7 @@ class Sweep:
 @dataclass(frozen=True)
 class Capture:
     pg_settings: bool = True
-    pg_stat_statements: str = "auto"  # "auto" | "true" | "false"
+    pg_stat_monitor: str = "auto"  # "auto" | "true" | "false"
     bgwriter_stats: bool = True
     io_stats: bool = True
     histogram: bool = True
@@ -93,21 +93,6 @@ class ReportCfg:
     detect_max_events: int = 50
 
 
-SOAK_EVENT_TYPES = ("failover", "scale_up", "scale_down", "note", "loadgen_restart")
-SOAK_TRIGGERS = ("manual", "do_api", "aiven_api")
-
-
-@dataclass(frozen=True)
-class Event:
-    """A timeline annotation (declared in the spec or appended live via `mark`)."""
-
-    type: str
-    at_s: Optional[int] = None          # offset from soak start (spec-declared events)
-    trigger: str = "manual"
-    note: str = ""
-    label: str = ""
-
-
 @dataclass(frozen=True)
 class Soak:
     """Fixed-concurrency, long-duration resilience run (failover/scale capture)."""
@@ -133,7 +118,6 @@ class Spec:
     capture: Capture
     report: ReportCfg
     soak: Optional[Soak] = None
-    events: tuple[Event, ...] = ()
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
     @property
@@ -297,16 +281,16 @@ def _parse_sweep(sec: dict[str, Any]) -> Sweep:
 
 def _parse_capture(sec: dict[str, Any]) -> Capture:
     _check_keys(sec, "capture", set(),
-                {"pg_settings", "pg_stat_statements", "bgwriter_stats", "io_stats", "histogram",
+                {"pg_settings", "pg_stat_monitor", "bgwriter_stats", "io_stats", "histogram",
                  "live_pg", "live_pg_interval_s"})
-    pss = sec.get("pg_stat_statements", "auto")
-    if isinstance(pss, bool):
-        pss = "true" if pss else "false"
-    if pss not in ("auto", "true", "false"):
-        raise SpecError("'capture.pg_stat_statements' must be true, false or 'auto'")
+    psm = sec.get("pg_stat_monitor", "auto")
+    if isinstance(psm, bool):
+        psm = "true" if psm else "false"
+    if psm not in ("auto", "true", "false"):
+        raise SpecError("'capture.pg_stat_monitor' must be true, false or 'auto'")
     return Capture(
         pg_settings=_typed(sec, "capture", "pg_settings", bool, True),
-        pg_stat_statements=pss,
+        pg_stat_monitor=psm,
         bgwriter_stats=_typed(sec, "capture", "bgwriter_stats", bool, True),
         io_stats=_typed(sec, "capture", "io_stats", bool, True),
         histogram=_typed(sec, "capture", "histogram", bool, True),
@@ -401,44 +385,20 @@ def _parse_soak(sec: dict[str, Any]) -> Soak:
     )
 
 
-def _parse_events(doc: Any) -> tuple[Event, ...]:
-    if "events" not in doc:
-        return ()
-    raw = doc["events"]
-    if not isinstance(raw, list):
-        raise SpecError("'events' must be a list")
-    out: list[Event] = []
-    for i, ev in enumerate(raw):
-        if not isinstance(ev, dict):
-            raise SpecError(f"events[{i}] must be a mapping")
-        unknown = set(ev) - {"at_s", "type", "trigger", "note", "label"}
-        if unknown:
-            raise SpecError(f"unknown key(s) in events[{i}]: {', '.join(sorted(unknown))}")
-        etype = ev.get("type")
-        if etype not in SOAK_EVENT_TYPES:
-            raise SpecError(f"events[{i}].type must be one of {SOAK_EVENT_TYPES}, got {etype!r}")
-        trigger = ev.get("trigger", "manual")
-        if trigger not in SOAK_TRIGGERS:
-            raise SpecError(f"events[{i}].trigger must be one of {SOAK_TRIGGERS}")
-        if trigger != "manual":
-            raise SpecError(
-                f"events[{i}].trigger={trigger!r} is not supported yet (Phase 1 is manual only)")
-        at_s = ev.get("at_s")
-        if at_s is not None and (not isinstance(at_s, int) or isinstance(at_s, bool) or at_s < 0):
-            raise SpecError(f"events[{i}].at_s must be a non-negative integer (seconds from soak start)")
-        out.append(Event(type=etype, at_s=at_s, trigger=trigger,
-                         note=str(ev.get("note", "")), label=str(ev.get("label", ""))))
-    return tuple(out)
-
-
 def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
     """Validate a parsed YAML document and return a typed :class:`Spec`."""
     if not isinstance(doc, dict):
         raise SpecError(f"{source}: top level of the spec must be a mapping")
-    known = {"run", "target", "workload", "sweep", "capture", "report", "soak", "events"}
+    known = {"run", "target", "workload", "sweep", "capture", "report", "soak"}
     unknown = set(doc) - known
     if unknown:
-        raise SpecError(f"unknown top-level section(s): {', '.join(sorted(unknown))}")
+        hint = ""
+        if "events" in unknown:
+            # Spec-declared events were removed: timeline events now come ONLY from
+            # auto-detection or operator marks (live cockpit / report stamping).
+            hint = (" — the 'events' section was removed; mark events live via the "
+                    "console or `pgbench-harness mark`, or rely on auto-detection")
+        raise SpecError(f"unknown top-level section(s): {', '.join(sorted(unknown))}{hint}")
     has_soak, has_sweep = "soak" in doc, "sweep" in doc
     if has_soak and has_sweep:
         raise SpecError("spec has both 'soak' and 'sweep'; they are mutually exclusive "
@@ -448,9 +408,6 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
                         "(resilience) section")
     sweep = _parse_sweep(_section(doc, "sweep")) if has_sweep else None
     soak = _parse_soak(_section(doc, "soak")) if has_soak else None
-    events = _parse_events(doc)
-    if events and not has_soak:
-        raise SpecError("'events' are only valid with a 'soak' section")
     return Spec(
         run=_parse_run(_section(doc, "run")),
         target=_parse_target(_section(doc, "target")),
@@ -459,7 +416,6 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
         capture=_parse_capture(doc.get("capture") or {}),
         report=_parse_report(doc.get("report") or {}, sweep),
         soak=soak,
-        events=events,
         raw=doc,
     )
 

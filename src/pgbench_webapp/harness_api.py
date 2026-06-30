@@ -77,8 +77,18 @@ def compare(run_dirs: list[Path], out_path: Path) -> Path:
     return compare_runs(run_dirs, out_path)
 
 
-def mark_event(run_dir: Path, etype: str, label: str, note: str) -> None:
-    runner.cmd_mark(run_dir, etype, label, note)
+def mark_event(run_dir: Path, etype: str, label: str, note: str,
+               at_s: Optional[float] = None) -> None:
+    """Stamp a timeline event. ``at_s`` (offset seconds from the soak start) lets an
+    operator annotate a specific point on the chart; without it the event is stamped
+    at 'now' (the live-cockpit behaviour)."""
+    runner.cmd_mark(run_dir, etype, label, note, at_s=at_s)
+
+
+def interactive_timeseries(run_dir: Path) -> Optional[dict[str, Any]]:
+    """uPlot-ready decimated soak series + markers for the in-app report (live or
+    finished). None when the run has no soak timeline to plot."""
+    return _report_soak.interactive_payload(run_dir)
 
 
 def prepare_stats(spec_yaml: str, results_dir: Path) -> Optional[dict[str, Any]]:

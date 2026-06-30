@@ -54,7 +54,7 @@ export function App() {
           {me.role === "admin" && <Route path="/users" element={<Users me={me} />} />}
           {me.role === "admin" && <Route path="/audit" element={<Audit />} />}
           <Route path="/runs/:runId" element={<RunDetail me={me} />} />
-          <Route path="/runs/:runId/report" element={<ReportView />} />
+          <Route path="/runs/:runId/report" element={<ReportView me={me} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Shell>

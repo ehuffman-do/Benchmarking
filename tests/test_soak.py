@@ -178,7 +178,6 @@ def _soak_doc(**over):
     doc.pop("sweep")
     doc.pop("report", None)
     doc["soak"] = {"threads": 32, "duration_s": 120, "tolerate_errors": True}
-    doc["events"] = [{"at_s": 60, "type": "failover", "trigger": "manual", "label": "fail"}]
     doc["report"] = {"baseline_window_s": [10, 50], "recovery_threshold_pct": 95}
     for k, v in over.items():
         doc[k] = v
@@ -190,7 +189,6 @@ def test_valid_soak_spec() -> None:
     assert spec.is_soak
     assert spec.sweep is None
     assert spec.soak.threads == 32
-    assert spec.events[0].type == "failover"
     assert spec.report.baseline_window_s == (10, 50)
 
 
@@ -201,21 +199,13 @@ def test_soak_and_sweep_mutually_exclusive() -> None:
         parse_spec(doc)
 
 
-def test_events_require_soak() -> None:
-    doc = make_spec_doc()
-    doc["events"] = [{"at_s": 1, "type": "note"}]
-    with pytest.raises(SpecError, match="only valid with a 'soak'"):
+def test_spec_events_section_rejected() -> None:
+    """Events are no longer pre-declared in the spec — an `events:` section is now
+    an unknown top-level key (events come from auto-detection or operator marks)."""
+    doc = _soak_doc()
+    doc["events"] = [{"at_s": 60, "type": "failover"}]
+    with pytest.raises(SpecError, match="unknown top-level section.*events"):
         parse_spec(doc)
-
-
-def test_bad_event_type_rejected() -> None:
-    with pytest.raises(SpecError, match="type must be one of"):
-        parse_spec(_soak_doc(events=[{"type": "explode"}]))
-
-
-def test_non_manual_trigger_rejected() -> None:
-    with pytest.raises(SpecError, match="not supported yet"):
-        parse_spec(_soak_doc(events=[{"type": "failover", "trigger": "do_api"}]))
 
 
 # ── end-to-end (fake sysbench/psql) ────────────────────────────────
@@ -223,8 +213,7 @@ def test_non_manual_trigger_rejected() -> None:
 def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     results = tmp_path / "results"
     spec_path = tmp_path / "soak.yaml"
-    doc = _soak_doc(soak={"threads": 4, "duration_s": 2, "tolerate_errors": True},
-                    events=[{"at_s": 1, "type": "failover", "label": "primary failover"}])
+    doc = _soak_doc(soak={"threads": 4, "duration_s": 2, "tolerate_errors": True})
     spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
     assert main(["soak", "--spec", str(spec_path), "--results-dir", str(results)]) in (0, 1)
     run_dir = sorted(d for d in results.iterdir() if (d / "manifest.json").exists())[-1]
@@ -236,11 +225,12 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     # B3: the read/write/other QPS split + per-interval percentile reach the series
     assert ts_lines[0].split(",")[-4:] == ["qps_r", "qps_w", "qps_o", "lat_p99_pct"]
     assert float(ts_lines[1].split(",")[9]) > 0          # qps_r populated, not blank
-    assert (run_dir / "events.jsonl").exists()
     assert list(run_dir.glob("raw/soak_seg*.log"))
     summary = json.loads((run_dir / "parsed" / "soak_summary.json").read_text())
     assert summary["mode"] == "soak"
-    assert any(e["type"] == "failover" for e in summary["events"])
+    # Events are no longer spec-seeded — the run starts with none confirmed; they
+    # arrive via auto-detection or operator marks (asserted after the mark below).
+    assert isinstance(summary["events"], list)
     # B1: the always-on run profile is present and populated even on a tiny run
     assert summary["run_profile"]["tps"] and "detected" in summary
     # B7: auto-generated narrative verdict leads the report
@@ -250,6 +240,11 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     assert main(["mark", "--run-dir", str(run_dir), "--type", "scale_up",
                  "--label", "resize"]) == 0
     assert main(["report", "--run-dir", str(run_dir)]) == 0
+    # the operator mark is the source of the confirmed event now (and creates
+    # events.jsonl, which a clean no-event soak never writes)
+    assert (run_dir / "events.jsonl").exists()
+    summary2 = json.loads((run_dir / "parsed" / "soak_summary.json").read_text())
+    assert any(e["type"] == "scale_up" for e in summary2["events"])
     html = (run_dir / "soak_report.html").read_text()
     assert "Resilience" in html
     assert "Methodology" in html
@@ -266,6 +261,33 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     assert not leaks
 
 
+def test_interactive_payload_live_without_summary(tmp_path) -> None:
+    """The in-app timeseries builder works MID-RUN: series come from a (partially
+    written) soak_timeseries.csv, and markers are recomputed live from events.jsonl
+    against the manifest soak start — with NO soak_summary.json present yet."""
+    from pgbench_harness import report_soak, runner
+    run_dir = tmp_path / "run-live"
+    (run_dir / "parsed").mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(json.dumps(
+        {"run_id": "run-live", "mode": "soak",
+         "soak": {"start_utc": "2026-06-30T00:00:00.000000Z", "target_duration_s": 600}}),
+        encoding="utf-8")
+    cols = "t,ts_utc,tps,qps,lat_p99,err_s,reconn_s,threads,seg,qps_r,qps_w,qps_o,lat_p99_pct"
+    rows = [cols,
+            "0,2026-06-30T00:00:00.000000Z,100,2000,40,0,0,4,soak_seg01,1000,700,300,99",
+            "1,2026-06-30T00:00:01.000000Z,110,2200,41,0,0,4,soak_seg01,1100,770,330,99",
+            "2,2026-06-30T00:00:02.000000Z,120,2400,42,0,0,4,soak_seg01,1200,840,360,99",
+            "x-partial-trailing-line"]   # truncated live append -> must be skipped, not crash
+    (run_dir / "parsed" / "soak_timeseries.csv").write_text("\n".join(rows), encoding="utf-8")
+    # operator stamps a failover at t=2 while the run is still in flight
+    assert runner.cmd_mark(run_dir, "failover", "primary", "", at_s=2) == 0
+    payload = report_soak.interactive_payload(run_dir)
+    assert payload is not None
+    assert payload["t"] == [0, 1, 2] and len(payload["tps"]) == 3
+    assert any(mk["t"] == 2 and mk["kind"] == "event" for mk in payload["markers"])
+    assert not (run_dir / "parsed" / "soak_summary.json").exists()
+
+
 def test_soak_surfaces_failure_and_finalizes(fake_env, tmp_path, monkeypatch) -> None:
     """A soak whose load generator can't run must FAIL FAST, surface sysbench's
     own error, and leave a TERMINAL manifest — never an indistinguishable blank,
@@ -274,7 +296,7 @@ def test_soak_surfaces_failure_and_finalizes(fake_env, tmp_path, monkeypatch) ->
     results = tmp_path / "results"
     spec_path = tmp_path / "soak.yaml"
     doc = _soak_doc(soak={"threads": 64, "duration_s": 300, "tolerate_errors": True,
-                          "fast_fail_segments": 2}, events=[])
+                          "fast_fail_segments": 2})
     spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
     t0 = time.monotonic()
@@ -314,7 +336,7 @@ def test_soak_rides_through_outage_after_producing_samples(fake_env, tmp_path, m
     spec_path = tmp_path / "soak.yaml"
     doc = _soak_doc(soak={"threads": 4, "duration_s": 6, "tolerate_errors": True,
                           "fast_fail_segments": 2, "segment_kill_grace_s": 1,
-                          "hard_ceiling_grace_s": 2}, events=[])
+                          "hard_ceiling_grace_s": 2})
     spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
     rc = main(["soak", "--spec", str(spec_path), "--results-dir", str(results)])
@@ -335,7 +357,7 @@ def test_soak_segment_watchdog_kills_hung_child(fake_env, tmp_path, monkeypatch)
     spec_path = tmp_path / "soak.yaml"
     doc = _soak_doc(soak={"threads": 4, "duration_s": 2, "tolerate_errors": True,
                           "segment_kill_grace_s": 1, "hard_ceiling_grace_s": 3,
-                          "fast_fail_segments": 5}, events=[])
+                          "fast_fail_segments": 5})
     spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
     t0 = time.monotonic()
@@ -382,5 +404,6 @@ def test_soak_dry_run(fake_env, tmp_path, capsys) -> None:
     assert main(["soak", "--spec", str(spec_path), "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "sysbench" in out and "--threads=32" in out
-    assert "planned event: failover" in out
+    # events are auto-detected or operator-marked, never pre-declared in the spec
+    assert "auto-detected" in out and "mark" in out
     assert TEST_PASSWORD not in out

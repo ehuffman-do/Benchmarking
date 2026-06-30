@@ -46,10 +46,19 @@ def _load_timeseries(run_dir: Path) -> dict[int, dict[str, Any]]:
     tl: dict[int, dict[str, Any]] = {}
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            tl[int(row["t"])] = {
-                "tps": float(row["tps"]), "qps": float(row["qps"]),
-                "lat_p99": float(row["lat_p99"]), "err_s": float(row["err_s"]),
-                "reconn_s": float(row["reconn_s"]),
+            # Tolerate a partial trailing line (the live incremental writer appends
+            # rows while this is read for an in-flight run) and first-seen-wins dedup
+            # so a re-emitted second never overwrites the original sample.
+            try:
+                t = int(row["t"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if t < 0 or t in tl:
+                continue
+            tl[t] = {
+                "tps": _f(row, "tps") or 0.0, "qps": _f(row, "qps") or 0.0,
+                "lat_p99": _f(row, "lat_p99") or 0.0, "err_s": _f(row, "err_s") or 0.0,
+                "reconn_s": _f(row, "reconn_s") or 0.0,
                 # extra (B3) columns are absent on old run dirs -> None
                 "qps_r": _f(row, "qps_r"), "qps_w": _f(row, "qps_w"), "qps_o": _f(row, "qps_o"),
             }
@@ -122,6 +131,64 @@ def build_interactive(run_dir: Path, summary: dict[str, Any],
         pg = {"t": pxs, **pcols}
     return {"t": xs2, **cols2, "markers": markers, "pg": pg or None,
             "baseline_tps": summary.get("baseline", {}).get("tps") or None}
+
+
+def _soak_start(run_dir: Path):
+    """The soak's t=0 anchor (manifest.soak.start_utc) as a datetime, or None."""
+    from pgbench_harness.soak import _parse_ts_loose
+    try:
+        m = read_json(run_dir / "manifest.json")
+    except (OSError, ValueError):
+        return None
+    s = (m.get("soak") or {}).get("start_utc") if isinstance(m, dict) else None
+    try:
+        return _parse_ts_loose(s) if s else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _live_event_markers(run_dir: Path) -> list[dict[str, Any]]:
+    """Operator/spec event markers recomputed from events.jsonl against the soak
+    start, so a freshly-stamped mark shows on the in-app chart immediately — even
+    mid-run, before the next full analysis writes soak_summary.json."""
+    from pgbench_harness.soak import ANALYSIS_TYPES, read_events
+    start = _soak_start(run_dir)
+    if start is None:
+        return []
+    out = []
+    for e in read_events(run_dir):
+        if e.get("type") in ANALYSIS_TYPES:
+            at = max(0, int(round((e["_dt"] - start).total_seconds())))
+            out.append({"at_s": at, "type": e["type"], "label": e.get("label", "")})
+    return out
+
+
+def interactive_payload(run_dir: Path) -> Optional[dict[str, Any]]:
+    """uPlot-ready decimated arrays + event/detected markers for the IN-APP soak
+    report. Works for a live or finished soak: the series come from the (possibly
+    incrementally written) soak_timeseries.csv, markers are recomputed live from
+    events.jsonl, and ``detected``/``baseline`` are lifted from soak_summary.json
+    when the finalize analysis has produced it. None when there's nothing to plot."""
+    tl = _load_timeseries(run_dir)
+    if not tl:
+        return None
+    summary: dict[str, Any] = {}
+    sp = run_dir / "parsed" / "soak_summary.json"
+    if sp.exists():
+        try:
+            loaded = read_json(sp)
+            summary = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            summary = {}
+    # Always recompute markers from events.jsonl (the source of truth) rather than
+    # trust the snapshot in soak_summary.json, which is stale between analyses.
+    summary = dict(summary)
+    summary["events"] = _live_event_markers(run_dir)
+    summary["horizon_s"] = int(summary.get("horizon_s") or max(tl))
+    payload = build_interactive(run_dir, summary, tl)
+    if payload is not None:
+        payload["horizon_s"] = summary["horizon_s"]
+    return payload
 
 
 def _hms(seconds: float) -> str:
