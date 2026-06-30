@@ -88,7 +88,7 @@ def cmd_validate(spec_path: Path) -> int:
     if spec.is_soak:
         assert spec.soak is not None
         print(f"  soak     : {spec.soak.threads} threads for {fmt_duration(spec.soak.duration_s)} "
-              f"(events: auto-detected or operator-marked)")
+              f"(events: operator-marked only)")
     else:
         assert spec.sweep is not None
         print(f"  sweep    : threads {list(spec.sweep.threads)}, {spec.sweep.duration_s}s/level, "
@@ -661,8 +661,9 @@ def _soak_supervisor(
     last_excerpt = ""
 
     # Shared-clock anchor for the live per-second writer. Timeline events are NOT
-    # pre-declared in the spec: they arrive only via auto-detection (soak.analyze)
-    # or operator marks (the live cockpit / report stamping, appended to events.jsonl).
+    # pre-declared in the spec, and the harness does not auto-detect them: they
+    # arrive ONLY via operator marks (the live cockpit / report stamping, or
+    # `pgbench-harness mark`), appended to events.jsonl.
     base_dt = datetime.strptime(start_utc, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
 
     # Persist the soak anchor (start_utc) to the manifest immediately — BEFORE the
@@ -819,8 +820,8 @@ def cmd_soak(
         print(cmd.display())
         print(f"# fixed concurrency {spec.soak.threads}, duration "
               f"{fmt_duration(spec.soak.duration_s)} (supervisor relaunches on early exit)")
-        print("# events: auto-detected by the analysis, or marked live via the console / "
-              "`pgbench-harness mark` — none are pre-declared in the spec")
+        print("# events: marked only by an operator (the console Annotate button or "
+              "`pgbench-harness mark`) — none are pre-declared or auto-detected")
         print(f"# password source: env var {spec.target.password_env} -> PGPASSWORD")
         return 0
     password = spec.password()

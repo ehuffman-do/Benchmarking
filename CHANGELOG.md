@@ -2,6 +2,13 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Removed automatic anomaly detection.** The harness no longer auto-detects or
+  marks anything on the timeline (no more `dip` / `scale_down` / `error_burst` /
+  `latency_spike` annotations). Only **operator-marked** events are stamped on the
+  charts/tables of both the interactive and classic reports. Dropped the `detect`
+  module, the `detected` summary field + its report sections, and the unused
+  `report.detect_*` spec knobs. The always-on run profile (median TPS, CoV,
+  outages) is unchanged.
 - **Removed spec-declared timeline events.** A soak spec can no longer
   pre-declare events (the `events:` section, including `at_s` timing) — an
   `events:` key is now rejected with a hint. Timeline events come only from the

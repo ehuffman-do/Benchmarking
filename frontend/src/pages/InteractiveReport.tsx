@@ -193,12 +193,10 @@ function SoakReport({ summary, prov, manifest, runId, me }: {
   manifest: Record<string, unknown>; runId: string; me: Me;
 }) {
   const events = (summary.events as Array<Record<string, unknown>>) || [];
-  const detected = (summary.detected as Array<Record<string, unknown>>) || [];
   const rp = (summary.run_profile || {}) as Record<string, unknown>;
   const tps = (rp.tps || {}) as Record<string, number>;
   const lat = (rp.latency_ms || {}) as Record<string, number | null>;
   const m = (e: Record<string, unknown>) => (e.metrics || {}) as Record<string, number>;
-  const ev = (o: Record<string, unknown>) => (o.evidence || {}) as Record<string, unknown>;
 
   const canStamp = me.role === "operator" || me.role === "admin";
   const [ts, setTs] = useState<TimeseriesResp | null>(null);
@@ -320,32 +318,9 @@ function SoakReport({ summary, prov, manifest, runId, me }: {
         </div>
       )}
 
-      {detected.length > 0 && (
-        <div className="card">
-          <div className="card-head"><h2>Detected anomalies <span className="subtle">— automatic, unconfirmed</span></h2></div>
-          <table>
-            <thead><tr><th>Type</th><th className="num">At</th><th className="num">Window (s)</th>
-              <th className="num">Confidence</th><th>Evidence</th></tr></thead>
-            <tbody>
-              {detected.map((c, i) => (
-                <tr key={i}>
-                  <td>{String(c.type)}</td>
-                  <td className="num">{String(c.at_s)}s</td>
-                  <td className="num">{(c.end_s as number) - (c.at_s as number) + 1}</td>
-                  <td className="num">{Math.round((c.confidence as number) * 100)}%</td>
-                  <td className="subtle mono" style={{ fontSize: 12 }}>
-                    {Object.entries(ev(c)).map(([k, v]) => `${k}=${v}`).join(", ")}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
       <div className="card">
-        <div className="card-head"><h2>Disruption events <span className="subtle">— confirmed</span></h2></div>
-        {events.length === 0 ? <div className="empty">No confirmed events. The profile and detected anomalies above characterize this run.</div> : (
+        <div className="card-head"><h2>Disruption events <span className="subtle">— operator-marked</span></h2></div>
+        {events.length === 0 ? <div className="empty">No events marked. The run profile and the timeline above characterize this run; mark events with the Annotate button.</div> : (
           <table>
             <thead><tr><th>At</th><th>Type</th><th>Label</th><th className="num">Downtime</th>
               <th className="num">TTR (95%)</th><th className="num">Full re-warm</th><th className="num">Min TPS</th></tr></thead>
