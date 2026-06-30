@@ -30,7 +30,7 @@ sweep:
 
 capture:
   pg_settings: true
-  pg_stat_statements: auto
+  pg_stat_monitor: auto
   bgwriter_stats: true
   io_stats: true
   histogram: true

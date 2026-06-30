@@ -41,6 +41,10 @@ _PKG = Path(__file__).resolve().parent
 ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 LOGIN_MAX, LOGIN_WINDOW_S = 10, 300
+# Operator-stampable soak event types (mirrors soak.ANALYSIS_TYPES — the only
+# types the analysis treats as user events; loadgen_restart is internal).
+_MARK_TYPES = ("failover", "scale_up", "scale_down", "note")
+TERMINAL_STATES = index.TERMINAL_RUN
 
 
 # ── dependencies ────────────────────────────────────────────────────
@@ -356,9 +360,46 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
         etype = payload.get("type", "note")
-        harness_api.mark_event(run_dir, etype, payload.get("label", ""), payload.get("note", ""))
-        queries.audit(conn, user["username"], "soak_mark", target=run_id, detail=etype)
-        return JSONResponse({"marked": etype})
+        if etype not in _MARK_TYPES:
+            raise HTTPException(400, f"invalid event type: {etype!r}")
+        at_s = payload.get("at_s")
+        if at_s is not None:
+            try:
+                at_s = float(at_s)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "at_s must be a number of seconds")
+            if at_s < 0:
+                raise HTTPException(400, "at_s must be >= 0")
+        try:
+            harness_api.mark_event(run_dir, etype, str(payload.get("label", "")),
+                                   str(payload.get("note", "")), at_s=at_s)
+        except harness_api.HarnessError as exc:
+            raise HTTPException(400, str(exc))
+        queries.audit(conn, user["username"], "soak_mark", target=run_id,
+                      detail=f"{etype}@{int(at_s)}s" if at_s is not None else etype)
+        return JSONResponse({"marked": etype, "at_s": at_s})
+
+    @app.get("/api/runs/{run_id}/timeseries")
+    def api_run_timeseries(run_id: str,
+                           user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        """Decimated soak series + event markers for the in-app interactive chart.
+        Works for a live or finished soak; viewers can read, operators stamp marks."""
+        run_dir = _run_dir_safe(cfg, run_id)
+        if not (run_dir / "manifest.json").exists():
+            raise HTTPException(404, "run not found")
+        terminal = _run_status(run_dir) in TERMINAL_STATES
+        if _run_mode(run_dir) != "soak":
+            return JSONResponse({"available": False, "terminal": True,
+                                 "reason": "timeseries is soak-only"})
+        payload = harness_api.interactive_timeseries(run_dir)
+        if payload is None:
+            # No samples yet (e.g. a soak that just started). Report terminal so the
+            # client keeps polling until the first second lands, then stops at the end.
+            return JSONResponse({"available": False, "terminal": terminal})
+        payload.pop("pg", None)        # engine-side charts aren't drawn in-app; keep polls lean
+        payload["available"] = True
+        payload["terminal"] = terminal
+        return JSONResponse(payload)
 
     @app.post("/api/runs/{run_id}/resume")
     def api_resume(run_id: str, request: Request,

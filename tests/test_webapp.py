@@ -40,7 +40,6 @@ workload:
 """
     if mode == "soak":
         base += "soak:\n  threads: 2\n  duration_s: 2\n  tolerate_errors: true\n"
-        base += "events:\n  - {at_s: 1, type: failover, label: fail}\n"
     else:
         base += "sweep:\n  threads: [1]\n  duration_s: 2\n  warmup_s: 1\n  cooldown_s: 0\n  repetitions: 1\n"
     return base
@@ -898,6 +897,63 @@ def test_prepare_enqueues_and_doctor_rbac(web):
     d = client.get("/api/doctor", auth=("op", "oppw"))
     assert d.status_code == 200 and "pgbench-harness" in d.json()["text"]
     assert client.get("/api/doctor", auth=("viewer", "vpw")).status_code == 403
+
+
+# ── soak interactive timeseries + operator event stamping ───────────────
+
+def _make_soak(client, cfg) -> str:
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml("soak"), "password": WEB_PW},
+                auth=("op", "oppw"))
+    return _run_worker_once(cfg)[2]["run_id"]
+
+
+def test_soak_timeseries_endpoint_serves_series_and_markers(web):
+    client, cfg = web
+    rid = _make_soak(client, cfg)
+    # events are no longer spec-seeded — stamp one so there's a confirmed marker
+    client.post(f"/api/runs/{rid}/mark", json={"type": "failover", "at_s": 1, "label": "f"},
+                auth=("op", "oppw"))
+    d = client.get(f"/api/runs/{rid}/timeseries", auth=("viewer", "vpw")).json()
+    assert d["available"] is True and d["terminal"] is True
+    assert isinstance(d["t"], list) and len(d["t"]) >= 1
+    assert len(d["tps"]) == len(d["t"])
+    # the stamped failover renders as a confirmed (event) marker
+    assert any(mk["kind"] == "event" for mk in d["markers"])
+
+
+def test_timeseries_is_soak_only(web):
+    client, cfg = web
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml("sweep"), "password": WEB_PW}, auth=("op", "oppw"))
+    rid = _run_worker_once(cfg)[2]["run_id"]
+    d = client.get(f"/api/runs/{rid}/timeseries", auth=("viewer", "vpw")).json()
+    assert d["available"] is False
+
+
+def test_mark_at_offset_stamps_event_and_shows_on_timeseries(web):
+    client, cfg = web
+    rid = _make_soak(client, cfg)
+    # operator stamps a scale_up at t=1s (post-hoc, on the finished run)
+    r = client.post(f"/api/runs/{rid}/mark", json={"type": "scale_up", "at_s": 1, "label": "grew"},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200 and r.json()["at_s"] == 1
+    d = client.get(f"/api/runs/{rid}/timeseries", auth=("viewer", "vpw")).json()
+    assert 1 in [mk["t"] for mk in d["markers"]]   # markers carry the x value as `t`
+    # the event is anchored to the soak start + offset in events.jsonl
+    import json as _json
+    evs = [_json.loads(ln) for ln in (cfg.results_dir / rid / "events.jsonl").read_text().splitlines() if ln.strip()]
+    assert any(e["type"] == "scale_up" and e["source"] == "mark" for e in evs)
+    # a viewer cannot stamp
+    assert client.post(f"/api/runs/{rid}/mark", json={"type": "scale_up", "at_s": 1},
+                       auth=("viewer", "vpw")).status_code == 403
+
+
+def test_mark_rejects_bad_type_and_negative_offset(web):
+    client, cfg = web
+    rid = _make_soak(client, cfg)
+    assert client.post(f"/api/runs/{rid}/mark", json={"type": "bogus", "at_s": 1},
+                       auth=("op", "oppw")).status_code == 400
+    assert client.post(f"/api/runs/{rid}/mark", json={"type": "failover", "at_s": -3},
+                       auth=("op", "oppw")).status_code == 400
 
 
 # ── regression: SQLite connection usable across threads (FastAPI threadpool) ──

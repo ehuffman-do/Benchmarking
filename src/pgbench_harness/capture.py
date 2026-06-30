@@ -88,7 +88,7 @@ class PreflightResult:
     server_version: str = ""
     max_connections: str = ""
     pooler_probe: str = ""
-    pg_stat_statements: bool = False
+    pg_stat_monitor: bool = False
     dataset: Optional[DatasetCheck] = None
     probe: Optional[ProbeResult] = None
     warnings: list[str] = field(default_factory=list)
@@ -441,11 +441,11 @@ def detect_pooler(spec: Spec, password: str) -> str:
     return f"SHOW pool_mode failed (expected against PgBouncer app DBs / plain PG): {out}"
 
 
-def detect_pg_stat_statements(spec: Spec, password: str) -> bool:
-    """True when the pg_stat_statements extension is installed."""
+def detect_pg_stat_monitor(spec: Spec, password: str) -> bool:
+    """True when the pg_stat_monitor extension is installed."""
     ok, out = psql_query_soft(
         spec, password,
-        "SELECT count(*) FROM pg_extension WHERE extname='pg_stat_statements'",
+        "SELECT count(*) FROM pg_extension WHERE extname='pg_stat_monitor'",
     )
     return ok and out.strip() == "1"
 
@@ -531,15 +531,15 @@ def wait_for_db(spec: Spec, password: str, attempts: int = 8, delay: float = 1.5
     return False
 
 
-def enable_pg_stat_statements(spec: Spec, password: str) -> tuple[bool, str]:
-    """Try to enable the pg_stat_statements extension. Returns (ok, detail).
+def enable_pg_stat_monitor(spec: Spec, password: str) -> tuple[bool, str]:
+    """Try to enable the pg_stat_monitor extension. Returns (ok, detail).
 
-    ``CREATE EXTENSION IF NOT EXISTS`` is idempotent. On managed PostgreSQL the
-    extension is preloaded, so this usually succeeds for a privileged user;
-    otherwise it returns the server's (redacted) reason.
+    ``CREATE EXTENSION IF NOT EXISTS`` is idempotent. pg_stat_monitor must be in
+    ``shared_preload_libraries`` (set on the managed cluster / via a restart) for
+    the CREATE to succeed; otherwise this returns the server's (redacted) reason.
     """
     ok, out = psql_query_soft(
-        spec, password, "CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        spec, password, "CREATE EXTENSION IF NOT EXISTS pg_stat_monitor")
     return (ok, "extension enabled" if ok else out)
 
 
@@ -593,12 +593,18 @@ def _loads(text: str) -> Optional[dict[str, Any]]:
         return None
 
 
-def snapshot_pg_stat_statements(spec: Spec, password: str, limit: int = 50) -> str:
-    """Top statements by total time as JSON rows (best effort)."""
+def snapshot_pg_stat_monitor(spec: Spec, password: str, limit: int = 50) -> str:
+    """Top statements by total execution time as JSON rows (best effort).
+
+    pg_stat_monitor buckets its stats over rolling time windows, so a query can
+    appear once per bucket. Aggregate by queryid to present a single top-N rather
+    than one row per (query, bucket).
+    """
     sql = (
         "SELECT coalesce(json_agg(t), '[]'::json) FROM ("
-        "SELECT queryid, calls, total_exec_time, mean_exec_time, rows "
-        f"FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT {limit}) t"
+        "SELECT queryid, sum(calls) AS calls, sum(total_exec_time) AS total_exec_time, "
+        "avg(mean_exec_time) AS mean_exec_time, sum(rows) AS rows "
+        f"FROM pg_stat_monitor GROUP BY queryid ORDER BY total_exec_time DESC LIMIT {limit}) t"
     )
     ok, out = psql_query_soft(spec, password, sql)
     return out if ok else "[]"
@@ -647,7 +653,7 @@ def run_preflight(spec: Spec, password: str, logger: logging.Logger) -> Prefligh
     pf.pooler_probe = detect_pooler(spec, password)
     logger.info("preflight: server %s, max_connections=%s", pf.server_version, pf.max_connections)
     logger.info("preflight: pooler probe: %s", pf.pooler_probe)
-    _check_pg_stat_statements(spec, password, pf)
+    _check_pg_stat_monitor(spec, password, pf)
     _check_ceiling(spec, password, pf, logger)
     pf.dataset = check_dataset(spec, password)
     logger.info("preflight: dataset [%s]: %s", pf.dataset.status, pf.dataset.detail)
@@ -704,17 +710,17 @@ def preflight_steps(spec: Spec, password: str,
     except Exception as exc:  # noqa: BLE001
         yield ev("Pooler probe", "info", str(exc))
     try:
-        if detect_pg_stat_statements(spec, password):
-            yield ev("pg_stat_statements", "ok", "enabled (per-query latency/calls captured)")
+        if detect_pg_stat_monitor(spec, password):
+            yield ev("pg_stat_monitor", "ok", "enabled (per-query latency/calls captured)")
         else:
-            ok, detail = enable_pg_stat_statements(spec, password)
-            if ok and detect_pg_stat_statements(spec, password):
-                yield ev("pg_stat_statements", "ok", "was disabled — enabled it now")
+            ok, detail = enable_pg_stat_monitor(spec, password)
+            if ok and detect_pg_stat_monitor(spec, password):
+                yield ev("pg_stat_monitor", "ok", "was disabled — enabled it now")
             else:
-                yield ev("pg_stat_statements", "warn",
+                yield ev("pg_stat_monitor", "warn",
                          f"not enabled and could not enable it ({detail})")
     except Exception as exc:  # noqa: BLE001
-        yield ev("pg_stat_statements", "warn", str(exc))
+        yield ev("pg_stat_monitor", "warn", str(exc))
     try:
         peak = peak_threads(spec)
         probe = connection_ceiling_probe(spec, password, peak, logger)
@@ -761,15 +767,16 @@ def _collect_warnings(spec: Spec, pf: PreflightResult) -> None:
         )
 
 
-def _check_pg_stat_statements(spec: Spec, password: str, pf: PreflightResult) -> None:
-    mode = spec.capture.pg_stat_statements
+def _check_pg_stat_monitor(spec: Spec, password: str, pf: PreflightResult) -> None:
+    mode = spec.capture.pg_stat_monitor
     if mode == "false":
         return
-    pf.pg_stat_statements = detect_pg_stat_statements(spec, password)
-    if mode == "true" and not pf.pg_stat_statements:
+    pf.pg_stat_monitor = detect_pg_stat_monitor(spec, password)
+    if mode == "true" and not pf.pg_stat_monitor:
         raise PreflightError(
-            "capture.pg_stat_statements is true but the extension is not installed",
-            hint="CREATE EXTENSION pg_stat_statements, or set capture.pg_stat_statements to auto/false.",
+            "capture.pg_stat_monitor is true but the extension is not installed",
+            hint="CREATE EXTENSION pg_stat_monitor (it must be in shared_preload_libraries), "
+                 "or set capture.pg_stat_monitor to auto/false.",
         )
 
 

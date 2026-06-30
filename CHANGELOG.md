@@ -2,6 +2,24 @@
 
 ## Unreleased — operator console (incremental)
 
+- **Removed spec-declared timeline events.** A soak spec can no longer
+  pre-declare events (the `events:` section, including `at_s` timing) — an
+  `events:` key is now rejected with a hint. Timeline events come only from the
+  analysis's **auto-detection** or from **operator marks** (the live cockpit /
+  report stamping, or `pgbench-harness mark`). **Breaking:** remove any
+  `events:` section from existing soak specs/presets.
+- **Switched query-stats capture from pg_stat_statements to pg_stat_monitor.**
+  The `capture.pg_stat_statements` spec key is now `capture.pg_stat_monitor`
+  (same `auto`/`true`/`false` semantics); preflight detects/enables the
+  `pg_stat_monitor` extension, the per-query snapshot reads `pg_stat_monitor`
+  (aggregated across its rolling time buckets) and is written to
+  `env/pg_stat_monitor.json`. **Breaking:** specs/presets using the old
+  `pg_stat_statements` key must rename it to `pg_stat_monitor`.
+- **Interactive soak report: full-run chart + operator event stamping.** The
+  in-app report now renders a zoomable uPlot throughput/QPS/latency timeline
+  with baseline and event markers, and operators can stamp events (failover /
+  scale up / scale down / note) by arming an Annotate toggle and clicking a
+  point — live or after the run, persisted to `events.jsonl`.
 - **Prepare visibility, safety, and pg_stat_statements.**
   - **Tasks view** — a new page listing every job (runs, soaks, and the lifecycle
     jobs prepare/preflight/doctor) with state, who, start, **duration**, and the

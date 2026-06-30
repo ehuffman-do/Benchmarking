@@ -48,7 +48,7 @@ def make_spec_doc(**overrides: object) -> dict:
         },
         "capture": {
             "pg_settings": True,
-            "pg_stat_statements": "auto",
+            "pg_stat_monitor": "auto",
             "bgwriter_stats": True,
             "histogram": True,
         },

@@ -19,7 +19,7 @@ def test_valid_spec_parses() -> None:
     assert spec.run.edition == "advanced"
     assert spec.sweep.threads == (1, 4)
     assert spec.sweep.repetitions == 2
-    assert spec.capture.pg_stat_statements == "auto"
+    assert spec.capture.pg_stat_monitor == "auto"
     assert spec.report.percentiles == (50, 95, 99)
 
 
@@ -50,7 +50,7 @@ def test_defaults_applied() -> None:
     (lambda d: d["sweep"].__setitem__("repetitions", 0), "repetitions"),
     (lambda d: d["workload"].__setitem__("type", "ycsb"), "workload.type"),
     (lambda d: d["report"].__setitem__("timeseries_levels", [3]), "timeseries_levels"),
-    (lambda d: d["capture"].__setitem__("pg_stat_statements", "maybe"), "pg_stat_statements"),
+    (lambda d: d["capture"].__setitem__("pg_stat_monitor", "maybe"), "pg_stat_monitor"),
 ], ids=["unknown-section", "unknown-key", "missing-label", "bad-edition",
         "missing-password-env", "inline-password", "empty-threads", "non-int-threads",
         "warmup-ge-duration", "zero-reps", "bad-workload", "ts-level-not-in-ladder",

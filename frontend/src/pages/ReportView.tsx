@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../api";
+import type { Me } from "../types";
 import { InteractiveReport } from "./InteractiveReport";
 
 type Tab = "interactive" | "classic";
@@ -8,7 +9,7 @@ type Tab = "interactive" | "classic";
 // Two ways to read a run's report: an interactive in-app view (zoomable charts,
 // CSV/print) and the classic self-contained HTML report (offline-portable),
 // rendered inline. Available for past or in-flight runs — no download required.
-export function ReportView() {
+export function ReportView({ me }: { me: Me }) {
   const { runId = "" } = useParams();
   const [tab, setTab] = useState<Tab>("interactive");
   const [bust, setBust] = useState(0);
@@ -55,7 +56,7 @@ export function ReportView() {
       </div>
 
       {tab === "interactive"
-        ? <InteractiveReport runId={runId} />
+        ? <InteractiveReport runId={runId} me={me} />
         : <div className="report-frame"><iframe ref={frame} title={`report ${runId}`} src={src} /></div>}
     </>
   );

@@ -29,14 +29,9 @@ soak:
   duration_s: 3600          # 1 hour; supervisor relaunches the load gen on early exit
   tolerate_errors: true     # keep hammering through the outage
 
-# Planned markers (optional). For exact timing, prefer `pgbench-harness mark`
-# at the real moment you trigger the event from the console.
-events:
-  - at_s: 600
-    type: failover
-    trigger: manual
-    label: "primary failover"
-    note: "trigger primary failover from the DO/Aiven console now"
+# Events are not pre-declared. Mark them at the real moment you trigger each one —
+# in the console (Annotate -> click the chart) or with `pgbench-harness mark` —
+# and the analysis also auto-detects outages/level shifts on its own.
 
 capture:
   pg_settings: true

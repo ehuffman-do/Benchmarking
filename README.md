@@ -141,7 +141,7 @@ sweep:
 
 capture:                                  # whole section optional
   pg_settings: true                       # default true; full pg_settings CSV dump
-  pg_stat_statements: auto                # auto (default) = capture if extension exists;
+  pg_stat_monitor: auto                   # auto (default) = capture if extension exists;
                                           # true = fail preflight if missing; false = skip
   bgwriter_stats: true                    # default true; pg_stat_bgwriter snapshot
                                           # before/after each level (raw/<level>_bgwriter.json)

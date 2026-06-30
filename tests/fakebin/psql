@@ -136,7 +136,7 @@ elif "from pg_database where datname" in low:
 elif low.startswith("create database") or low.startswith("drop database") or "pg_terminate_backend" in low:
     pass  # admin op succeeds silently
 elif low.startswith("create extension"):
-    pass  # pg_stat_statements enable succeeds
+    pass  # pg_stat_monitor enable succeeds
 elif low.startswith("drop table"):
     pass  # table drop succeeds
 elif "pg_database_size" in low:
@@ -182,7 +182,7 @@ elif "pg_stat_wal" in low:
         with open(cf, "w") as fh:
             fh.write(str(n + 1))
     print('{"wal_records": %d, "wal_bytes": %d, "wal_fpi": %d}' % (n * 2000, n * 8000000, n * 50))
-elif "pg_stat_statements" in low:
+elif "pg_stat_monitor" in low:
     print("[]")
 elif "copy (select name, setting, unit, source from pg_settings" in low:
     print("name,setting,unit,source")
