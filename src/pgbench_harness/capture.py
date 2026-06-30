@@ -837,13 +837,32 @@ _WAL_NONE = "SELECT 0 AS wal_bytes"
 def _build_live_sql(ckpt: str, wal_src: str) -> str:
     return (
         "SELECT row_to_json(t) FROM (SELECT "
+        # Server-side read time: rate denominators use the delta between two
+        # clock_timestamp()s (the true counter-sampling interval), not the harness's
+        # round-trip timing, so a slow sample under load can't skew the rate.
+        "EXTRACT(EPOCH FROM clock_timestamp()) AS db_epoch, "
+        # Cluster-wide saturation gauges (max_connections is cluster-scoped, so the
+        # connection counts are intentionally NOT filtered to a single database).
         "(SELECT count(*) FROM pg_stat_activity WHERE state='active') AS active, "
         "(SELECT count(*) FROM pg_stat_activity) AS total_conn, "
+        # Lock contention on the TARGET database: backends blocked waiting on a lock,
+        # and the longest such wait (proxy: age of the blocked query). This is the
+        # engine-side cause behind sysbench's err/s (deadlock/serialization retries).
+        "(SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
+        "AND wait_event_type='Lock' AND state='active') AS blocked, "
+        "(SELECT COALESCE(EXTRACT(EPOCH FROM max(clock_timestamp()-query_start)),0) "
+        "FROM pg_stat_activity WHERE datname=current_database() "
+        "AND wait_event_type='Lock' AND state='active') AS lock_wait_max_s, "
         "d.*, (d.xact_commit + d.xact_rollback) AS xacts, "
         "w.wal_bytes, c.ckpt_timed, c.ckpt_req, c.ckpt_write_ms, c.ckpt_sync_ms, "
         "b.bgw_clean, b.bgw_alloc, "
         "(SELECT EXTRACT(EPOCH FROM max(replay_lag)) FROM pg_stat_replication) AS repl_replay_lag "
-        f"FROM (SELECT {_DB_SELECT} FROM pg_stat_database) d, ({wal_src}) w, (SELECT {ckpt}) c, "
+        # pg_stat_database is scoped to the TARGET database (the sampler connects to
+        # it, so current_database() is the benchmark DB). Summing every database
+        # inflated the workload counters with other DBs / shared-catalog activity —
+        # per-database tools like PMM show one DB, which is the discrepancy this fixes.
+        f"FROM (SELECT {_DB_SELECT} FROM pg_stat_database WHERE datname=current_database()) d, "
+        f"({wal_src}) w, (SELECT {ckpt}) c, "
         "(SELECT COALESCE(buffers_clean,0) AS bgw_clean, COALESCE(buffers_alloc,0) AS bgw_alloc "
         "FROM pg_stat_bgwriter) b) t"
     )
@@ -858,7 +877,7 @@ LIVE_PG_SQLS = (
     _build_live_sql(_CKPT_PRE17, _WAL_NONE),
 )
 LIVE_PG_COLUMNS = (
-    "t", "active", "total_conn",
+    "t", "active", "total_conn", "blocked_queries", "lock_wait_max_s",
     "xacts_s", "commits_s", "rollbacks_s",
     "cache_hit_pct", "blks_read_s", "blks_hit_s", "wal_mb_s",
     "tup_returned_s", "tup_fetched_s", "tup_inserted_s", "tup_updated_s", "tup_deleted_s",
@@ -918,6 +937,19 @@ def _pg_gauge(cur: dict[str, Any], key: str) -> Any:
         return ""
 
 
+def _sample_dt(prev: dict[str, Any], cur: dict[str, Any]) -> float:
+    """Seconds between the two counter snapshots. Prefer the server clock
+    (clock_timestamp at read time) so the rate denominator is the true sampling
+    interval; fall back to the harness monotonic clock if db_epoch is unavailable."""
+    try:
+        d = float(cur.get("db_epoch")) - float(prev.get("db_epoch"))
+        if d > 0:
+            return d
+    except (TypeError, ValueError):
+        pass
+    return max(1e-9, float(cur["_mono"]) - float(prev["_mono"]))
+
+
 def pg_delta_row(prev: dict[str, Any], cur: dict[str, Any], t: float) -> dict[str, Any]:
     """Build one timeseries row from two cumulative samples (rates over the gap).
 
@@ -925,7 +957,7 @@ def pg_delta_row(prev: dict[str, Any], cur: dict[str, Any], t: float) -> dict[st
     it reflects current cache behaviour — the key re-warm signal after a storage
     reattach — not the since-startup average. All rates are reset-aware.
     """
-    dt = max(1e-9, float(cur["_mono"]) - float(prev["_mono"]))
+    dt = _sample_dt(prev, cur)
     d_hit = float(cur.get("blks_hit", 0)) - float(prev.get("blks_hit", 0))
     d_read = float(cur.get("blks_read", 0)) - float(prev.get("blks_read", 0))
     accesses = d_hit + d_read
@@ -935,6 +967,8 @@ def pg_delta_row(prev: dict[str, Any], cur: dict[str, Any], t: float) -> dict[st
         "t": int(round(t)),
         "active": int(cur.get("active", 0) or 0),
         "total_conn": int(cur.get("total_conn", 0) or 0),
+        "blocked_queries": int(float(cur.get("blocked", 0) or 0)),
+        "lock_wait_max_s": _pg_gauge(cur, "lock_wait_max_s"),
         "xacts_s": _pg_rate(prev, cur, "xacts", dt),
         "commits_s": _pg_rate(prev, cur, "xact_commit", dt),
         "rollbacks_s": _pg_rate(prev, cur, "xact_rollback", dt),

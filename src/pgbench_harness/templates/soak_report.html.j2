@@ -109,8 +109,9 @@ during the soak, or declare <code>events:</code> in the spec.</div>
 <div class="card"><div id="ic-p99" class="uchart"></div></div>
 <div class="card"><div id="ic-errors" class="uchart"></div></div>
 {% if interactive.pg %}
-<div class="section-label">PostgreSQL (engine-side) <span class="subtle">— from the server's own counters; an IOPS-proxy, not device metrics</span></div>
+<div class="section-label">PostgreSQL (engine-side) <span class="subtle">— the server's own pg_stat counters, scoped to the target database (rates use the server clock). Block I/O is logical (buffer cache), not device IOPS.</span></div>
 <div class="card"><div id="ic-commits" class="uchart"></div></div>
+<div class="card"><div id="ic-locks" class="uchart"></div></div>
 <div class="card"><div id="ic-cache" class="uchart"></div></div>
 <div class="card"><div id="ic-wal" class="uchart"></div></div>
 <div class="card"><div id="ic-blocks" class="uchart"></div></div>
@@ -163,13 +164,17 @@ during the soak, or declare <code>events:</code> in the spec.</div>
     mk('ic-commits','Transactions — commits / rollbacks (per second)',P.t,[
       {label:'commits/s',values:P.commits_s,stroke:'#159a8a'},
       {label:'rollbacks/s',values:P.rollbacks_s,stroke:'#c0392b'}],[]);
+    mk('ic-locks','Lock contention — blocked queries, max wait & deadlocks/s',P.t,[
+      {label:'blocked queries',values:P.blocked_queries,stroke:'#c0392b'},
+      {label:'deadlocks/s',values:P.deadlocks_s,stroke:'#e8a33d'},
+      {label:'max wait (s)',values:P.lock_wait_max_s,stroke:'#2f6fed',scale:'y2'}],D.markers);
     mk('ic-cache','Cache hit % (interval)',P.t,[
       {label:'cache hit %',values:P.cache_hit_pct,stroke:'#159a8a'}],[]);
     mk('ic-wal','WAL throughput (MB/s)',P.t,[
       {label:'WAL MB/s',values:P.wal_mb_s,stroke:'#c0392b'}],[]);
-    mk('ic-blocks','Block I/O — read vs hit (per second)',P.t,[
-      {label:'blks read/s',values:P.blks_read_s,stroke:'#c0392b'},
-      {label:'blks hit/s',values:P.blks_hit_s,stroke:'#159a8a'}],[]);
+    mk('ic-blocks','Block I/O — buffer reads vs hits (blocks/s, logical)',P.t,[
+      {label:'blks read/s (cache miss)',values:P.blks_read_s,stroke:'#c0392b'},
+      {label:'blks hit/s (in cache)',values:P.blks_hit_s,stroke:'#159a8a',scale:'y2'}],[]);
   }
 })();
 </script>

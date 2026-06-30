@@ -298,6 +298,17 @@ pre.out.dry { background: #0a0e14; color: #cdd9e5; padding: 10px 12px; border-ra
 .menu-pop a { padding: 7px 10px; border-radius: 6px; color: var(--ink); font-size: 13px; }
 .menu-pop a:hover { background: var(--surface-3); text-decoration: none; }
 
+/* ── per-second throughput detail ticker ── */
+table.ticker { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.ticker thead th { position: sticky; top: 0; background: var(--surface);
+  text-align: right; color: var(--muted); font-weight: 600; padding: 4px 10px;
+  border-bottom: 1px solid var(--line-strong); }
+table.ticker thead th:first-child { text-align: left; }
+table.ticker td { padding: 2px 10px; font-variant-numeric: tabular-nums;
+  font-family: "IBM Plex Mono", monospace; }
+table.ticker tbody tr:hover { background: var(--surface-3); }
+table.ticker tbody tr.row-warn td { color: var(--bad); }
+
 /* ── chart event-stamping popup ── */
 .card-head .spacer { margin-left: auto; }
 .stamp-backdrop { position: fixed; inset: 0; z-index: 40; }

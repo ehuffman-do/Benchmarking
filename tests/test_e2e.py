@@ -444,6 +444,27 @@ def test_pg_delta_row_rates() -> None:
     assert abs(row["wal_mb_s"] - (2_000_000 / 1024 / 1024 / 2)) < 0.01  # MiB/s
 
 
+def test_pg_delta_row_uses_server_clock_and_lock_metrics() -> None:
+    """Rates use the server clock delta (db_epoch), not the harness round-trip
+    timing, and lock-contention gauges (blocked queries / max wait) are recorded."""
+    from pgbench_harness.capture import _sample_dt, pg_delta_row
+    base = {"blks_hit": 0, "blks_read": 0, "xacts": 0, "xact_commit": 0,
+            "xact_rollback": 0, "wal_bytes": 0, "tup_returned": 0, "tup_fetched": 0,
+            "tup_inserted": 0, "tup_updated": 0, "tup_deleted": 0, "deadlocks": 0,
+            "conflicts": 0, "temp_bytes": 0, "temp_files": 0, "ckpt_timed": 0,
+            "ckpt_req": 0, "ckpt_write_ms": 0, "ckpt_sync_ms": 0, "bgw_clean": 0,
+            "bgw_alloc": 0, "active": 4, "total_conn": 9}
+    prev = {**base, "db_epoch": 2000.0, "_mono": 50.0, "tup_inserted": 100}
+    # the sample's psql round-trip was slow (mono advanced 9s) but the server clock
+    # only advanced 3s between the two counter reads — the rate must use 3s.
+    cur = {**base, "db_epoch": 2003.0, "_mono": 59.0, "tup_inserted": 400,
+           "blocked": 5, "lock_wait_max_s": 2.5}
+    assert _sample_dt(prev, cur) == 3.0
+    row = pg_delta_row(prev, cur, 3)
+    assert row["tup_inserted_s"] == 100.0          # 300 / 3s (server clock), not /9
+    assert row["blocked_queries"] == 5 and row["lock_wait_max_s"] == 2.5
+
+
 def test_pg_delta_row_reset_is_a_gap_not_a_spike() -> None:
     """A counter that went backwards (server restart/failover/reset) yields a
     blank gap — never a misleading 0 or a huge first-delta spike (the WAL

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { LiveChart } from "../components/LiveChart";
 import { AnnotatableChart, type Marker } from "../components/AnnotatableChart";
-import { fmtInt, fmtNum } from "../lib/format";
+import { fmtCompact, fmtInt, fmtNum } from "../lib/format";
 import type { Me } from "../types";
 
 interface Level {
@@ -142,11 +142,11 @@ function SweepReport({ summary, prov, pgSettings }:
       </div>
       <div className="grid2">
         <div className="card">
-          <LiveChart title="QPS / TPS vs threads" xs={threads} xFormat={xt} yFormat={(v) => fmtInt(v)}
+          <LiveChart title="QPS / TPS vs threads" xs={threads} xFormat={xt} yFormat={(v) => fmtCompact(v)}
             series={[{ label: "QPS", values: qps, stroke: C.qps }, { label: "TPS", values: tps, stroke: C.tps, scale: "y2" }]} />
         </div>
         <div className="card">
-          <LiveChart title="Latency vs threads (ms)" xs={threads} xFormat={xt} yFormat={(v) => fmtInt(v)}
+          <LiveChart title="Latency vs threads (ms)" xs={threads} xFormat={xt} yFormat={(v) => fmtCompact(v)}
             series={[
               { label: "p50", values: p50, stroke: C.p50 },
               { label: "p95", values: p95, stroke: C.p95 },
@@ -288,7 +288,7 @@ function SoakReport({ summary, prov, manifest, runId, me }: {
             </div>
           )}
           <AnnotatableChart title="Throughput (TPS / QPS)" xs={xs} xMax={xMax} xFormat={hms}
-            yFormat={(v) => fmtInt(v)} markers={markers} baseline={ts?.baseline_tps ?? null} {...stampProps}
+            yFormat={(v) => fmtCompact(v)} markers={markers} baseline={ts?.baseline_tps ?? null} {...stampProps}
             series={[{ label: "TPS", values: numArr(ts?.tps), stroke: C.tps },
                      { label: "QPS", values: numArr(ts?.qps), stroke: C.qps, scale: "y2" }]} />
         </div>
@@ -298,14 +298,14 @@ function SoakReport({ summary, prov, manifest, runId, me }: {
         <div className="grid2">
           <div className="card">
             <AnnotatableChart title="QPS — read / write / other" xs={xs} xMax={xMax} xFormat={hms}
-              yFormat={(v) => fmtInt(v)} markers={markers} {...stampProps} height={200}
+              yFormat={(v) => fmtCompact(v)} markers={markers} {...stampProps} height={200}
               series={[{ label: "read", values: numArr(ts?.qps_r), stroke: C.read },
                        { label: "write", values: numArr(ts?.qps_w), stroke: C.write },
                        { label: "other", values: numArr(ts?.qps_o), stroke: C.other }]} />
           </div>
           <div className="card">
             <AnnotatableChart title="p99 latency (ms) — per second" xs={xs} xMax={xMax} xFormat={hms}
-              yFormat={(v) => fmtInt(v)} markers={markers} {...stampProps} height={200}
+              yFormat={(v) => fmtCompact(v)} markers={markers} {...stampProps} height={200}
               series={[{ label: "p99 ms", values: numArr(ts?.lat_p99), stroke: C.p99 }]} />
           </div>
         </div>
@@ -314,7 +314,7 @@ function SoakReport({ summary, prov, manifest, runId, me }: {
       {hasSeries && (
         <div className="card">
           <AnnotatableChart title="Errors & reconnects (per second)" xs={xs} xMax={xMax} xFormat={hms}
-            yFormat={(v) => fmtInt(v)} markers={markers} {...stampProps} height={180}
+            yFormat={(v) => fmtCompact(v)} markers={markers} {...stampProps} height={180}
             series={[{ label: "errors/s", values: numArr(ts?.err_s), stroke: C.err },
                      { label: "reconnects/s", values: numArr(ts?.reconn_s), stroke: C.reconn, scale: "y2" }]} />
         </div>

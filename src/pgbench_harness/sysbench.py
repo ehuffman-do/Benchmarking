@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -22,6 +23,24 @@ from pgbench_harness.errors import RunError
 from pgbench_harness.parser import INTERVAL_RE
 from pgbench_harness.spec import Spec
 from pgbench_harness.util import get_redactor
+
+
+def _line_buffered(argv: list[str]) -> list[str]:
+    """Wrap *argv* so the child's stdout is LINE-buffered.
+
+    sysbench is a C program that uses stdio; when its stdout is a pipe (which it
+    is here — we capture it), glibc switches to *full* (block) buffering, so the
+    ``--report-interval=1`` lines pile up in a 4 KB+ buffer and reach us in bursts
+    (and the bulk only at exit). That makes the live cockpit/console update a
+    couple of times for a whole run, and — because each interval is timestamped at
+    *read* time — a burst read in one instant collapses to a single timeline second.
+
+    ``stdbuf -oL`` flips stdout back to line-buffered via an LD_PRELOAD shim and
+    ``exec``s the target in place (same PID, so the supervisor's killpg/watchdog
+    are unaffected). Degrades gracefully to a direct exec where stdbuf is absent
+    (e.g. macOS, where it ships as ``gstdbuf``)."""
+    stdbuf = shutil.which("stdbuf")
+    return [stdbuf, "-oL", *argv] if stdbuf else argv
 
 
 @dataclass(frozen=True)
@@ -154,7 +173,7 @@ def run_streaming(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         proc = subprocess.Popen(
-            list(cmd.argv),
+            _line_buffered(list(cmd.argv)),
             cwd=cmd.cwd,
             env=env,
             stdout=subprocess.PIPE,
@@ -244,7 +263,7 @@ def run_streaming_timestamped(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         proc = subprocess.Popen(
-            list(cmd.argv), cwd=cmd.cwd, env=env,
+            _line_buffered(list(cmd.argv)), cwd=cmd.cwd, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
     except FileNotFoundError as exc:

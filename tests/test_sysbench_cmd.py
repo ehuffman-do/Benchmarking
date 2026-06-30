@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 from pgbench_harness.spec import parse_spec
-from pgbench_harness.sysbench import build_prepare_command, build_run_command, child_env
+from pgbench_harness.sysbench import (
+    _line_buffered, build_prepare_command, build_run_command, child_env,
+)
 
 from conftest import TEST_PASSWORD, make_spec_doc
+
+
+def test_line_buffered_wraps_with_stdbuf_when_available(monkeypatch) -> None:
+    """The child is launched line-buffered (stdbuf -oL) so sysbench's interval
+    lines stream out each second instead of block-buffering into bursts — the fix
+    for 'only a couple of interval lines show up live for a whole run'."""
+    monkeypatch.setattr("pgbench_harness.sysbench.shutil.which", lambda _n: "/usr/bin/stdbuf")
+    assert _line_buffered(["sysbench", "run"]) == ["/usr/bin/stdbuf", "-oL", "sysbench", "run"]
+    # graceful fallback where stdbuf is absent (e.g. a bare macOS)
+    monkeypatch.setattr("pgbench_harness.sysbench.shutil.which", lambda _n: None)
+    assert _line_buffered(["sysbench", "run"]) == ["sysbench", "run"]
 
 
 def test_oltp_run_command() -> None:

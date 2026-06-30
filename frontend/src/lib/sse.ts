@@ -141,7 +141,8 @@ function numOrNaN(v: string | undefined): number {
 
 export interface PgSeries {
   t: number[];
-  active: number[]; cacheHit: number[]; walMbs: number[]; xactsS: number[];
+  active: number[]; blockedQueries: number[]; lockWaitMaxS: number[];
+  cacheHit: number[]; walMbs: number[]; xactsS: number[];
   commitsS: number[]; rollbacksS: number[];
   blksReadS: number[]; blksHitS: number[];
   tupReturnedS: number[]; tupFetchedS: number[];
@@ -154,7 +155,8 @@ export interface PgSeries {
 
 export function emptyPg(): PgSeries {
   return {
-    t: [], active: [], cacheHit: [], walMbs: [], xactsS: [],
+    t: [], active: [], blockedQueries: [], lockWaitMaxS: [],
+    cacheHit: [], walMbs: [], xactsS: [],
     commitsS: [], rollbacksS: [], blksReadS: [], blksHitS: [],
     tupReturnedS: [], tupFetchedS: [], tupInsertedS: [], tupUpdatedS: [], tupDeletedS: [],
     deadlocksS: [], tempBytesS: [], ckptWriteMsS: [], ckptSyncMsS: [],
@@ -172,6 +174,8 @@ export function appendPg(s: PgSeries, batch: SampleBatch): void {
     if (Number.isNaN(t)) continue;
     s.t.push(t);
     s.active.push(num(f[ix("active")]));                 // gauge
+    s.blockedQueries.push(num(f[ix("blocked_queries")]));
+    s.lockWaitMaxS.push(get(f, "lock_wait_max_s"));
     s.cacheHit.push(get(f, "cache_hit_pct"));
     s.walMbs.push(get(f, "wal_mb_s"));
     s.xactsS.push(get(f, "xacts_s"));

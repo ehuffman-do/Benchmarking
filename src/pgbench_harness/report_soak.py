@@ -95,7 +95,8 @@ def _load_pg_series(run_dir: Path) -> Optional[dict[str, Any]]:
                 out.append(None)
         return out
     t = [int(float(r["t"])) for r in rows]
-    keys = ("active", "cache_hit_pct", "wal_mb_s", "commits_s", "rollbacks_s",
+    keys = ("active", "blocked_queries", "lock_wait_max_s", "deadlocks_s",
+            "cache_hit_pct", "wal_mb_s", "commits_s", "rollbacks_s",
             "blks_read_s", "blks_hit_s", "ckpt_write_ms_s", "ckpt_sync_ms_s",
             "tup_inserted_s", "tup_updated_s", "tup_deleted_s")
     return {"t": t, **{k: col(k) for k in keys}}

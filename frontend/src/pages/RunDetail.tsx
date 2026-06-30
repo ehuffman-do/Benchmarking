@@ -4,7 +4,8 @@ import { api } from "../api";
 import type { Job, Me, Run } from "../types";
 import { LiveChart } from "../components/LiveChart";
 import { LogConsole } from "../components/LogConsole";
-import { fmtInt } from "../lib/format";
+import { SeriesTable } from "../components/SeriesTable";
+import { fmtCompact, fmtInt } from "../lib/format";
 import {
   appendBatch, appendPg, emptyPg, emptySeries, openStream,
   type PgSeries, type Progress, type Series,
@@ -208,14 +209,14 @@ export function RunDetail({ me }: { me: Me }) {
 
       {/* Load generator (sysbench) — full-width, stacked, with a running time axis */}
       <div className="card">
-        <LiveChart title="Throughput (TPS / QPS)" xs={series.t} xMax={chartMax} yFormat={(v) => fmtInt(v)}
+        <LiveChart title="Throughput (TPS / QPS)" xs={series.t} xMax={chartMax} yFormat={(v) => fmtCompact(v)}
           series={[
             { label: "TPS", values: series.tps, stroke: PALETTE.tps },
             { label: "QPS", values: series.qps, stroke: PALETTE.qps, scale: "y2" },
           ]} />
       </div>
       <div className="card">
-        <LiveChart title="QPS — read / write / other" xs={series.t} xMax={chartMax} yFormat={(v) => fmtInt(v)}
+        <LiveChart title="QPS — read / write / other" xs={series.t} xMax={chartMax} yFormat={(v) => fmtCompact(v)}
           series={[
             { label: "read", values: series.qpsR, stroke: PALETTE.read },
             { label: "write", values: series.qpsW, stroke: PALETTE.write },
@@ -223,7 +224,7 @@ export function RunDetail({ me }: { me: Me }) {
           ]} />
       </div>
       <div className="card">
-        <LiveChart title="p99 latency (ms) — per-second" xs={series.t} xMax={chartMax} yFormat={(v) => fmtInt(v)}
+        <LiveChart title="p99 latency (ms) — per-second" xs={series.t} xMax={chartMax} yFormat={(v) => fmtCompact(v)}
           series={[{ label: "p99 ms", values: series.p99, stroke: PALETTE.p99 }]} />
       </div>
       <div className="card">
@@ -234,18 +235,20 @@ export function RunDetail({ me }: { me: Me }) {
           ]} />
       </div>
 
+      <SeriesTable series={series} />
+
       {pg.t.length > 0 && (
         <>
-          <div className="section-label">PostgreSQL (engine-side) <span className="subtle">— from the server's own counters; an IOPS-proxy, not device metrics</span></div>
+          <div className="section-label">PostgreSQL (engine-side) <span className="subtle">— the server's own pg_stat counters, scoped to the target database (rates use the server clock). Block I/O is logical (buffer cache), not device IOPS.</span></div>
           <div className="card">
-            <LiveChart title="Transactions — commits / rollbacks (per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+            <LiveChart title="Transactions — commits / rollbacks (per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
               series={[
                 { label: "commits/s", values: pg.commitsS, stroke: PALETTE.tps },
                 { label: "rollbacks/s", values: pg.rollbacksS, stroke: PALETTE.err },
               ]} />
           </div>
           <div className="card">
-            <LiveChart title="Tuples written (per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+            <LiveChart title="Tuples written (per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
               series={[
                 { label: "inserted/s", values: pg.tupInsertedS, stroke: PALETTE.read },
                 { label: "updated/s", values: pg.tupUpdatedS, stroke: PALETTE.write },
@@ -253,17 +256,17 @@ export function RunDetail({ me }: { me: Me }) {
               ]} />
           </div>
           <div className="card">
-            <LiveChart title="Tuples read (per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+            <LiveChart title="Tuples read (per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
               series={[
                 { label: "returned/s", values: pg.tupReturnedS, stroke: PALETTE.qps },
                 { label: "fetched/s", values: pg.tupFetchedS, stroke: PALETTE.other },
               ]} />
           </div>
           <div className="card">
-            <LiveChart title="Block I/O — read vs hit (per second, IOPS-proxy)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+            <LiveChart title="Block I/O — buffer reads vs hits (blocks/s, logical)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
               series={[
-                { label: "blks read/s", values: pg.blksReadS, stroke: PALETTE.err },
-                { label: "blks hit/s", values: pg.blksHitS, stroke: PALETTE.tps },
+                { label: "blks read/s (cache miss)", values: pg.blksReadS, stroke: PALETTE.err },
+                { label: "blks hit/s (in cache)", values: pg.blksHitS, stroke: PALETTE.tps, scale: "y2" },
               ]} />
           </div>
           <div className="card">
@@ -271,29 +274,36 @@ export function RunDetail({ me }: { me: Me }) {
               series={[{ label: "cache hit %", values: pg.cacheHit, stroke: PALETTE.tps }]} />
           </div>
           <div className="card">
-            <LiveChart title="WAL throughput (MB/s)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+            <LiveChart title="WAL throughput (MB/s)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
               series={[{ label: "WAL MB/s", values: pg.walMbs, stroke: PALETTE.p99 }]} />
           </div>
           <div className="card">
-            <LiveChart title="Checkpoint activity (ms of work per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+            <LiveChart title="Checkpoint activity (ms of work per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
               series={[
                 { label: "write-time ms/s", values: pg.ckptWriteMsS, stroke: PALETTE.write },
                 { label: "sync-time ms/s", values: pg.ckptSyncMsS, stroke: PALETTE.err },
               ]} />
           </div>
           <div className="card">
-            <LiveChart title="Bgwriter buffers (per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+            <LiveChart title="Bgwriter buffers (per second)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
               series={[
                 { label: "clean/s", values: pg.bgwCleanS, stroke: PALETTE.qps },
                 { label: "alloc/s", values: pg.bgwAllocS, stroke: PALETTE.other },
               ]} />
           </div>
           <div className="card">
-            <LiveChart title="Active connections" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+            <LiveChart title="Active connections" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
               series={[{ label: "active", values: pg.active, stroke: PALETTE.qps }]} />
           </div>
           <div className="card">
-            <LiveChart title="Health — deadlocks/s & temp bytes/s" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+            <LiveChart title="Lock contention — blocked queries & max wait" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
+              series={[
+                { label: "blocked queries", values: pg.blockedQueries, stroke: PALETTE.err },
+                { label: "max wait (s)", values: pg.lockWaitMaxS, stroke: PALETTE.p99, scale: "y2" },
+              ]} />
+          </div>
+          <div className="card">
+            <LiveChart title="Health — deadlocks/s & temp bytes/s" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
               series={[
                 { label: "deadlocks/s", values: pg.deadlocksS, stroke: PALETTE.err },
                 { label: "temp bytes/s", values: pg.tempBytesS, stroke: PALETTE.other, scale: "y2" },
@@ -301,7 +311,7 @@ export function RunDetail({ me }: { me: Me }) {
           </div>
           {pg.replLagS.some((v) => !Number.isNaN(v)) && (
             <div className="card">
-              <LiveChart title="Replication replay lag (s)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtInt(v)}
+              <LiveChart title="Replication replay lag (s)" xs={pg.t} xMax={chartMax} height={180} yFormat={(v) => fmtCompact(v)}
                 series={[{ label: "replay lag s", values: pg.replLagS, stroke: PALETTE.p99 }]} />
             </div>
           )}

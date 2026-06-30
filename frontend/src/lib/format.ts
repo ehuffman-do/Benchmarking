@@ -10,6 +10,17 @@ export function fmtNum(n: number | null | undefined, digits = 1): string {
   return n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
+/** Compact magnitude for chart axes so big values (IOPS, tuples) fit the gutter:
+ *  1726 -> "1.7k", 126879 -> "127k", 1268790 -> "1.27M". Legends still show full. */
+export function fmtCompact(n: number | null | undefined): string {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+  const a = Math.abs(n);
+  if (a < 1000) return String(Math.round(n));
+  if (a < 1e6) return `${(n / 1e3).toLocaleString("en-US", { maximumFractionDigits: a < 1e4 ? 1 : 0 })}k`;
+  if (a < 1e9) return `${(n / 1e6).toLocaleString("en-US", { maximumFractionDigits: a < 1e7 ? 2 : 1 })}M`;
+  return `${(n / 1e9).toLocaleString("en-US", { maximumFractionDigits: 1 })}B`;
+}
+
 /** "2026-06-27T14:30:05Z" -> "Jun 27, 14:30 UTC"; passes through if unparseable. */
 export function fmtWhen(iso: string | null | undefined): string {
   if (!iso) return "—";

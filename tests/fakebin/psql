@@ -122,7 +122,10 @@ elif "pg_stat_activity" in low:
     import json as _json
     n = int(time.time())
     print(_json.dumps({
+        "db_epoch": time.time(),
         "active": 8, "total_conn": 20,
+        "blocked": int(os.environ.get("FAKE_PSQL_BLOCKED", "2")),
+        "lock_wait_max_s": float(os.environ.get("FAKE_PSQL_LOCK_WAIT", "0.4")),
         "xact_commit": n * 90, "xact_rollback": n * 10, "xacts": n * 100,
         "blks_hit": n * 9000, "blks_read": n * 100, "wal_bytes": n * 500000,
         "tup_returned": n * 5000, "tup_fetched": n * 4000, "tup_inserted": n * 300,
