@@ -122,10 +122,9 @@ def build_interactive(run_dir: Path, summary: dict[str, Any],
     keys = ("tps", "qps", "lat_p99", "err_s", "reconn_s", "qps_r", "qps_w", "qps_o")
     cols = {k: [tl[o][k] if o in tl else None for o in xs] for k in keys}
     xs2, cols2 = _decimate(xs, cols, UPLOT_MAX_POINTS)
-    markers = ([{"t": e["at_s"], "label": e.get("label") or e["type"], "kind": "event"}
-                for e in summary.get("events", [])]
-               + [{"t": c["at_s"], "label": c["type"], "kind": "detected"}
-                  for c in summary.get("detected", [])])
+    # Only operator-marked (confirmed) events are annotated — no auto-detection.
+    markers = [{"t": e["at_s"], "label": e.get("label") or e["type"], "kind": "event"}
+               for e in summary.get("events", [])]
     pg = _load_pg_series(run_dir)
     if pg and pg.get("t"):
         pxs, pcols = _decimate(pg["t"], {k: v for k, v in pg.items() if k != "t"}, UPLOT_MAX_POINTS)
@@ -271,14 +270,6 @@ def chart_overview(summary: dict[str, Any], tl: dict[int, dict[str, Any]]) -> Op
                     xycoords=("data", "axes fraction"), xytext=(3, 0),
                     textcoords="offset points", fontsize=11, color=EVENT_COLOR,
                     rotation=90, va="top")
-    # Auto-detected (unconfirmed) anomalies: dashed amber, visually distinct from
-    # the solid-red confirmed events so the operator can tell them apart.
-    for i, c in enumerate(summary.get("detected", [])):
-        ax.axvline(c["at_s"], color="#e8a33d", linewidth=1.1, linestyle="--", alpha=0.85,
-                   label="detected (unconfirmed)" if i == 0 else None)
-        end = c.get("end_s")
-        if end and end > c["at_s"]:
-            ax.axvspan(c["at_s"], end, color="#e8a33d", alpha=0.07)
     ax.legend(fontsize=10, loc="upper right")
     return fig_to_base64(fig)
 

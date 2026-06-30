@@ -385,11 +385,9 @@ def build_run_profile(tl: dict[int, dict[str, Any]], horizon: int,
 
 
 def _soak_tldr(status: str, soak_cfg: dict[str, Any], total_s: int,
-               rp: dict[str, Any], detected: list[dict[str, Any]],
-               events: list[dict[str, Any]]) -> str:
+               rp: dict[str, Any], events: list[dict[str, Any]]) -> str:
     """One-line auto-generated verdict — the sentence for a status update. Leads
     the report so it tells the story first (the MySQL artifact has no narrative)."""
-    import collections
     parts = [f"{soak_cfg.get('threads', '?')} threads for {fmt_duration(total_s)}"]
     if rp.get("tps"):
         parts.append(f"median {rp['tps']['median']:.0f} TPS")
@@ -398,10 +396,6 @@ def _soak_tldr(status: str, soak_cfg: dict[str, Any], total_s: int,
         parts.append(f"p99 {lat['p99']:.0f} ms")
     out = rp.get("longest_outage_s", 0)
     parts.append(f"{out}s longest outage" if out else "no downtime")
-    if detected:
-        c = collections.Counter(d["type"] for d in detected)
-        parts.append(f"{len(detected)} detected ("
-                     + ", ".join(f"{n} {t}" for t, n in c.items()) + ")")
     if events:
         parts.append(f"{len(events)} confirmed event(s)")
     return "Soak: " + "; ".join(parts) + f" — status: {status}."
@@ -478,12 +472,11 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
         warnings.append("load generator never produced samples; last sysbench error: "
                         + failure_reason.splitlines()[0])
 
-    # Always-rich characterization + automatic event detection (event or not).
-    from pgbench_harness import detect
+    # Always-rich characterization of the whole run. Timeline events are NOT
+    # auto-detected/marked — only operator marks appear on the charts/reports.
     run_profile = build_run_profile(tl, horizon, spec.report.percentiles, run_dir)
-    detected = detect.detect_anomalies(tl, baseline_tps, baseline_lat, horizon, spec.report)
     tldr = _soak_tldr(status, dict(spec.raw.get("soak", {})), total_s,
-                      run_profile, detected, out_events)
+                      run_profile, out_events)
 
     _write_timeseries(run_dir, tl, horizon)
     summary = {
@@ -505,7 +498,6 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
         "failed_segments": failed_segments,
         "failure_reason": failure_reason,
         "run_profile": run_profile,
-        "detected": detected,
         "tldr": tldr,
         "warnings": warnings,
         "baseline": {
@@ -519,11 +511,6 @@ def analyze(run_dir: Path, spec: Spec, manifest_soak: dict[str, Any]) -> dict[st
             "full_recovery_pct": spec.report.full_recovery_pct,
             "recovery_hold_s": spec.report.recovery_hold_s,
             "latency_spike_mult": spec.report.latency_spike_mult,
-            "detect_drop_pct": spec.report.detect_drop_pct,
-            "detect_recover_pct": spec.report.detect_recover_pct,
-            "detect_min_event_s": spec.report.detect_min_event_s,
-            "detect_shift_pct": spec.report.detect_shift_pct,
-            "detect_err_burst": spec.report.detect_err_burst,
         },
         "events": out_events,
     }

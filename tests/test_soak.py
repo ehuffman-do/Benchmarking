@@ -130,35 +130,11 @@ def test_resolve_baseline_window_defaults() -> None:
     assert resolve_baseline_window({}, 1000, ev, (10, 50)) == (10, 50)  # explicit wins
 
 
-# ── automatic detection + run profile (B1/B2) ──────────────────────
+# ── run profile (B1) ───────────────────────────────────────────────
 
 def _flat(tps, lat=10.0, err=0.0, reconn=0.0):
     return {"tps": tps, "qps": tps * 20, "lat_p99": lat, "err_s": err, "reconn_s": reconn,
             "qps_r": tps * 10, "qps_w": tps * 7, "qps_o": tps * 3}
-
-
-def test_detect_downtime_failover_and_error_burst() -> None:
-    from pgbench_harness import detect
-    tl = {t: _flat(100) for t in range(0, 60)}
-    for t in range(60, 66):                       # 6s hard outage with errors
-        tl[t] = _flat(0.0, lat=0.0, err=5.0, reconn=1.0)
-    for t in range(66, 120):
-        tl[t] = _flat(100)
-    cands = detect.detect_anomalies(tl, 100.0, 10.0, 119, CFG)
-    dt = next(c for c in cands if c["type"] == "downtime")
-    assert dt["at_s"] == 60 and dt["evidence"]["duration_s"] == 6
-    assert dt["status"] == "detected_unconfirmed" and 0 < dt["confidence"] <= 1
-    assert any(c["type"] == "error_burst" for c in cands)
-
-
-def test_detect_latency_spike_and_no_false_positive_on_steady() -> None:
-    from pgbench_harness import detect
-    tl = {t: _flat(100) for t in range(0, 120)}
-    assert detect.detect_anomalies(tl, 100.0, 10.0, 119, CFG) == []   # steady -> nothing
-    for t in range(40, 45):
-        tl[t] = _flat(100, lat=50.0)              # 5s p99 spike > 2x baseline
-    cands = detect.detect_anomalies(tl, 100.0, 10.0, 119, CFG)
-    assert any(c["type"] == "latency_spike" and c["at_s"] == 40 for c in cands)
 
 
 def test_build_run_profile_aggregates(tmp_path) -> None:
@@ -201,7 +177,7 @@ def test_soak_and_sweep_mutually_exclusive() -> None:
 
 def test_spec_events_section_rejected() -> None:
     """Events are no longer pre-declared in the spec — an `events:` section is now
-    an unknown top-level key (events come from auto-detection or operator marks)."""
+    an unknown top-level key (events come only from operator marks)."""
     doc = _soak_doc()
     doc["events"] = [{"at_s": 60, "type": "failover"}]
     with pytest.raises(SpecError, match="unknown top-level section.*events"):
@@ -228,11 +204,12 @@ def test_soak_end_to_end(fake_env, tmp_path, monkeypatch) -> None:
     assert list(run_dir.glob("raw/soak_seg*.log"))
     summary = json.loads((run_dir / "parsed" / "soak_summary.json").read_text())
     assert summary["mode"] == "soak"
-    # Events are no longer spec-seeded — the run starts with none confirmed; they
-    # arrive via auto-detection or operator marks (asserted after the mark below).
+    # Events are only operator-marked now (no spec seeding, no auto-detection) —
+    # the run starts with none confirmed (asserted after the mark below).
     assert isinstance(summary["events"], list)
+    assert "detected" not in summary          # auto-detection removed entirely
     # B1: the always-on run profile is present and populated even on a tiny run
-    assert summary["run_profile"]["tps"] and "detected" in summary
+    assert summary["run_profile"]["tps"]
     # B7: auto-generated narrative verdict leads the report
     assert summary["tldr"].startswith("Soak:") and "status:" in summary["tldr"]
 
@@ -404,6 +381,6 @@ def test_soak_dry_run(fake_env, tmp_path, capsys) -> None:
     assert main(["soak", "--spec", str(spec_path), "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "sysbench" in out and "--threads=32" in out
-    # events are auto-detected or operator-marked, never pre-declared in the spec
-    assert "auto-detected" in out and "mark" in out
+    # events are operator-marked only — never pre-declared in the spec, never auto-detected
+    assert "operator" in out and "mark" in out
     assert TEST_PASSWORD not in out
