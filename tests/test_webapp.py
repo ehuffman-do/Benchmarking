@@ -798,6 +798,7 @@ def test_sse_emits_hello_progress_and_incremental_samples(web):
     run_id = client.get("/api/runs", auth=("viewer", "vpw")).json()[0]["run_id"]
     body = client.get(f"/runs/{run_id}/stream", auth=("viewer", "vpw")).text
     assert "event: hello" in body
+    assert '"start_utc"' in body    # wall-clock anchor for the live-compare alignment
     assert "event: progress" in body
     assert "event: done" in body
     # samples are sent incrementally with a row offset (not a 300-row re-send)

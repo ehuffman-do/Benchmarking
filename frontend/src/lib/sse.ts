@@ -7,6 +7,7 @@ export interface Hello {
   mode: string;
   status: string;
   budget_s: number;
+  start_utc: string;   // run t=0 wall-clock anchor (soak load start, else created) for alignment
 }
 
 export interface Progress {

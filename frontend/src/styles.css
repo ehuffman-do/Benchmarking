@@ -298,6 +298,33 @@ pre.out.dry { background: #0a0e14; color: #cdd9e5; padding: 10px 12px; border-ra
 .menu-pop a { padding: 7px 10px; border-radius: 6px; color: var(--ink); font-size: 13px; }
 .menu-pop a:hover { background: var(--surface-3); text-decoration: none; }
 
+/* ── live compare ── */
+.banner-warn { background: var(--warn-bg, rgba(224,163,61,.12)); color: var(--warn, #b9770e);
+  padding: 9px 13px; border-radius: var(--radius-sm); margin-bottom: 12px; font-size: 13px; }
+.cmp-heads { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+.cmp-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--surface);
+  border: 1px solid var(--line); border-left: 3px solid; border-radius: var(--radius-sm); }
+.cmp-head .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.card.overlap > div { margin: 2px 0; }
+.tl-strip { position: relative; }
+.tl-overlap { position: absolute; top: 18px; bottom: 16px; background: rgba(139,151,166,.14);
+  border-left: 1px dashed var(--line-strong); border-right: 1px dashed var(--line-strong); }
+.tl-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.tl-label { width: 96px; font-size: 11px; color: var(--muted); text-align: right; flex: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-track { position: relative; flex: 1; height: 12px; background: var(--surface-3); border-radius: 6px; }
+.tl-bar { position: absolute; top: 0; height: 12px; border-radius: 6px; min-width: 2px; }
+.tl-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted);
+  margin-left: 104px; margin-top: 2px; }
+.kpi-compare .cmp-vals { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px; font-size: 20px;
+  font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 4px; }
+.kpi-compare .cmp-vals .subtle { font-size: 13px; font-weight: 400; }
+.kpi-compare .cmp-vals .sep { margin: 0 2px; }
+.kpi-compare .cmp-vals .best { text-decoration: underline; text-underline-offset: 3px; }
+.kpi-compare .delta { margin-left: auto; font-size: 13px; font-weight: 600; padding: 1px 7px; border-radius: 10px; }
+.kpi-compare .delta.up { color: var(--good, #1e8449); background: rgba(30,132,73,.12); }
+.kpi-compare .delta.down { color: var(--bad, #c0392b); background: rgba(192,57,43,.12); }
+
 /* ── per-second throughput detail ticker ── */
 table.ticker { width: 100%; border-collapse: collapse; font-size: 12px; }
 table.ticker thead th { position: sticky; top: 0; background: var(--surface);
