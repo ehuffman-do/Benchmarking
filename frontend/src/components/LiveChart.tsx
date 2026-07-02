@@ -18,6 +18,9 @@ interface Props {
   xFormat?: (v: number) => string; // default: "<v>s"
   xMax?: number; // anchor the x-axis at [0, max(data, xMax)] so a running time
                  // axis is drawn from t=0 even before any data arrives
+  spanGaps?: boolean; // connect across null holes — for sparsely-sampled series
+                      // (e.g. 5s PG metrics on a per-second axis), NOT throughput
+                      // where a real gap must break the line
 }
 
 // Axis/grid colours that read on both themes (mid-grey, low-alpha grid).
@@ -31,7 +34,7 @@ const GRID = "rgba(139,151,166,0.16)";
 const clean = (vals: number[]): (number | null)[] =>
   vals.map((v) => (Number.isFinite(v) ? v : null));
 
-export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat, xMax }: Props) {
+export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat, xMax, spanGaps }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
 
@@ -82,6 +85,7 @@ export function LiveChart({ title, xs, series, height = 220, yFormat, xFormat, x
           width: 1.6,
           scale: s.scale ?? "y",
           points: { show: false },
+          spanGaps: !!spanGaps,
         })),
       ],
     };

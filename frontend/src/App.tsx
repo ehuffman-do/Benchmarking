@@ -12,6 +12,7 @@ import { JobView } from "./pages/JobView";
 import { Diagnostics } from "./pages/Diagnostics";
 import { Tasks } from "./pages/Tasks";
 import { Compare } from "./pages/Compare";
+import { LiveCompare } from "./pages/LiveCompare";
 import { Settings } from "./pages/Settings";
 import { Users } from "./pages/Users";
 import { Audit } from "./pages/Audit";
@@ -50,6 +51,7 @@ export function App() {
           <Route path="/tasks" element={<Tasks />} />
           <Route path="/jobs/:jobId" element={<JobView />} />
           <Route path="/compare" element={<Compare />} />
+          <Route path="/compare/live" element={<LiveCompare />} />
           {me.role === "admin" && <Route path="/settings" element={<Settings />} />}
           {me.role === "admin" && <Route path="/users" element={<Users me={me} />} />}
           {me.role === "admin" && <Route path="/audit" element={<Audit />} />}

@@ -978,7 +978,8 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
     cur_file: Optional[str] = None
     budget_s = _planned_budget_s(run_dir)
     yield _event("hello", {"run_id": run_dir.name, "mode": _run_mode(run_dir),
-                           "status": _run_status(run_dir), "budget_s": budget_s})
+                           "status": _run_status(run_dir), "budget_s": budget_s,
+                           "start_utc": _run_start_utc(run_dir)})
     for _ in range(max_ticks):
         if log.exists():
             chunk, sent_log = _read_tail(log, sent_log)   # byte offset; incremental
@@ -1159,6 +1160,15 @@ def _run_status(run_dir: Path) -> str:
 
 def _run_mode(run_dir: Path) -> str:
     return str(_manifest(run_dir).get("mode", "sweep"))
+
+
+def _run_start_utc(run_dir: Path) -> str:
+    """The run's t=0 wall-clock anchor: the soak load start (precise, excludes
+    preflight) for soaks, else the run's created time. Empty if unknown. Used to
+    align two runs on a shared real-time axis in the live compare view."""
+    m = _manifest(run_dir)
+    soak_start = (m.get("soak") or {}).get("start_utc") if isinstance(m.get("soak"), dict) else ""
+    return str(soak_start or m.get("created_utc", "") or "")
 
 
 def _planned_budget_s(run_dir: Path) -> int:
