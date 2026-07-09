@@ -16,6 +16,11 @@ import { LiveCompare } from "./pages/LiveCompare";
 import { Settings } from "./pages/Settings";
 import { Users } from "./pages/Users";
 import { Audit } from "./pages/Audit";
+import { ClusterOps } from "./pages/ClusterOps";
+import { KubeTargetView } from "./pages/KubeTargetView";
+import { OpsRuns } from "./pages/OpsRuns";
+import { OpsRunView } from "./pages/OpsRunView";
+import { OpsCompare } from "./pages/OpsCompare";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -50,6 +55,11 @@ export function App() {
           <Route path="/diagnostics" element={<Diagnostics />} />
           <Route path="/tasks" element={<Tasks />} />
           <Route path="/jobs/:jobId" element={<JobView />} />
+          <Route path="/ops" element={<ClusterOps me={me} />} />
+          <Route path="/ops/targets/:targetId" element={<KubeTargetView me={me} />} />
+          <Route path="/ops/runs" element={<OpsRuns />} />
+          <Route path="/ops/runs/:opRunId" element={<OpsRunView />} />
+          <Route path="/ops/compare" element={<OpsCompare />} />
           <Route path="/compare" element={<Compare />} />
           <Route path="/compare/live" element={<LiveCompare />} />
           {me.role === "admin" && <Route path="/settings" element={<Settings />} />}

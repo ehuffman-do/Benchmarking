@@ -453,3 +453,45 @@ No Prometheus/Grafana integration or OS-metric scraping (workload-side
 metrics only), no provisioning/scheduling/CI, no results web server, no
 engines other than PostgreSQL, no load engines other than sysbench, and no
 tuning logic — the harness measures, humans tune.
+
+## Cluster Ops (Kubernetes / Percona PG Operator)
+
+A separate console section for operating Kubernetes-hosted PostgreSQL
+clusters (PGO v2.x: Patroni HA, pgBackRest, pgBouncer) via a registered
+kubeconfig — porting a field-tested bash methodology into first-class
+`pgbench-harness ops` subcommands driven by the same job queue and worker:
+
+- **Kube Targets** — kubeconfig registration (path on host or encrypted
+  import), live validation checklist, read-only topology discovery
+  (Patroni leader/members/TL/lag via `patronictl list -f json`, pods,
+  services, backup schedules, pgBackRest repo info).
+- **CR configuration** — dry-run first (exact merge patch + value diff),
+  apply with a verify loop against `pg_settings` on the leader; loud
+  `pending_restart` warnings ("the operator will roll pods — expect a
+  failover"); pgBackRest globals verified against the rendered config in the
+  pod; CR snapshots with rollback-as-a-new-patch; prep actions.
+- **Backups** — full/diff/incr via direct exec or the operator's `manual:`
+  Job path, from the leader or a replica (`--backup-standby`); lock
+  preflight aborts instead of the rc=50 false success; 5 s samplers
+  (pg_stat_archiver, archive queue depth, dual-node load); operator
+  schedule pause/restore with a persistent nag; reports can overlay a live
+  benchmark run's TPS with the backup window shaded.
+- **Failover scenarios** — Cases A (switchover), B (pgkill), C1 (pod
+  delete), C2 (node loss, experimental): capture → baseline → FIRE →
+  settle → stitch → report. 5 Hz write probe through pgBouncer, per-pod log
+  streams with auto-reattach, and a stitcher that classifies election vs
+  restart-in-place by the authoritative Patroni leader name (never the
+  probe IP), latches full-HA recovery only after an observed ready-count
+  dip, and reports the pgBouncer `server_login_retry` backoff tail
+  separately from DB downtime. Cross-scenario comparison table included.
+- **Telemetry monitor** — continuous per-target sampler (WAL rate,
+  checkpoints, archive queue, replication lag, per-member disk) that
+  re-detects the leader every cycle and never blanks a whole row when one
+  collector fails.
+
+Security invariants: kubeconfig contents and k8s-derived passwords never
+touch the DB, specs, logs, SSE streams, reports, or artifacts (enforced by
+the extended leak test); the web tier never runs kubectl; destructive
+actions are admin-only with typed cluster-name confirmation, audited, and
+mutually exclusive per target. See OPERATIONS.md §14 for the kubeconfig
+flow, safety model, exact fire commands, and the smoke checklist.

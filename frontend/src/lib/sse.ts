@@ -198,3 +198,57 @@ export function appendPg(s: PgSeries, batch: SampleBatch): void {
     s.replLagS.push(get(f, "repl_replay_lag_s"));
   }
 }
+
+// ── cluster ops runs ────────────────────────────────────────────────────
+
+export interface OpsEvent {
+  ts_utc: string;
+  ts_epoch_ms: number;
+  type: string;
+  label: string;
+  note: string;
+}
+
+export interface OpsCsvBatch {
+  file: string;
+  header: string;
+  offset: number;
+  rows: string[];
+}
+
+export interface OpsStatus {
+  ts_utc?: string;
+  phase?: string;
+  leader?: string;
+  timeline?: number;
+  ready?: string;
+  members?: { name: string; role: string; state: string }[];
+  [k: string]: unknown;
+}
+
+export interface OpsStreamHandlers {
+  onHello?: (h: { op_run_id: string; op: string; status: string }) => void;
+  onLog?: (chunk: string) => void;
+  onEvents?: (b: { offset: number; items: OpsEvent[] }) => void;
+  onStatus?: (s: OpsStatus) => void;
+  onCsv?: (b: OpsCsvBatch) => void;
+  onProgress?: (p: { status: string }) => void;
+  onDone?: (d: { status: string }) => void;
+  onError?: () => void;
+}
+
+export function openOpsStream(opRunId: string, h: OpsStreamHandlers): EventSource {
+  const es = new EventSource(`/ops/runs/${encodeURIComponent(opRunId)}/stream`);
+  es.addEventListener("hello", (e) => h.onHello?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("log", (e) => h.onLog?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("events", (e) => h.onEvents?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("status", (e) => h.onStatus?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("csv", (e) => h.onCsv?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("progress", (e) => h.onProgress?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("done", (e) => {
+    h.onDone?.(JSON.parse((e as MessageEvent).data));
+    es.close();
+  });
+  es.onerror = () => h.onError?.();
+  return es;
+}

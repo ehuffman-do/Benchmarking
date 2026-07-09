@@ -366,3 +366,8 @@ table.ticker tbody tr.row-warn td { color: var(--bad); }
 /* keyboard focus visibility (quality floor) */
 :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* ── cluster ops ── */
+.badge.warning, .badge.aborted { color: var(--warn); background: var(--warn-bg); }
+.badge.aborted { color: var(--bad); background: var(--bad-bg); }
+.tabs button { margin-right: 6px; }

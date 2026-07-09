@@ -28,7 +28,7 @@ from typing import Any, Optional
 import yaml
 
 from pgbench_harness.util import get_redactor
-from pgbench_webapp import index, queries
+from pgbench_webapp import index, ops_support, queries
 from pgbench_webapp.config import Config, ensure_dirs, load_config
 from pgbench_webapp.db import connect
 from pgbench_webapp.secrets_store import SecretStore
@@ -101,9 +101,25 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
         env["PGB_TARGET_PASSWORD"] = pw
         get_redactor().register(pw)  # scrub from any harness output the worker reads
 
-    before = _run_dir_names(cfg.results_dir)
+    # Cluster Ops jobs: inject KUBECONFIG (path or decrypted copy) the same way —
+    # child env only, contents registered with the redactor either way.
+    kube_tmp: Optional[Path] = None
     kind = job["kind"]
-    if kind == "doctor":                       # environment health; no spec/password
+    if ops_support.is_ops_kind(kind):
+        kt = queries.get_kube_target(conn, job["kube_target_id"]) \
+            if job["kube_target_id"] else None
+        if kt is None:
+            queries.update_job(conn, job["id"], state="failed", pid=None,
+                               finished_utc=utc_now_iso(),
+                               error="kube target no longer exists")
+            store.delete(job_password_ref(job["id"]))
+            return "failed"
+        kube_tmp = ops_support.prepare_env(cfg, store, env, kt, job["id"])
+
+    before = _run_dir_names(cfg.results_dir)
+    if ops_support.is_ops_kind(kind):
+        argv = ops_support.build_argv(cfg, kind, spec_file)
+    elif kind == "doctor":                     # environment health; no spec/password
         argv = [cfg.harness_bin, "doctor"]
     elif kind == "preflight":                  # live checklist (structured JSON events)
         argv = [cfg.harness_bin, "preflight", "--spec", str(spec_file), "--json"]
@@ -148,6 +164,12 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                 # Link the run to the job the instant the harness prints its run dir
                 # (the very first lines), so the UI can open the LIVE cockpit while
                 # the run is still going — not only after it finishes.
+                if early_run_id is None and kind in ops_support.RUN_DIR_KINDS:
+                    rid = ops_support.parse_op_run_id(red, cfg.results_dir)
+                    if rid:
+                        early_run_id = rid
+                        queries.update_job(conn, job["id"], run_id=rid)
+                        ops_support.index_ops_run(cfg, conn, rid, job)
                 if early_run_id is None and kind in ("run", "soak"):
                     rid = _parse_run_id(red, cfg.results_dir)
                     if rid:
@@ -166,15 +188,18 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                             queries.upsert_run(conn, row)
             rc = proc.wait()
 
-        # Only run/soak produce a run directory. Prefer the id the harness printed
-        # (exact per-job, concurrency-safe); fall back to the new manifest-bearing
-        # dir, then to the resume dir. preflight/prepare/doctor never set a run_id.
+        # Only run/soak (and run-dir ops kinds) produce a run directory. Prefer
+        # the id the harness printed (exact per-job, concurrency-safe); fall back
+        # to the new manifest-bearing dir, then to the resume dir.
+        # preflight/prepare/doctor/ops_validate/ops_discover never set a run_id.
         run_id: Optional[str] = None
         if kind in ("run", "soak"):
             run_id = _parse_run_id("".join(head), cfg.results_dir)
             if run_id is None:
                 new_dirs = sorted(_run_dir_names(cfg.results_dir) - before)
                 run_id = new_dirs[-1] if new_dirs else (job["resume_run_id"] or None)
+        elif kind in ops_support.RUN_DIR_KINDS:
+            run_id = ops_support.parse_op_run_id("".join(head), cfg.results_dir)
         fresh = queries.get_job(conn, job["id"])
         canceling = fresh is not None and fresh["state"] == "canceling"
         if canceling or rc < 0:   # rc < 0 => killed by a signal (our cancel SIGTERM)
@@ -189,7 +214,11 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
         if run_id:               # never clobber an existing link with NULL
             fields["run_id"] = run_id
         queries.update_job(conn, job["id"], **fields)
-        if run_id:
+        if ops_support.is_ops_kind(kind):
+            # Ops jobs index into ops_runs (never the benchmark runs table) and
+            # cache validate/discover/schedule results onto the kube target.
+            ops_support.postprocess(cfg, conn, job, state, run_id, log_path)
+        elif run_id:
             # A terminal job must drive its run to a consistent terminal status —
             # even when the harness was killed before it could finalize (e.g. a
             # SIGKILLed stop) — so the run is never re-indexed as 'running' and the
@@ -204,6 +233,11 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
         return state
     finally:
         store.delete(job_password_ref(job["id"]))   # secret gone even on error
+        if kube_tmp is not None:
+            try:
+                kube_tmp.unlink()                   # decrypted kubeconfig copy gone too
+            except OSError:
+                pass
 
 
 def _notify(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row, state: str,
@@ -234,7 +268,13 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
     """On worker start, mark orphaned 'running'/'canceling' jobs whose process is
     gone as interrupted, so the queue isn't wedged after a crash/restart, then
     converge any run left non-terminal on disk whose owning job has ended."""
+    # Cluster Ops jobs are converged by ops_support (which also drives their
+    # results/ops meta.json + index terminal). Skip them here so the generic
+    # loop can't mark an ops job 'failed' BEFORE that runs — which would leave
+    # the ops reconcile with nothing to converge and the run stuck 'running'.
     for job in queries.list_jobs(conn, states=("running", "canceling")):
+        if ops_support.is_ops_kind(job["kind"]):
+            continue
         pid = job["pid"]
         alive = False
         if pid:
@@ -254,6 +294,8 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
     # Converge stuck-running runs against their now-terminal jobs and re-index
     # the filesystem so no run survives a restart still showing 'live'.
     index.reconcile(conn, cfg.results_dir)
+    # Same for Cluster Ops jobs/runs, which index.reconcile does not cover.
+    ops_support.reconcile_stale_ops_jobs(cfg, conn, startup=True)
 
 
 def _run_job_threaded(cfg: Config, store: SecretStore, job_id: int) -> None:
@@ -286,12 +328,22 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
     conn = connect(cfg.db_path)
     reconcile_startup(cfg, conn)
     store = _store(cfg)
-    active: dict[int, threading.Thread] = {}
+    # value = (thread, kind); the kind lets the monitor lane run WITHOUT
+    # occupying a benchmark/ops concurrency slot. Gating the loop on
+    # len(active) alone would let one long-lived monitor wedge the queue —
+    # claim_next_job's running_count already excludes monitors, so the outer
+    # gate must exclude them too, or the exclusion is a no-op.
+    active: dict[int, tuple[threading.Thread, str]] = {}
+    # Absolute backstop so a fleet of per-target monitors can't spawn unbounded
+    # threads even though each is admissible on its own lane.
+    monitor_cap = 32
     while True:
-        for jid in [j for j, t in active.items() if not t.is_alive()]:
-            active.pop(jid).join()
+        for jid in [j for j, (t, _k) in active.items() if not t.is_alive()]:
+            active.pop(jid)[0].join()
         max_conc = max(1, int(queries.get_setting(conn, "max_concurrency", "1") or "1"))
-        if len(active) >= max_conc:
+        slotted = sum(1 for _t, k in active.values() if k != "ops_monitor")
+        monitors = len(active) - slotted
+        if slotted >= max_conc or monitors >= monitor_cap:
             time.sleep(POLL_SECONDS)
             continue
         job = queries.claim_next_job(conn, max_conc)
@@ -300,7 +352,7 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
             continue
         t = threading.Thread(target=_run_job_threaded, args=(cfg, store, job["id"]),
                              name=f"job-{job['id']}", daemon=True)
-        active[job["id"]] = t
+        active[job["id"]] = (t, job["kind"])
         t.start()
 
 

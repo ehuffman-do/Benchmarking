@@ -224,6 +224,22 @@ install_packages() {
     postgresql-client sysbench git python3-venv python3-pip openssl curl ca-certificates rsync
   ok "Packages installed."
 
+  # kubectl for the Cluster Ops module (pinned to upstream stable; optional —
+  # a download failure must not break a benchmark-only install).
+  if command -v kubectl >/dev/null 2>&1; then
+    ok "kubectl already present."
+  else
+    info "Installing kubectl (Cluster Ops module)"
+    KVER="$(curl -fsSL https://dl.k8s.io/release/stable.txt 2>/dev/null || true)"
+    if [[ -n "${KVER}" ]] && curl -fsSL -o /usr/local/bin/kubectl \
+        "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" 2>/dev/null; then
+      chmod 0755 /usr/local/bin/kubectl
+      ok "kubectl ${KVER} installed."
+    else
+      warn "kubectl download failed — Cluster Ops will be unavailable until it is installed."
+    fi
+  fi
+
   section "Verifying sysbench has the PostgreSQL (pgsql) driver"
   if sysbench oltp_read_only --db-driver=pgsql help >/dev/null 2>&1; then
     ok "sysbench pgsql driver present."
@@ -276,6 +292,9 @@ setup_user_and_dirs() {
   install -d -m 0750 -o "${SVC_USER}" -g "${SVC_GROUP}" "${DATA_DIR}"
   install -d -m 0750 -o "${SVC_USER}" -g "${SVC_GROUP}" "${RESULTS_DIR}"
   install -d -m 0750 -o "${SVC_USER}" -g "${SVC_GROUP}" "${CERT_DIR}"
+  # Cluster Ops: the ONLY sanctioned home for path-referenced kubeconfigs — the
+  # sandboxed worker (ProtectHome/ProtectSystem) cannot see files anywhere else.
+  install -d -m 0700 -o "${SVC_USER}" -g "${SVC_GROUP}" "${DATA_DIR}/kubeconfigs"
   # Log dir (owned by service user so the app can write web.log/worker.log).
   install -d -m 0755 -o "${SVC_USER}" -g "${SVC_GROUP}" "${LOG_DIR}"
   ok "Directories ready under ${DATA_DIR} and ${LOG_DIR}."

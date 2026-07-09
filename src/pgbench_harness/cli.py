@@ -79,6 +79,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ls = sub.add_parser("list", help="tabulate all stored runs")
     ls.add_argument("--results-dir", type=Path, default=Path("results"))
+
+    from pgbench_harness.ops.cli import add_ops_parser
+    add_ops_parser(sub)
     return p
 
 
@@ -178,6 +181,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_compare(args)
         if args.command == "list":
             return _cmd_list(args)
+        if args.command == "ops":
+            from pgbench_harness.ops.cli import cmd_ops
+            return cmd_ops(args)
         raise AssertionError(f"unhandled command {args.command}")
     except HarnessError as exc:
         print(f"\nerror: {exc}", file=sys.stderr)

@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — Cluster Ops module
+
+- **New: Cluster Ops** — kubeconfig-driven operations for Kubernetes-hosted
+  PostgreSQL (Percona PG Operator v2.x) as first-class `pgbench-harness ops`
+  subcommands + a new console section: Kube Target registration/validation,
+  topology discovery (patronictl parsed in Python), CR configuration with
+  dry-run diff / verify loop / pending_restart loud-fail / snapshot+rollback,
+  pgBackRest backups (direct + operator paths, leader/replica sources, lock
+  preflight, 5s samplers, schedule pause/restore with nag), failover
+  scenarios (switchover / pgkill / pod-delete / node-loss-experimental) with
+  a fixture-tested stitcher (leader-name classification, T7 dip latch,
+  pgBouncer backoff tail, probe-artifact windows), continuous telemetry
+  monitor with per-cycle leader re-detection, self-contained ops reports +
+  cross-scenario comparison, live SSE cockpits. Secrets model extended:
+  KUBECONFIG child-env injection, redactor-registered kubeconfig credentials
+  and k8s-secret passwords, leak test extended. Worker gains a monitor lane
+  (ops_monitor never consumes benchmark concurrency). Installer adds kubectl
+  and the sanctioned `kubeconfigs/` directory.
+
+
 ## Unreleased — operator console (incremental)
 
 - **Removed automatic anomaly detection.** The harness no longer auto-detects or

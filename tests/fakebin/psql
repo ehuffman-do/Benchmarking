@@ -41,6 +41,45 @@ if not os.environ.get("PGPASSWORD"):
 
 low = sql.lower()
 
+if "pg_is_in_recovery" in low:
+    # Cluster Ops write probe: answer from the fake kube cluster's state so
+    # outages (pgkill/pod-delete/switchover/node-loss) are client-visible.
+    import json as _json
+    from datetime import datetime, timezone
+    st_dir = os.environ.get("FAKE_KUBE_STATE", "")
+    restart_s = float(os.environ.get("FAKE_KUBE_RESTART_S", "3"))
+    recreate_s = float(os.environ.get("FAKE_KUBE_RECREATE_S", "4"))
+    ip, down = "10.244.0.20", False
+    try:
+        st = _json.load(open(os.path.join(st_dir, "state.json")))
+        nowt = time.time()
+        leader = st.get("leader", "")
+
+        def _alive(name):
+            del_at = st.get("deleted", {}).get(name, 0)
+            if del_at and nowt < del_at + recreate_s:
+                return False
+            inst = next((i for i in st.get("instances", []) if i["name"] == name), None)
+            return not (inst and inst.get("node") in st.get("lost_nodes", []))
+
+        if st.get("killed_at") and nowt < st["killed_at"] + restart_s:
+            down = True
+        if not _alive(leader):
+            down = True
+        if st.get("elect_at") and nowt < st["elect_at"]:
+            down = True
+        inst = next((i for i in st.get("instances", []) if i["name"] == leader), None)
+        if inst:
+            ip = inst["ip"]
+    except Exception:
+        pass
+    if down:
+        print("psql: error: connection to server failed: Connection refused",
+              file=sys.stderr)
+        sys.exit(2)
+    print(datetime.now(timezone.utc).isoformat() + "|f|" + ip)
+    sys.exit(0)
+
 if "pg_sleep" in low:
     max_conn = os.environ.get("FAKE_PSQL_MAX_CONN")
     if max_conn:

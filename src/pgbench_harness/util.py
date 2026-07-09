@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -105,9 +106,20 @@ def atomic_write_text(path: Path, text: str, redact: bool = True) -> None:
     if redact:
         text = _REDACTOR.redact(text)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    # Unique temp per writer (pid + thread id): two threads writing the same
+    # target (e.g. the scenario's ClusterWatch thread and main thread both
+    # updating status.json) would otherwise share one ``.tmp`` path — the
+    # second os.replace would race a FileNotFoundError and corrupt the write.
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def atomic_write_json(path: Path, obj: Any) -> None:

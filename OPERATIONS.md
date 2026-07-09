@@ -462,3 +462,109 @@ sudo -u pgbench /opt/pgbench-harness/venv/bin/pgbench-harness report \
 | A specific run failed | `cat /var/lib/pgbench-harness/results/<run_id>/harness.log` |
 | Install problem | `cat /var/log/pgbench-harness/install.log` |
 | Health | `curl --cacert <cert> https://127.0.0.1:8443/healthz` |
+
+## 14. Cluster Ops (kubeconfig-driven operations)
+
+The Cluster Ops module drives PostgreSQL clusters running under the **Percona
+PostgreSQL Operator (PGO v2.x)** on Kubernetes: topology discovery, CR
+configuration changes, pgBackRest backups with impact capture, failover
+scenarios, and continuous telemetry. Everything below applies on top of the
+existing security model.
+
+### 14.1 Kubeconfig flow
+
+1. Copy the kubeconfig onto the app host, into the **sanctioned directory**:
+
+   ```bash
+   sudo install -o pgbench -g pgbench -m 0600 my-cluster.yaml \
+        /var/lib/pgbench-harness/kubeconfigs/
+   ```
+
+   This is the only path the worker can see: both systemd units run with
+   `ProtectHome=true` and `ProtectSystem=strict`, so a kubeconfig left in
+   `/root` or `/home` is *invisible* to the worker (validation reports this
+   explicitly). Alternatively paste the kubeconfig contents in the UI — the
+   copy is stored Fernet-encrypted in the secret store and decrypted to a
+   0600 temp file only for the duration of each job.
+2. In the console: **Cluster Ops → Register a cluster**. Validation runs as a
+   worker job and reports the API server, context, namespaces, discovered CR
+   name(s), and the pguser secret; discovered names pre-fill the target.
+3. **Refresh topology** captures instance/pgBouncer pods, the Patroni leader
+   (via `patronictl list -f json`, parsed in Python), member roles/TL/lag,
+   StatefulSets, services, pgBackRest repo info, and the operator's backup
+   schedules.
+
+### 14.2 Secrets model (do not regress)
+
+- kubectl always runs in the **worker** with `KUBECONFIG` injected into the
+  child process environment — never a flag, never written into a spec or
+  artifact. The web tier never runs kubectl; every action is an enqueued job.
+- The DB password is read from the cluster's pguser Secret **by the ops
+  runner at runtime**, registered with the output redactor immediately, and
+  passed only in psql child environments.
+- Kubeconfig credential values (cert data, tokens) are registered with the
+  redactor too. The extended leak test (`tests/test_ops.py`) enforces all of
+  this.
+
+### 14.3 Safety model
+
+- Destructive actions (CR patches, backups, scenario firing, schedule
+  pausing) are **admin-only** and require **typing the cluster (CR) name**.
+- One destructive op per target at a time (server-side mutex).
+- Scenario firing and backups run a **lock preflight**: if pgBackRest reports
+  `backup/expire running`, the op **aborts** instead of colliding (rc=50).
+- Pausing the operator's backup schedules snapshots them first and the UI
+  nags on every Cluster Ops page until they are restored.
+- Every action is audited (who, when, target, parameters, outcome).
+
+### 14.4 Scenario fire commands (exactly what the runner executes)
+
+| Case | Trigger |
+|---|---|
+| A — switchover | `kubectl exec <leader> -c database -- patronictl switchover <cluster>-ha --force` |
+| B — pgkill | `kubectl exec <leader> -c database -- bash -c 'kill -9 $(head -1 /pgdata/pg*/postmaster.pid)'` |
+| C1 — pod delete | `kubectl delete pod <leader> --grace-period=0 --force` |
+| C2 — node loss (EXPERIMENTAL) | `kubectl cordon <node>` + `kubectl delete node <node>` |
+
+Every scenario runs: capture streams start (5 Hz write probe through
+pgBouncer, per-pod Patroni/pgBouncer logs with auto-reattach, pod/event
+watches, 1 s patronictl sampler) → baseline settle → **FIRE** (exact instant
+stamped in `raw/fire.marker`) → settle → stitch → report. Classification
+(election vs restart-in-place) is decided by the Patroni **leader name**
+before vs after — never the probe's answering IP.
+
+### 14.5 Results layout
+
+```
+results/ops/<op_run_id>/
+  meta.json          # manifest: UTC ISO + epoch-ms anchors, headline KPIs
+  raw/               # capture streams — the source of truth
+  parsed/            # sampler CSVs (archiver, queue depth, load, monitor)
+  TIMELINE.txt       # stitched human-readable timeline
+  events.csv         # stitched machine-readable events
+  stitched.json      # downtime decomposition + classification
+  report.html        # self-contained; regenerable: pgbench-harness ops report
+  cr_snapshot.yaml   # full CR before any patch (cr-apply runs)
+```
+
+`pgbench-harness ops stitch --run-dir <dir>` re-derives everything under it
+from `raw/` at any time.
+
+### 14.6 Manual smoke checklist (first live-cluster run per phase)
+
+1. **Foundation:** register the kubeconfig from `kubeconfigs/`; validation all
+   green; topology shows the correct leader and member count; check the audit
+   page for the actions.
+2. **CR config:** dry-run the Patroni bundle — verify the patch JSON and diff
+   match expectations **before** any apply; apply; confirm values in
+   `pg_settings` on the leader and no `pending_restart` surprises; roll back;
+   confirm original values.
+3. **Backups:** run an `incr` off the leader (direct path) with no benchmark
+   load; verify the lock preflight events, a new label in `pgbackrest info`,
+   and non-empty `parsed/archiver.csv`; pause schedules, verify the nag,
+   restore, verify the CR.
+4. **Scenarios:** Case A first (least destructive); verify probe downtime,
+   flip=YES, TL bump; then Case B and confirm flip=NO restart-in-place.
+   C2 only against a disposable cluster.
+5. **Monitor:** start at 60 s; verify leader re-detection by doing a Case A
+   switchover mid-run and watching the leader column change.

@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ meta.op_run_id }} — cluster ops report</title>
+<style>{{ base_css }}</style>
+<style>{{ uplot_css }}</style>
+<style>
+.kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:14px; margin:22px 0; }
+.kpi { background:var(--bg-soft); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+.kpi .v { font-size:24px; font-weight:700; letter-spacing:-.3px; }
+.kpi .l { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; margin-top:2px; }
+.cls { border-radius:10px; padding:16px 20px; margin:22px 0; font-size:16px; border:1px solid var(--line); }
+.cls.flip { background:var(--fail-bg); }
+.cls.inplace { background:var(--good-bg); }
+.cls .basis { font-size:12.5px; color:var(--muted); margin-top:6px; }
+.warnbox { background:var(--warn-bg); border:1px solid #e5c26a; border-radius:10px; padding:14px 18px; margin:18px 0; }
+pre.timeline { background:#0b2d5c; color:#dbe7ff; border-radius:10px; padding:18px 20px; overflow-x:auto; font-size:12.5px; line-height:1.45; }
+table { border-collapse:collapse; width:100%; margin:14px 0; font-size:13.5px; }
+th,td { border:1px solid var(--line); padding:7px 11px; text-align:left; }
+th { background:var(--bg-soft); }
+.chart { margin:18px 0 30px; }
+.mono { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:12.5px; }
+.del { color:var(--bad); } .add { color:var(--good); font-weight:600; }
+</style>
+</head>
+<body>
+<div class="banner">
+  <h1>Cluster Ops — {{ op }}{% if headline.get("case") %}: {{ headline.get("case") }}{% elif headline.get("type") %} ({{ headline.get("type") }}){% endif %}</h1>
+  <div class="runid">{{ meta.op_run_id }}</div>
+  <div class="crumbs">
+    <span class="crumb">target: {{ meta.target.name }}</span>
+    <span class="crumb">cluster: {{ meta.target.cr_kind }}/{{ meta.target.cr_name }}</span>
+    <span class="crumb">ns: {{ meta.target.namespace }}</span>
+    <span class="crumb">status: {{ meta.status }}</span>
+    <span class="crumb">{{ meta.created_utc }}</span>
+  </div>
+</div>
+<main>
+
+{% if op == "scenario" %}
+  {% if stitched.classification %}
+  <div class="cls {{ 'flip' if stitched.classification.flip else 'inplace' }}">
+    <strong>flip?
+    {% if stitched.classification.flip %}YES — real election{% elif stitched.classification.flip == False %}NO — restart in place{% else %}unknown{% endif %}</strong>
+    &nbsp; leader {{ stitched.patroni.leader_before or "?" }} → {{ stitched.patroni.leader_after or "?" }},
+    TL {{ stitched.patroni.tl_before }} → {{ stitched.patroni.tl_after }}
+    {% if stitched.classification.tl_change %}(timeline bumped — corroborates){% endif %}
+    <div class="basis">{{ stitched.classification.basis }}</div>
+  </div>
+  {% endif %}
+  <div class="kpis">
+    <div class="kpi"><div class="v">{% if headline.get("downtime_ms") is not none %}{{ "%.1f"|format(headline.get("downtime_ms") / 1000) }}s{% else %}—{% endif %}</div><div class="l">client write downtime</div></div>
+    <div class="kpi"><div class="v">{% if headline.get("detection_ms") is not none %}{{ "%.1f"|format(headline.get("detection_ms") / 1000) }}s{% else %}—{% endif %}</div><div class="l">detection (fire → first fail)</div></div>
+    <div class="kpi"><div class="v">{% if headline.get("backoff_tail_ms") %}+{{ "%.1f"|format(headline.get("backoff_tail_ms") / 1000) }}s{% else %}0{% endif %}</div><div class="l">pgBouncer backoff tail</div></div>
+    <div class="kpi"><div class="v">{{ headline.get("full_ha_recovery_s") if headline.get("full_ha_recovery_s") is not none else "—" }}{% if headline.get("full_ha_recovery_s") is not none %}s{% endif %}</div><div class="l">full HA recovery (post-dip)</div></div>
+  </div>
+  {% if stitched.pgbouncer and stitched.pgbouncer.backoff_tail_ms %}
+  <div class="warnbox"><strong>pgBouncer negative-cache:</strong> {{ stitched.pgbouncer.note }}</div>
+  {% endif %}
+  {% if stitched.recovery and stitched.recovery.note %}
+  <div class="warnbox">{{ stitched.recovery.note }}</div>
+  {% endif %}
+  <h2>Write-probe availability (through pgBouncer)</h2>
+  <div class="chart" id="chart-probe"></div>
+  <h2>Timeline</h2>
+  <pre class="timeline">{{ timeline_txt }}</pre>
+{% endif %}
+
+{% if op == "backup" %}
+  <div class="kpis">
+    <div class="kpi"><div class="v">{{ headline.get("label") or "—" }}</div><div class="l">backup label</div></div>
+    <div class="kpi"><div class="v">{{ headline.get("type") }} / {{ headline.get("path") }}</div><div class="l">type / trigger path</div></div>
+    <div class="kpi"><div class="v">{{ headline.get("source_role") }}</div><div class="l">source ({{ headline.get("source") }})</div></div>
+    <div class="kpi"><div class="v">{% if headline.get("duration_s") %}{{ "%.0f"|format(headline.get("duration_s")) }}s{% else %}—{% endif %}</div><div class="l">duration</div></div>
+    <div class="kpi"><div class="v">{% if headline.get("db_size") %}{{ "%.1f"|format(headline.get("db_size") / 1073741824) }} GiB{% else %}—{% endif %}</div><div class="l">database size</div></div>
+    <div class="kpi"><div class="v">{% if headline.get("repo_size") %}{{ "%.1f"|format(headline.get("repo_size") / 1073741824) }} GiB{% else %}—{% endif %}</div><div class="l">repo backup size</div></div>
+    <div class="kpi"><div class="v">{% if headline.get("db_size") and headline.get("repo_size") %}{{ "%.1f"|format(headline.get("db_size") / headline.get("repo_size")) }}×{% else %}—{% endif %}</div><div class="l">compression</div></div>
+    <div class="kpi"><div class="v">{{ headline.get("peak_archive_queue") if headline.get("peak_archive_queue") is not none else "—" }}</div><div class="l">peak archive queue (.ready)</div></div>
+  </div>
+  <p class="mono">trigger path: <strong>{{ headline.get("path") }}</strong> — direct exec and the
+  operator's Job path have different lock/scheduling interactions; results are
+  not interchangeable evidence.</p>
+  <h2>Archive queue depth (backup starving archiving?)</h2>
+  <div class="chart" id="chart-queue"></div>
+  <h2>WAL archiver progress</h2>
+  <div class="chart" id="chart-archived"></div>
+  <div id="overlay-section"></div>
+{% endif %}
+
+{% if op == "cr-apply" %}
+  {% if headline.get("pending_restart") %}
+  <div class="warnbox"><strong>pending_restart:</strong>
+    {{ headline.get("pending_restart") | join(", ") }} — these parameters require a
+    Postgres restart; the operator will roll pods to apply them. <strong>Expect a
+    failover.</strong> This run is marked <em>warning</em>, not success.</div>
+  {% endif %}
+  <div class="kpis">
+    <div class="kpi"><div class="v">{{ headline.get("action") }}</div><div class="l">action</div></div>
+    <div class="kpi"><div class="v">{{ (headline.get("changed") or {}) | length }}</div><div class="l">values changed</div></div>
+    <div class="kpi"><div class="v">{{ "dry-run" if headline.get("dry_run") else ("verified" if headline.get("verified") else "NOT verified") }}</div><div class="l">verification</div></div>
+  </div>
+  {% if diff.changed %}
+  <h2>Value diff (CR before → after)</h2>
+  <table><tr><th>parameter</th><th>current</th><th>proposed</th></tr>
+  {% for k, pair in diff.changed | dictsort %}
+    <tr><td class="mono">{{ k }}</td><td class="mono del">{{ pair[0] if pair[0] is not none else "(unset)" }}</td>
+        <td class="mono add">{{ pair[1] }}</td></tr>
+  {% endfor %}
+  </table>
+  {% endif %}
+  {% if verify.live %}
+  <h2>Verified live values (pg_settings on the leader)</h2>
+  <table><tr><th>parameter</th><th>live setting</th></tr>
+  {% for k, v in verify.live | dictsort %}<tr><td class="mono">{{ k }}</td><td class="mono">{{ v }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+  {% if verify.rendered %}
+  <h2>Rendered pgBackRest config in the pod</h2>
+  <table><tr><th>option</th><th>rendered value</th></tr>
+  {% for k, v in verify.rendered | dictsort %}<tr><td class="mono">{{ k }}</td><td class="mono">{{ v }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+{% endif %}
+
+<h2>Event feed</h2>
+<table><tr><th>utc</th><th>type</th><th>event</th><th>detail</th></tr>
+{% for e in events %}
+<tr><td class="mono">{{ e.ts_utc }}</td><td>{{ e.type }}</td><td>{{ e.label }}</td>
+    <td>{{ e.note }}</td></tr>
+{% endfor %}
+</table>
+
+<p class="mono" style="color:var(--muted)">generated {{ generated_utc }} — raw capture
+streams under raw/ are the source of truth; this report is derived and
+regenerable (<code>pgbench-harness ops report --run-dir …</code>).</p>
+</main>
+<script>{{ uplot_js }}</script>
+<script>
+const CH = {{ charts_json }};
+function mk(el, title, series, data, opts) {
+  if (!data || !data[0] || !data[0].length) { el.innerHTML =
+    "<p style='color:#5b6573'>no samples captured</p>"; return; }
+  const o = Object.assign({
+    title, width: Math.min(1180, el.clientWidth || 1100), height: 260,
+    scales: { x: { time: true } },
+    series: [{}, ...series],
+    axes: [{}, { size: 70 }],
+  }, opts || {});
+  new uPlot(o, data, el);
+}
+if (CH.probe && document.getElementById("chart-probe"))
+  mk(document.getElementById("chart-probe"), "probe OK (1) / FAIL (0)",
+     [{ label: "up", stroke: "#0061eb", fill: "rgba(0,97,235,.15)", step: { align: 1 } }],
+     CH.probe.length ? [CH.probe[0], CH.probe[1]] : null);
+if (CH.queue && document.getElementById("chart-queue"))
+  mk(document.getElementById("chart-queue"), ".ready files awaiting archive",
+     [{ label: ".ready", stroke: "#a01b12", fill: "rgba(160,27,18,.12)" }], CH.queue);
+if (CH.archived && document.getElementById("chart-archived"))
+  mk(document.getElementById("chart-archived"), "pg_stat_archiver.archived_count",
+     [{ label: "archived", stroke: "#11602a" }], CH.archived);
+if (CH.overlay) {
+  const sec = document.getElementById("overlay-section");
+  const k = CH.overlay.kpi;
+  const f = v => v == null ? "—" : Number(v).toFixed(0);
+  sec.innerHTML = "<h2>Benchmark correlation — " + CH.overlay.linked_run_id +
+    "</h2><div class='kpis'>" +
+    "<div class='kpi'><div class='v'>" + f(k.before.tps_median) + "</div><div class='l'>TPS median before</div></div>" +
+    "<div class='kpi'><div class='v'>" + f(k.during.tps_median) + "</div><div class='l'>TPS median during backup</div></div>" +
+    "<div class='kpi'><div class='v'>" + f(k.after.tps_median) + "</div><div class='l'>TPS median after</div></div>" +
+    "</div><div class='chart' id='chart-overlay'></div>";
+  const el = document.getElementById("chart-overlay");
+  const w = CH.overlay.window;
+  mk(el, "TPS with backup window shaded",
+     [{ label: "tps", stroke: "#0061eb" }],
+     [CH.overlay.series.x, CH.overlay.series.tps],
+     { hooks: { drawClear: [u => {
+         const { ctx } = u;
+         const x0 = u.valToPos(w.start_s, "x", true), x1 = u.valToPos(w.end_s, "x", true);
+         ctx.save(); ctx.fillStyle = "rgba(253,243,215,.85)";
+         ctx.fillRect(x0, u.bbox.top, x1 - x0, u.bbox.height); ctx.restore();
+     }] } });
+}
+</script>
+</body>
+</html>

@@ -169,12 +169,13 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
 
 def enqueue_job(conn: sqlite3.Connection, kind: str, spec_yaml: str, target_id: Optional[int],
                 requested_by: str, scheduled_utc: Optional[str] = None,
-                resume_run_id: Optional[str] = None, options: Optional[str] = None) -> int:
+                resume_run_id: Optional[str] = None, options: Optional[str] = None,
+                kube_target_id: Optional[int] = None) -> int:
     cur = conn.execute(
         "INSERT INTO jobs(kind, state, spec_yaml, target_id, scheduled_utc, created_utc, "
-        "requested_by, resume_run_id, options) VALUES (?,?,?,?,?,?,?,?,?)",
+        "requested_by, resume_run_id, options, kube_target_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (kind, "queued", spec_yaml, target_id, scheduled_utc, utc_now_iso(),
-         requested_by, resume_run_id, options))
+         requested_by, resume_run_id, options, kube_target_id))
     return int(cur.lastrowid or 0)
 
 
@@ -190,7 +191,15 @@ def list_jobs(conn: sqlite3.Connection, states: tuple[str, ...] = ()) -> list[sq
 
 
 def running_count(conn: sqlite3.Connection) -> int:
-    return int(conn.execute("SELECT count(*) FROM jobs WHERE state='running'").fetchone()[0])
+    """Running jobs that count against max_concurrency.
+
+    Telemetry monitors (ops_monitor) run indefinitely by design, so they get
+    their own lane: they never consume a benchmark/ops concurrency slot (a
+    single monitor would otherwise wedge the queue forever). Their own cap is
+    one per kube target, enforced at enqueue time.
+    """
+    return int(conn.execute("SELECT count(*) FROM jobs WHERE state='running' "
+                            "AND kind != 'ops_monitor'").fetchone()[0])
 
 
 def update_job(conn: sqlite3.Connection, job_id: int, **fields: Any) -> None:
@@ -263,3 +272,123 @@ def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
 def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.execute("INSERT INTO settings(key, value) VALUES (?,?) "
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+# ── cluster ops: kube targets ───────────────────────────────────────
+
+KUBE_TARGET_FIELDS = ("name", "kubeconfig_path", "kubeconfig_ref", "context", "namespace",
+                      "cr_kind", "cr_name", "pguser_secret", "pguser_secret_key",
+                      "db_user", "db_name")
+
+
+def create_kube_target(conn: sqlite3.Connection, **fields: Any) -> int:
+    cols = [k for k in KUBE_TARGET_FIELDS if k in fields]
+    sql = (f"INSERT INTO kube_targets({','.join(cols)}, created_utc) "
+           f"VALUES ({','.join('?' for _ in cols)}, ?)")
+    cur = conn.execute(sql, (*[fields[k] for k in cols], utc_now_iso()))
+    return int(cur.lastrowid or 0)
+
+
+def get_kube_target(conn: sqlite3.Connection, target_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM kube_targets WHERE id=?", (target_id,)).fetchone()
+
+
+def get_kube_target_by_name(conn: sqlite3.Connection, name: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM kube_targets WHERE name=?", (name,)).fetchone()
+
+
+def list_kube_targets(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(conn.execute("SELECT * FROM kube_targets ORDER BY name"))
+
+
+def update_kube_target(conn: sqlite3.Connection, target_id: int, **fields: Any) -> None:
+    # Drop None values: the columns are NOT NULL, so a caller passing {"cr_name":
+    # None} would otherwise raise IntegrityError. Use the dedicated pause/clear
+    # paths (which pass explicit "" / real values) to blank a field.
+    fields = {k: v for k, v in fields.items()
+              if v is not None or k in ("topology_json", "schedules_snapshot",
+                                        "schedules_paused_utc")}
+    if not fields:
+        return
+    sets = ",".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE kube_targets SET {sets} WHERE id=?",
+                 (*fields.values(), target_id))
+
+
+def delete_kube_target(conn: sqlite3.Connection, target_id: int) -> None:
+    conn.execute("UPDATE jobs SET kube_target_id=NULL WHERE kube_target_id=?", (target_id,))
+    conn.execute("UPDATE ops_runs SET kube_target_id=NULL WHERE kube_target_id=?", (target_id,))
+    conn.execute("DELETE FROM kube_targets WHERE id=?", (target_id,))
+
+
+def active_ops_jobs(conn: sqlite3.Connection, kube_target_id: int,
+                    kinds: tuple[str, ...] = ()) -> list[sqlite3.Row]:
+    """Queued/running ops jobs on a kube target — the per-target mutex check."""
+    sql = ("SELECT * FROM jobs WHERE kube_target_id=? "
+           "AND state IN ('queued','running','canceling')")
+    params: list[Any] = [kube_target_id]
+    if kinds:
+        sql += f" AND kind IN ({','.join('?' for _ in kinds)})"
+        params += list(kinds)
+    return list(conn.execute(sql, params))
+
+
+def enqueue_ops_job_atomic(conn: sqlite3.Connection, kind: str, spec_yaml: str,
+                           requested_by: str, kube_target_id: int,
+                           mutex_kinds: tuple[str, ...] = ()) -> Optional[int]:
+    """Enqueue an ops job, atomically enforcing the per-target mutex.
+
+    Wraps the active-jobs check and the insert in one immediate transaction so
+    two concurrent requests can't both pass the check and enqueue competing
+    destructive ops on the same cluster (the TOCTOU the plain check-then-insert
+    allowed). Returns the new job id, or None if the mutex is held.
+    ``mutex_kinds`` empty => no mutex (validate/discover/dry-run always enqueue).
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if mutex_kinds and active_ops_jobs(conn, kube_target_id, mutex_kinds):
+            conn.execute("COMMIT")
+            return None
+        cur = conn.execute(
+            "INSERT INTO jobs(kind, state, spec_yaml, target_id, scheduled_utc, "
+            "created_utc, requested_by, resume_run_id, options, kube_target_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (kind, "queued", spec_yaml, None, None, utc_now_iso(), requested_by,
+             None, None, kube_target_id))
+        conn.execute("COMMIT")
+        return int(cur.lastrowid or 0)
+    except sqlite3.Error:
+        conn.execute("ROLLBACK")
+        raise
+
+
+# ── cluster ops: run index (results/ops/ stays source of truth) ─────
+
+def upsert_ops_run(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    cols = ("op_run_id", "kind", "kube_target_id", "kube_target_name", "label",
+            "params", "status", "linked_run_id", "headline", "created_utc",
+            "finished_utc")
+    vals = [row.get(c) for c in cols]
+    updates = ",".join(f"{c}=excluded.{c}" for c in cols[1:])
+    conn.execute(
+        f"INSERT INTO ops_runs({','.join(cols)}) VALUES ({','.join('?' for _ in cols)}) "
+        f"ON CONFLICT(op_run_id) DO UPDATE SET {updates}", vals)
+
+
+def get_ops_run(conn: sqlite3.Connection, op_run_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM ops_runs WHERE op_run_id=?", (op_run_id,)).fetchone()
+
+
+def list_ops_runs(conn: sqlite3.Connection, kube_target_id: Optional[int] = None,
+                  limit: int = 200) -> list[sqlite3.Row]:
+    if kube_target_id is not None:
+        return list(conn.execute(
+            "SELECT * FROM ops_runs WHERE kube_target_id=? ORDER BY created_utc DESC LIMIT ?",
+            (kube_target_id, limit)))
+    return list(conn.execute(
+        "SELECT * FROM ops_runs ORDER BY created_utc DESC LIMIT ?", (limit,)))
+
+
+def delete_ops_run(conn: sqlite3.Connection, op_run_id: str) -> None:
+    conn.execute("DELETE FROM ops_runs WHERE op_run_id=?", (op_run_id,))
+    conn.execute("UPDATE jobs SET run_id=NULL WHERE run_id=?", (op_run_id,))

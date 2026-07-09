@@ -84,6 +84,44 @@ MIGRATIONS: list[tuple[int, str]] = [
     (3, """
     ALTER TABLE jobs ADD COLUMN options TEXT;
     """),
+    # 4: Cluster Ops — Kube Targets (kubeconfig by path OR encrypted secret ref;
+    #    never contents), the ops-run index (results/ops/ stays source of truth),
+    #    and the job->kube-target link. schedules_snapshot non-empty == operator
+    #    backup schedules are PAUSED on that target (drives the UI nag banner).
+    (4, """
+    CREATE TABLE kube_targets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        kubeconfig_path TEXT NOT NULL DEFAULT '',
+        kubeconfig_ref TEXT NOT NULL DEFAULT '',
+        context TEXT NOT NULL DEFAULT '',
+        namespace TEXT NOT NULL DEFAULT 'percona',
+        cr_kind TEXT NOT NULL DEFAULT 'perconapgcluster',
+        cr_name TEXT NOT NULL DEFAULT '',
+        pguser_secret TEXT NOT NULL DEFAULT '',
+        pguser_secret_key TEXT NOT NULL DEFAULT 'password',
+        db_user TEXT NOT NULL DEFAULT 'doadmin',
+        db_name TEXT NOT NULL DEFAULT 'defaultdb',
+        api_server TEXT NOT NULL DEFAULT '',
+        last_validated_utc TEXT,
+        topology_json TEXT,
+        topology_utc TEXT,
+        schedules_snapshot TEXT,
+        schedules_paused_utc TEXT,
+        created_utc TEXT NOT NULL
+    );
+    CREATE TABLE ops_runs (
+        op_run_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        kube_target_id INTEGER REFERENCES kube_targets(id),
+        kube_target_name TEXT,
+        label TEXT, params TEXT, status TEXT,
+        linked_run_id TEXT, headline TEXT,
+        created_utc TEXT, finished_utc TEXT
+    );
+    ALTER TABLE jobs ADD COLUMN kube_target_id INTEGER REFERENCES kube_targets(id);
+    CREATE INDEX idx_ops_runs_created ON ops_runs(created_utc);
+    """),
 ]
 
 

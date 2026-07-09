@@ -1,0 +1,182 @@
+"""Topology discovery — read-only snapshot of the cluster's moving parts.
+
+Streams progress as JSON check lines (same contract as validate) and finishes
+with ``OPS_TOPOLOGY_JSON {...}`` — the worker caches that document onto the
+Kube Target row so the UI's topology panel has an instant last-known view.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Optional
+
+from pgbench_harness.ops import patroni
+from pgbench_harness.ops.kube import Kube, KubeError
+from pgbench_harness.ops.opspec import CR_KINDS, OpsSpec
+from pgbench_harness.util import utc_now_iso
+
+TOPOLOGY_MARKER = "OPS_TOPOLOGY_JSON"
+
+
+def _check(name: str, status: str, detail: str = "") -> None:
+    print(json.dumps({"name": name, "status": status, "detail": detail}), flush=True)
+
+
+def _pod_summary(item: dict[str, Any]) -> dict[str, Any]:
+    meta, status, spec = item.get("metadata", {}), item.get("status", {}), item.get("spec", {})
+    cs = status.get("containerStatuses") or []
+    ready = sum(1 for c in cs if c.get("ready"))
+    return {"name": meta.get("name", ""), "phase": status.get("phase", ""),
+            "ready": f"{ready}/{len(cs)}" if cs else "0/0",
+            "node": spec.get("nodeName", ""), "pod_ip": status.get("podIP", ""),
+            "labels": meta.get("labels", {}) or {},
+            "containers": [c.get("name", "") for c in spec.get("containers", [])]}
+
+
+def classify_pods(items: list[dict[str, Any]], cr_name: str) -> dict[str, list[dict[str, Any]]]:
+    """Split pods into instance / pgbouncer / backup-job / other buckets.
+
+    Instance pods are identified by carrying a ``database`` container (both
+    Percona and Crunchy layouts) — label schemes differ between the two
+    operators, container layout does not.
+    """
+    out: dict[str, list[dict[str, Any]]] = {"instances": [], "pgbouncer": [],
+                                            "backup_jobs": [], "other": []}
+    for item in items:
+        pod = _pod_summary(item)
+        name = pod["name"]
+        if cr_name and not name.startswith(cr_name):
+            out["other"].append(pod)
+        elif "database" in pod["containers"]:
+            out["instances"].append(pod)
+        elif "pgbouncer" in name or "pgbouncer" in pod["containers"]:
+            out["pgbouncer"].append(pod)
+        elif ("backup" in name or "pgbackrest" in name) \
+                and "database" not in pod["containers"]:
+            out["backup_jobs"].append(pod)
+        else:
+            out["other"].append(pod)
+    return out
+
+
+def _first_running_instance(instances: list[dict[str, Any]]) -> Optional[str]:
+    for pod in instances:
+        if pod["phase"] == "Running":
+            return str(pod["name"])
+    return None
+
+
+def cr_backup_config(cr: dict[str, Any]) -> dict[str, Any]:
+    """Backup-relevant CR slices: repo schedules, manual block, global opts."""
+    pgb = (((cr.get("spec") or {}).get("backups") or {}).get("pgbackrest") or {})
+    repos = pgb.get("repos") or []
+    schedules = [{"repo": r.get("name", ""), "schedules": r.get("schedules") or {}}
+                 for r in repos if isinstance(r, dict)]
+    return {"schedules": schedules, "manual": pgb.get("manual") or None,
+            "global": pgb.get("global") or {}}
+
+
+def run_discover(spec: OpsSpec) -> int:
+    t = spec.target
+    kube = Kube(context=t.context, namespace=t.namespace)
+    topo: dict[str, Any] = {"collected_utc": utc_now_iso(), "namespace": t.namespace,
+                            "cr_kind": "", "cr_name": t.cr_name}
+
+    # CR (kind fallback, name auto-pick when the target doesn't pin one).
+    cr_doc: Optional[dict[str, Any]] = None
+    for kind in ([t.cr_kind] + [k for k in CR_KINDS if k != t.cr_kind]):
+        try:
+            if t.cr_name:
+                cr_doc = kube.cluster_cr(kind, t.cr_name)
+                topo["cr_kind"], topo["cr_name"] = kind, t.cr_name
+            else:
+                listing = kube.json(["get", kind])
+                items = listing.get("items") or []
+                if not items:
+                    continue
+                cr_doc = items[0]
+                topo["cr_kind"] = kind
+                topo["cr_name"] = cr_doc.get("metadata", {}).get("name", "")
+            break
+        except KubeError:
+            continue
+    if cr_doc is not None:
+        topo["postgres_version"] = str(((cr_doc.get("spec") or {}).get("postgresVersion", "")))
+        topo["backups"] = cr_backup_config(cr_doc)
+        _check("cluster-cr", "ok", f"{topo['cr_kind']}/{topo['cr_name']}")
+    else:
+        _check("cluster-cr", "fail", f"no {' / '.join(CR_KINDS)} found in '{t.namespace}'")
+        print(f"{TOPOLOGY_MARKER} {json.dumps(topo)}", flush=True)
+        return 3
+
+    # Pods.
+    try:
+        pods = kube.json(["get", "pods"]).get("items") or []
+    except KubeError as exc:
+        _check("pods", "fail", str(exc)[:300])
+        print(f"{TOPOLOGY_MARKER} {json.dumps(topo)}", flush=True)
+        return 3
+    buckets = classify_pods(pods, topo["cr_name"])
+    topo["pods"] = buckets
+    _check("pods", "ok", f"{len(buckets['instances'])} instance, "
+           f"{len(buckets['pgbouncer'])} pgbouncer")
+
+    # Patroni view (leader, roles, TL, lag) via the first running instance pod.
+    exec_pod = _first_running_instance(buckets["instances"])
+    if exec_pod:
+        try:
+            view = patroni.fetch_view(kube, exec_pod)
+            topo["patroni"] = view.to_dict()
+            _check("patroni", "ok",
+                   f"leader {view.leader_name or '(none)'} TL {view.timeline}")
+        except KubeError as exc:
+            topo["patroni"] = {"error": str(exc)[:300]}
+            _check("patroni", "warn", str(exc)[:300])
+    else:
+        topo["patroni"] = {"error": "no running instance pod"}
+        _check("patroni", "warn", "no running instance pod to query")
+
+    # StatefulSets + services.
+    try:
+        sts = kube.json(["get", "sts"]).get("items") or []
+        topo["statefulsets"] = [
+            {"name": s.get("metadata", {}).get("name", ""),
+             "replicas": (s.get("spec") or {}).get("replicas"),
+             "ready": (s.get("status") or {}).get("readyReplicas") or 0}
+            for s in sts
+            if not topo["cr_name"] or
+               str(s.get("metadata", {}).get("name", "")).startswith(topo["cr_name"])]
+        svcs = kube.json(["get", "svc"]).get("items") or []
+        topo["services"] = [
+            {"name": v.get("metadata", {}).get("name", ""),
+             "type": (v.get("spec") or {}).get("type", ""),
+             "cluster_ip": (v.get("spec") or {}).get("clusterIP", "")}
+            for v in svcs
+            if not topo["cr_name"] or
+               str(v.get("metadata", {}).get("name", "")).startswith(topo["cr_name"])]
+        _check("workloads", "ok", f"{len(topo['statefulsets'])} sts, "
+               f"{len(topo['services'])} services")
+    except KubeError as exc:
+        _check("workloads", "warn", str(exc)[:300])
+
+    # pgBackRest repo info (raw text kept small; parse happens in backup ops).
+    # Guarded: a hung `pgbackrest info` must not crash discover after all the
+    # topology above has been collected — this is the last step and its output
+    # (OPS_TOPOLOGY_JSON) must always be printed for the worker to cache.
+    if exec_pod:
+        try:
+            res = kube.exec(exec_pod, "database",
+                            ["pgbackrest", "--stanza=db", "info"], timeout_s=30)
+            if res.ok:
+                topo["pgbackrest_info"] = res.stdout[-4000:]
+                _check("pgbackrest", "ok", "repo info collected")
+            else:
+                topo["pgbackrest_info"] = ""
+                _check("pgbackrest", "warn",
+                       (res.stderr or res.stdout).strip()[:300] or "info unavailable")
+        except KubeError as exc:
+            topo["pgbackrest_info"] = ""
+            _check("pgbackrest", "warn", str(exc)[:300])
+
+    print(f"{TOPOLOGY_MARKER} {json.dumps(topo)}", flush=True)
+    return 0

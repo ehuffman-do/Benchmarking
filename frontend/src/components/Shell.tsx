@@ -14,6 +14,8 @@ const NAV: { to: string; label: string; admin?: boolean; op?: boolean }[] = [
   { to: "/tasks", label: "Tasks" },
   { to: "/targets", label: "Targets" },
   { to: "/compare", label: "Compare" },
+  { to: "/ops", label: "Cluster Ops" },
+  { to: "/ops/runs", label: "Ops runs" },
   { to: "/diagnostics", label: "Diagnostics", op: true },
   { to: "/users", label: "Users", admin: true },
   { to: "/settings", label: "Settings", admin: true },

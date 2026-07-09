@@ -148,6 +148,10 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
 def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                      templates: Jinja2Templates) -> None:
 
+    # Cluster Ops routes live in their own module (same closure-style pattern).
+    from pgbench_webapp import ops_routes
+    ops_routes.register(app, cfg, store)
+
     def page(request: Request, name: str, user: Optional[sqlite3.Row], **ctx: Any) -> HTMLResponse:
         ctx.update(version=__version__, csrf=request.cookies.get("pgbench_csrf", ""),
                    user=(user["username"] if user else None),
