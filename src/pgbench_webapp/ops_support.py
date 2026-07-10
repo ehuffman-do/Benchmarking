@@ -32,12 +32,18 @@ OPS_KINDS: dict[str, str] = {
     "ops_backup": "backup",
     "ops_scenario": "scenario",
     "ops_monitor": "monitor",
+    "ops_pg_params": "pg-params",
+    "ops_diag": "diag",
+    "ops_health": "health",
 }
-RUN_DIR_KINDS = ("ops_cr_apply", "ops_backup", "ops_scenario", "ops_monitor")
+RUN_DIR_KINDS = ("ops_cr_apply", "ops_backup", "ops_scenario", "ops_monitor",
+                 "ops_diag")
 
 SUMMARY_MARKER = "OPS_SUMMARY_JSON"
 TOPOLOGY_MARKER = "OPS_TOPOLOGY_JSON"
 SCHEDULES_MARKER = "OPS_SCHEDULES_JSON"
+PARAMS_MARKER = "OPS_PARAMS_JSON"
+HEALTH_MARKER = "OPS_HEALTH_JSON"
 
 
 def is_ops_kind(kind: str) -> bool:
@@ -258,7 +264,9 @@ def postprocess(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
         summary = _marker_payload(log_path, SUMMARY_MARKER)
         if summary:
             fields: dict[str, Any] = {"api_server": summary.get("api_server", ""),
-                                      "last_validated_utc": utc_now_iso()}
+                                      "last_validated_utc": utc_now_iso(),
+                                      "last_validation_ok":
+                                          1 if summary.get("ok") else 0}
             kt = queries.get_kube_target(conn, kt_id)
             # Pre-fill discovered names only where the operator left them blank.
             if kt is not None:
@@ -278,6 +286,18 @@ def postprocess(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                 fields["cr_kind"] = topo.get("cr_kind") or kt["cr_kind"]
                 fields["cr_name"] = topo["cr_name"]
             queries.update_kube_target(conn, kt_id, **fields)
+    if kt_id and kind == "ops_pg_params":
+        params = _marker_payload(log_path, PARAMS_MARKER)
+        if params and params.get("params"):
+            queries.update_kube_target(conn, kt_id,
+                                       params_json=json.dumps(params),
+                                       params_utc=utc_now_iso())
+    if kt_id and kind == "ops_health":
+        health = _marker_payload(log_path, HEALTH_MARKER)
+        if health:
+            queries.update_kube_target(conn, kt_id,
+                                       health_json=json.dumps(health),
+                                       health_utc=utc_now_iso())
     if kt_id:
         sched = _marker_payload(log_path, SCHEDULES_MARKER)
         if sched is not None:

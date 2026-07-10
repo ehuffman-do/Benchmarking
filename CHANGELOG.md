@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — Cluster Ops intelligence layer
+
+- **New: Parameter map** (`ops pg-params` + console page) — the full
+  `pg_settings` catalog introspected live from the Patroni leader (names,
+  values, types, units, min/max, enum values, contexts, descriptions,
+  pending_restart), overlaid with the Patroni apply channel
+  (cr / dcs-coordinated / patroni-locked / readonly) and CR-managed value
+  provenance. Searchable + filterable console page with typed editors
+  (validation derived from the server), staged changes → dry-run / apply &
+  verify through the existing cr-apply loop. Snapshot cached per target
+  (migration 6).
+- **New: Diagnostics workbench** (`ops diag` + console page) — 17 curated
+  read-only checks (sessions, locks, replication, slots, wraparound, cache
+  hit, dead tuples, sizes, temp spill, checkpoints, WAL, patronictl,
+  pgBackRest inventory, pods, warning events, PVC usage) streaming CSVs into
+  the live cockpit; watch mode re-samples live checks on an interval for
+  moving charts. Operator-level; nothing mutates.
+- **New: Health checks** (`ops health` + target panel) — threshold heuristics
+  producing findings with severity, one-line remediation, and a deep-link
+  action (to the matching diagnostic or parameter filter); worst severity
+  cached and badged on the targets list; thresholds overridable per run.
+- **Replica backups steered correctly** — Source=replica locks the trigger
+  path to the operator (repo-host) flow; the form shows whether
+  `backup-standby: "y"` is set and offers a one-click enable; the runner
+  aborts replica+direct with the rc=56 explanation instead of failing
+  mid-run.
+- **Target management polish** — edit an existing Kube Target from the
+  console (including kubeconfig replacement; switching back to path mode
+  drops the stale imported copy), validation records a pass/fail verdict
+  (migration 5) shown in the targets list and reset on edit, and discover
+  now surfaces the real kubectl/auth error instead of "no CR found".
+
 ## Unreleased — Cluster Ops module
 
 - **New: Cluster Ops** — kubeconfig-driven operations for Kubernetes-hosted

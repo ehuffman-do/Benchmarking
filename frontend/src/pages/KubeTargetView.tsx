@@ -1,9 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
-import type { Job, KubeTarget, Me, OpsRun, Run, Topology } from "../types";
+import type { HealthDoc, HealthFinding, Job, KubeTarget, Me, OpsRun, Run, Topology } from "../types";
 import { openJobStream, CheckEvent } from "../lib/sse";
 import { CheckList } from "./ClusterOps";
+
+const SEV_BADGE: Record<string, string> = {
+  crit: "failed", warn: "failed", info: "running", ok: "ok",
+};
+
+function findingLink(targetId: string | undefined, f: HealthFinding): string | null {
+  const a = f.action ?? {};
+  if (a.type === "diag") {
+    return `/ops/targets/${targetId}/diag${a.checks?.length ? `?checks=${a.checks.join(",")}` : ""}`;
+  }
+  if (a.type === "params") {
+    return `/ops/targets/${targetId}/params${a.filter ? `?filter=${a.filter}` : ""}`;
+  }
+  return null;
+}
 
 const PATRONI_BUNDLE = JSON.stringify({
   max_wal_size: "49152", min_wal_size: "2048", archive_timeout: "300",
@@ -34,6 +49,9 @@ export function KubeTargetView({ me }: { me: Me }) {
   const [checks, setChecks] = useState<CheckEvent[] | null>(null);
   const [discovering, setDiscovering] = useState(false);
   const [confirm, setConfirm] = useState("");
+  const [health, setHealth] = useState<HealthDoc | null>(null);
+  const [healthUtc, setHealthUtc] = useState<string | null>(null);
+  const [healthRunning, setHealthRunning] = useState(false);
   const isAdmin = me.role === "admin";
   const canOp = me.role !== "viewer";
 
@@ -56,6 +74,10 @@ export function KubeTargetView({ me }: { me: Me }) {
     api.get<{ topology: Topology | null; collected_utc: string | null }>(
       `/api/kube-targets/${targetId}/topology`)
       .then((r) => { setTopo(r.topology); setTopoUtc(r.collected_utc); })
+      .catch(() => undefined);
+    api.get<{ health: HealthDoc | null; collected_utc: string | null }>(
+      `/api/kube-targets/${targetId}/health`)
+      .then((r) => { setHealth(r.health); setHealthUtc(r.collected_utc); })
       .catch(() => undefined);
     api.get<OpsRun[]>(`/api/ops/runs?target=${targetId}`).then(setRuns).catch(() => undefined);
     api.get<Run[]>("/api/runs").then((rs) =>
@@ -112,6 +134,8 @@ export function KubeTargetView({ me }: { me: Me }) {
         <h1>{kt.name}</h1>
         <span className="mono subtle">{kt.cr_kind}/{kt.cr_name || "?"} · ns {kt.namespace} · {kt.api_server || "API server unknown"}</span>
         <div className="spacer" />
+        <Link className="btn" to={`/ops/targets/${targetId}/params`}>Parameter map</Link>{" "}
+        <Link className="btn" to={`/ops/targets/${targetId}/diag`}>Diagnostics</Link>{" "}
         <Link className="btn" to="/ops">← targets</Link>
       </div>
 
@@ -130,6 +154,53 @@ export function KubeTargetView({ me }: { me: Me }) {
       )}
 
       <div className="card">
+        <div className="card-head">
+          <h2>Health
+            {health && <span className={`badge ${SEV_BADGE[health.status] ?? "ok"}`} style={{ marginLeft: 8 }}>
+              {health.status === "ok" ? "✓ healthy" : health.status}</span>}
+            {healthUtc && <span className="subtle mono" style={{ marginLeft: 8 }}>as of {healthUtc}</span>}
+          </h2>
+          <div className="spacer" />
+          {canOp && <button disabled={healthRunning} onClick={async () => {
+            setHealthRunning(true);
+            try {
+              const r = await api.post<{ job_id: number }>(`/api/kube-targets/${targetId}/health`, {});
+              openJobStream(r.job_id, {
+                onDone: () => { setHealthRunning(false); load(); },
+                onError: () => setHealthRunning(false),
+              });
+            } catch (ex) { setErr((ex as Error).message); setHealthRunning(false); }
+          }}>{healthRunning ? "Checking…" : "Run health check"}</button>}
+        </div>
+        {!health ? (
+          <p className="empty">No health check yet — run one to evaluate connection saturation,
+            replication, slots, disk, wraparound, autovacuum, backups, and pod state in one pass.</p>
+        ) : health.findings.length === 0 ? (
+          <p className="subtle">✓ {health.checked} checks evaluated — nothing needs attention.</p>
+        ) : (
+          <table>
+            <thead><tr><th /><th>Finding</th><th>Value</th><th>Why it matters / what to do</th><th /></tr></thead>
+            <tbody>
+              {health.findings.map((f) => {
+                const link = findingLink(targetId, f);
+                return (
+                  <tr key={f.id}>
+                    <td><span className={`badge ${SEV_BADGE[f.severity] ?? "ok"}`}>{f.severity}</span></td>
+                    <td><strong>{f.title}</strong></td>
+                    <td className="mono">{f.value}</td>
+                    <td className="subtle" style={{ fontSize: 12 }}>
+                      {f.detail}{f.remediation ? <> <strong>→ {f.remediation}</strong></> : null}
+                    </td>
+                    <td>{link && <Link className="btn-sm" to={link}>inspect</Link>}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
         <div className="card-head">
           <h2>Topology {topoUtc ? <span className="subtle mono">as of {topoUtc}</span> : null}</h2>
           <div className="spacer" />
@@ -265,13 +336,21 @@ export function KubeTargetView({ me }: { me: Me }) {
                   </select></div>
                 <div className="field"><label>Trigger path</label>
                   <select value={bkPath} onChange={(e) => setBkPath(e.target.value)}>
-                    <option value="direct">direct exec (pgbackrest in pod)</option>
+                    <option value="direct" disabled={bkSource !== "leader"}>
+                      direct exec (pgbackrest in pod{bkSource !== "leader" ? " — leader only" : ""})</option>
                     <option value="operator">operator (manual: block + Job)</option>
                   </select></div>
               </div>
               <div className="row">
                 <div className="field"><label>Source</label>
-                  <select value={bkSource} onChange={(e) => setBkSource(e.target.value)}>
+                  <select value={bkSource} onChange={(e) => {
+                    const v = e.target.value;
+                    setBkSource(v);
+                    // In PGO, exec'ing pgbackrest inside a replica pod only sees
+                    // that pod's local standby (rc=56); replica-offloaded backups
+                    // must go through the operator's repo-host path.
+                    if (v !== "leader") setBkPath("operator");
+                  }}>
                     <option value="leader">leader</option>
                     <option value="replica">any replica (backup-standby)</option>
                     {members.filter((m) => m.role.toLowerCase() !== "leader").map((m) =>
@@ -283,6 +362,23 @@ export function KubeTargetView({ me }: { me: Me }) {
                     {benchRuns.map((r) => <option key={r.run_id} value={r.run_id}>{r.run_id}</option>)}
                   </select></div>
               </div>
+              {bkSource !== "leader" && (
+                <p className="subtle" style={{ margin: "4px 0 8px" }}>
+                  Replica-sourced backups run through the operator's repo-host path and need{" "}
+                  <code>backup-standby: "y"</code> in the CR's pgBackRest global options
+                  {topo?.backups?.global?.["backup-standby"] === "y"
+                    ? <> — <span className="badge ok">already set</span></>
+                    : <>
+                        {" — "}<span className="badge failed">not set</span>
+                        {isAdmin && <>{" "}
+                          <button className="btn-sm" onClick={() =>
+                            launch("cr-apply", { confirm, params: { action: "pgbackrest_global",
+                              global: { "backup-standby": "y" } } })}>
+                            Enable backup-standby now</button></>}
+                      </>}.
+                  {" "}The standby copies the files; the primary only coordinates start/stop.
+                </p>
+              )}
               <button className="primary" onClick={() =>
                 launch("backup", { confirm, params: { type: bkType, path: bkPath, source: bkSource,
                   ...(bkLinked ? { linked_run_id: bkLinked } : {}) } })}>

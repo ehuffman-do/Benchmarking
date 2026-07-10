@@ -26,10 +26,25 @@ export function CheckList({ checks }: { checks: CheckEvent[] }) {
   );
 }
 
+export function ValidationBadge({ t }: { t: KubeTarget }) {
+  if (!t.last_validated_utc) return <span className="mono subtle">never</span>;
+  const when = t.last_validated_utc.slice(0, 16).replace("T", " ");
+  if (t.last_validation_ok === false)
+    return <span className="badge failed" title={`validation failed at ${t.last_validated_utc}`}>✕ failed</span>;
+  if (t.last_validation_ok === true)
+    return <span className="mono" title={t.last_validated_utc}><span className="badge ok">✓</span> {when}</span>;
+  // null with a timestamp: validated before the verdict column existed, or
+  // the target was edited since — verdict unknown until the next validate.
+  return <span className="mono subtle" title="target changed since — re-validate">{when} ?</span>;
+}
+
+type Mode = "keep" | "path" | "upload";
+
 export function ClusterOps({ me }: { me: Me }) {
   const [targets, setTargets] = useState<KubeTarget[] | null>(null);
   const [form, setForm] = useState({ ...BLANK });
-  const [mode, setMode] = useState<"path" | "upload">("path");
+  const [editing, setEditing] = useState<KubeTarget | null>(null);
+  const [mode, setMode] = useState<Mode>("path");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [checks, setChecks] = useState<CheckEvent[] | null>(null);
@@ -51,17 +66,50 @@ export function ClusterOps({ me }: { me: Me }) {
     });
   }
 
+  function startEdit(t: KubeTarget) {
+    setEditing(t);
+    setMode("keep");
+    setForm({
+      name: t.name, kubeconfig_path: t.kubeconfig_path, kubeconfig_content: "",
+      context: t.context, namespace: t.namespace, cr_kind: t.cr_kind,
+      cr_name: t.cr_name, pguser_secret: t.pguser_secret,
+      db_user: t.db_user, db_name: t.db_name,
+    });
+    setErr(null);
+  }
+
+  function cancelEdit() {
+    setEditing(null);
+    setMode("path");
+    setForm({ ...BLANK });
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setErr(null); setBusy(true);
     try {
-      const payload: Record<string, unknown> = { ...form };
-      if (mode === "path") delete payload.kubeconfig_content;
-      else delete payload.kubeconfig_path;
-      const r = await api.post<{ id: number; validate_job_id: number }>("/api/kube-targets", payload);
-      setForm({ ...BLANK });
-      load();
-      watchValidation(r.validate_job_id);
+      if (editing) {
+        const payload: Record<string, unknown> = {
+          context: form.context, namespace: form.namespace, cr_kind: form.cr_kind,
+          cr_name: form.cr_name, pguser_secret: form.pguser_secret,
+          db_user: form.db_user, db_name: form.db_name,
+        };
+        if (mode === "path") payload.kubeconfig_path = form.kubeconfig_path;
+        if (mode === "upload") payload.kubeconfig_content = form.kubeconfig_content;
+        await api.post(`/api/kube-targets/${editing.id}`, payload);
+        const r = await api.post<{ job_id: number }>(`/api/kube-targets/${editing.id}/validate`, {});
+        cancelEdit();
+        load();
+        watchValidation(r.job_id);
+      } else {
+        const payload: Record<string, unknown> = { ...form };
+        if (mode === "upload") delete payload.kubeconfig_path;
+        else delete payload.kubeconfig_content;
+        const r = await api.post<{ id: number; validate_job_id: number }>("/api/kube-targets", payload);
+        setForm({ ...BLANK });
+        load();
+        watchValidation(r.validate_job_id);
+      }
     } catch (ex) {
       setErr((ex as Error).message);
     } finally {
@@ -120,13 +168,18 @@ export function ClusterOps({ me }: { me: Me }) {
               ) : targets.map((t) => (
                 <tr key={t.id}>
                   <td><Link to={`/ops/targets/${t.id}`}><strong>{t.name}</strong></Link>
-                    {t.schedules_paused && <span className="badge failed" style={{ marginLeft: 6 }}>schedules paused</span>}</td>
+                    {t.schedules_paused && <span className="badge failed" style={{ marginLeft: 6 }}>schedules paused</span>}
+                    {(t.health_status === "warn" || t.health_status === "crit") &&
+                      <span className="badge failed" style={{ marginLeft: 6 }}
+                            title={`health check: ${t.health_status} (as of ${t.health_utc})`}>
+                        health: {t.health_status}</span>}</td>
                   <td className="mono">{t.cr_kind}/{t.cr_name || "?"}</td>
                   <td className="mono">{t.namespace}</td>
                   <td className="mono">{t.api_server || "—"}</td>
-                  <td className="mono">{t.last_validated_utc ?? "never"}</td>
+                  <td><ValidationBadge t={t} /></td>
                   <td style={{ whiteSpace: "nowrap" }}>
                     <button className="btn-sm" onClick={() => revalidate(t)}>Validate</button>{" "}
+                    {isAdmin && <button className="btn-sm" onClick={() => startEdit(t)}>Edit</button>}{" "}
                     {isAdmin && <button className="btn-sm danger" onClick={() => remove(t)}>Delete</button>}
                   </td>
                 </tr>
@@ -146,13 +199,20 @@ export function ClusterOps({ me }: { me: Me }) {
         </div>
 
         <div className="card">
-          <div className="card-head"><h2>{isAdmin ? "Register a cluster" : "Register a cluster (admin only)"}</h2></div>
+          <div className="card-head">
+            <h2>{editing ? `Edit “${editing.name}”`
+                 : isAdmin ? "Register a cluster" : "Register a cluster (admin only)"}</h2>
+            {editing && <button className="btn-sm" type="button" onClick={cancelEdit}>cancel</button>}
+          </div>
           <form onSubmit={submit}>
             <div className="row">
               <div className="field"><label>Name</label>
-                <input required value={form.name} onChange={set("name")} placeholder="prod-doks-nyc1" disabled={!isAdmin} /></div>
+                <input required value={form.name} onChange={set("name")} placeholder="prod-doks-nyc1"
+                       disabled={!isAdmin || !!editing} /></div>
               <div className="field"><label>Kubeconfig source</label>
-                <select value={mode} onChange={(e) => setMode(e.target.value as "path" | "upload")} disabled={!isAdmin}>
+                <select value={mode} onChange={(e) => setMode(e.target.value as Mode)} disabled={!isAdmin}>
+                  {editing && <option value="keep">
+                    keep current ({editing.kubeconfig_imported ? "imported copy" : "path"})</option>}
                   <option value="path">path on the app host</option>
                   <option value="upload">paste contents (stored encrypted)</option>
                 </select></div>
@@ -165,15 +225,16 @@ export function ClusterOps({ me }: { me: Me }) {
                   ProtectHome/ProtectSystem): place the file under the data dir&apos;s
                   <code> kubeconfigs/</code> directory or it will be invisible to it.</p>
               </div>
-            ) : (
+            ) : mode === "upload" ? (
               <div className="field"><label>Kubeconfig contents</label>
                 <textarea required rows={6} value={form.kubeconfig_content} onChange={set("kubeconfig_content")}
                           placeholder={"apiVersion: v1\nkind: Config\n…"} disabled={!isAdmin} className="mono"
                           style={{ width: "100%" }} />
                 <p className="subtle" style={{ margin: "4px 0 0" }}>Stored Fernet-encrypted in the secret
-                  store; decrypted to a 0600 temp file only for the duration of each job.</p>
+                  store; decrypted to a 0600 temp file only for the duration of each job.
+                  {editing && " Pasting replaces the current kubeconfig."}</p>
               </div>
-            )}
+            ) : null}
             <div className="row">
               <div className="field"><label>Context (blank = current-context)</label>
                 <input value={form.context} onChange={set("context")} disabled={!isAdmin} /></div>
@@ -198,7 +259,7 @@ export function ClusterOps({ me }: { me: Me }) {
             <div className="field"><label>pguser secret (blank = &lt;cr&gt;-pguser-&lt;user&gt;)</label>
               <input value={form.pguser_secret} onChange={set("pguser_secret")} placeholder="(auto)" disabled={!isAdmin} /></div>
             <button className="primary" disabled={!isAdmin || busy} type="submit">
-              {busy ? "Registering…" : "Register & validate"}
+              {busy ? "Saving…" : editing ? "Save & re-validate" : "Register & validate"}
             </button>
           </form>
         </div>

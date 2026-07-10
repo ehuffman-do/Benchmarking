@@ -14,7 +14,8 @@ from typing import Any
 
 from pgbench_harness.errors import SpecError
 
-OPS_KINDS = ("validate", "discover", "cr-apply", "backup", "scenario", "monitor")
+OPS_KINDS = ("validate", "discover", "cr-apply", "backup", "scenario", "monitor",
+             "pg-params", "diag", "health")
 
 # CR kinds we know how to drive, in fallback order (Percona first, then the
 # upstream Crunchy kind it is built on).

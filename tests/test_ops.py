@@ -253,6 +253,207 @@ def test_validate_reports_missing_kubeconfig(opsweb):
     assert "OPS_SUMMARY_JSON" in out             # summary still emitted for the worker
 
 
+def test_validation_verdict_recorded_and_reset(opsweb, monkeypatch):
+    """last_validation_ok: True after a pass, None after any edit (stale
+    verdict must not linger), False after a failing validate."""
+    client, cfg = opsweb
+    created = _create_target(client)
+    _run_worker_once(cfg)                        # auto-validate → ok
+    kt = client.get(f"/api/kube-targets/{created['id']}", auth=("viewer", "vpw")).json()
+    assert kt["last_validation_ok"] is True
+
+    r = client.post(f"/api/kube-targets/{created['id']}",
+                    json={"db_name": "otherdb"}, auth=("admin", "apw"))
+    assert r.status_code == 200
+    assert r.json()["last_validation_ok"] is None    # verdict reset on edit
+
+    monkeypatch.setenv("FAKE_KUBE_AUTH_FAIL", "1")
+    r = client.post(f"/api/kube-targets/{created['id']}/validate",
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    kt = client.get(f"/api/kube-targets/{created['id']}", auth=("viewer", "vpw")).json()
+    assert kt["last_validation_ok"] is False
+    assert kt["last_validated_utc"]
+
+
+def test_discover_surfaces_auth_error(opsweb, monkeypatch):
+    """An auth failure must be reported as such — not as 'no CR found'
+    (the live-cluster confusion: exec-credential kubeconfigs that can't
+    mint tokens under the sandbox look like an empty namespace)."""
+    client, cfg = opsweb
+    created = _create_target(client)
+    _drain_queue(cfg)                            # auto-validate (healthy)
+    monkeypatch.setenv("FAKE_KUBE_AUTH_FAIL", "1")
+    r = client.post(f"/api/kube-targets/{created['id']}/discover",
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    job_id, state, job = _run_worker_once(cfg)
+    assert state == "failed"
+    out = (cfg.data_dir / "jobs" / f"job_{job_id}.out").read_text()
+    assert "could not query cluster CRs" in out
+    assert "provide credentials" in out          # the real kubectl error, surfaced
+    assert "run Validate on this target" in out  # actionable pointer
+    assert "no perconapgcluster / postgrescluster found" not in out
+
+
+def test_update_to_path_mode_clears_imported_copy(opsweb):
+    """Switching an imported-kubeconfig target to path mode must drop the
+    encrypted copy — the worker prefers the ref, so a stale one would make
+    the new path silently unused."""
+    client, cfg = opsweb
+    created = _create_target(client)             # upload mode → ref set
+    _drain_queue(cfg)
+    kc = cfg.data_dir / "kubeconfigs" / "byhand.yaml"
+    kc.parent.mkdir(parents=True, exist_ok=True)
+    kc.write_text(KUBECONFIG_CONTENT)
+    r = client.post(f"/api/kube-targets/{created['id']}",
+                    json={"kubeconfig_path": str(kc)}, auth=("admin", "apw"))
+    assert r.status_code == 200
+    kt = r.json()
+    assert kt["kubeconfig_imported"] is False
+    assert kt["kubeconfig_path"] == str(kc)
+    # and validate still works through the path
+    client.post(f"/api/kube-targets/{created['id']}/validate", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    kt = client.get(f"/api/kube-targets/{created['id']}", auth=("viewer", "vpw")).json()
+    assert kt["last_validation_ok"] is True
+
+
+# ── parameter map / diagnostics / health ──
+
+def test_pg_params_snapshot_caches_catalog(opsweb):
+    """The parameter map is INTROSPECTED from pg_settings (types, units,
+    ranges, enums, contexts) and overlaid with the Patroni apply-channel."""
+    client, cfg = opsweb
+    created = _create_target(client)
+    _drain_queue(cfg)                            # auto-validate → cr_name known
+    r = client.post(f"/api/kube-targets/{created['id']}/pg-params",
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    doc = client.get(f"/api/kube-targets/{created['id']}/pg-params",
+                     auth=("viewer", "vpw")).json()
+    assert doc["collected_utc"]
+    cat = doc["catalog"]
+    assert cat["leader"] == "cluster1-instance1-abcd-0"
+    assert cat["pg_version"] == "18.0"
+    byname = {p["name"]: p for p in cat["params"]}
+    # metadata straight from the server: units, ranges, enums, contexts
+    assert byname["shared_buffers"]["unit"] == "8kB"
+    assert byname["shared_buffers"]["restart_required"] is True
+    assert byname["wal_level"]["enumvals"] == ["minimal", "replica", "logical"]
+    assert byname["work_mem"]["min_val"] == "64"
+    # the apply-channel overlay
+    assert byname["listen_addresses"]["channel"] == "patroni-locked"
+    assert byname["max_connections"]["channel"] == "dcs-coordinated"
+    assert byname["archive_command"]["channel"] == "operator-managed"
+    assert byname["work_mem"]["channel"] == "cr"
+    assert byname["block_size"]["channel"] == "readonly"
+    # CR-managed values are marked so the UI can show provenance
+    assert byname["max_wal_size"]["cr_value"] == "4096"
+    assert cat["cr_managed"]["max_wal_size"] == "4096"
+    assert byname["work_mem"]["cr_value"] is None
+
+
+def test_diag_checks_write_live_csvs(opsweb):
+    client, cfg = opsweb
+    created = _create_target(client)
+    _drain_queue(cfg)
+    # catalog is served to the UI (no SQL in it)
+    cat = client.get("/api/ops/diag-catalog", auth=("viewer", "vpw")).json()["checks"]
+    keys = [c["key"] for c in cat]
+    assert "slots" in keys and "patroni_list" in keys and "pvc_usage" in keys
+    assert all("sql" not in c for c in cat)
+    # unknown check → clean 400
+    r = client.post(f"/api/kube-targets/{created['id']}/diag",
+                    json={"params": {"checks": ["nope"]}}, auth=("op", "oppw"))
+    assert r.status_code == 400
+    # run a battery
+    picked = ["connections", "long_running", "replication", "slots", "wraparound",
+              "cache_hit", "patroni_list", "backup_info", "pods",
+              "events_warnings", "pvc_usage"]
+    r = client.post(f"/api/kube-targets/{created['id']}/diag",
+                    json={"params": {"checks": picked}}, auth=("op", "oppw"))
+    assert r.status_code == 200, r.text
+    job_id, state, job = _run_worker_once(cfg)
+    assert state == "done", (cfg.data_dir / "jobs" / f"job_{job_id}.out").read_text()
+    parsed = cfg.results_dir / "ops" / job["run_id"] / "parsed"
+    for key in picked:
+        assert (parsed / f"{key}.csv").exists(), key
+    conns = (parsed / "connections.csv").read_text().splitlines()
+    assert conns[0] == "epoch_s,total,active,idle,idle_in_tx,waiting,max_connections,pct_used"
+    assert len(conns) == 2
+    pat = (parsed / "patroni_list.csv").read_text().splitlines()
+    assert pat[0] == "epoch_s,member,role,state,timeline,lag_mb"
+    assert len(pat) == 4                          # 3 members
+    backups = (parsed / "backup_info.csv").read_text().splitlines()
+    assert len(backups) >= 2                      # at least the seeded full
+    # index shows the run with its headline
+    runs = client.get("/api/ops/runs", auth=("viewer", "vpw")).json()
+    diag_runs = [x for x in runs if x["kind"] == "diag"]
+    assert diag_runs and diag_runs[0]["headline"]["checks"] == len(picked)
+
+
+def test_diag_watch_mode_appends_samples(opsweb):
+    client, cfg = opsweb
+    created = _create_target(client)
+    _drain_queue(cfg)
+    r = client.post(f"/api/kube-targets/{created['id']}/diag",
+                    json={"params": {"checks": ["connections"], "watch_s": 2.5,
+                                     "interval_s": 1}},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    job_id, state, job = _run_worker_once(cfg)
+    assert state == "done"
+    csv = (cfg.results_dir / "ops" / job["run_id"] / "parsed" /
+           "connections.csv").read_text().splitlines()
+    assert len(csv) >= 3                          # header + initial + watch rows
+    # bounds enforced
+    r = client.post(f"/api/kube-targets/{created['id']}/diag",
+                    json={"params": {"watch_s": 999999}}, auth=("op", "oppw"))
+    assert r.status_code == 400
+
+
+def test_health_findings_and_target_badge(opsweb, monkeypatch):
+    client, cfg = opsweb
+    created = _create_target(client)
+    _drain_queue(cfg)
+    # healthy cluster → ok, no findings
+    client.post(f"/api/kube-targets/{created['id']}/health", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    doc = client.get(f"/api/kube-targets/{created['id']}/health",
+                     auth=("viewer", "vpw")).json()
+    assert doc["health"]["status"] == "ok"
+    assert doc["health"]["findings"] == []
+    assert doc["health"]["checked"] >= 10
+    # an inactive slot retaining WAL → warn finding with remediation + action
+    monkeypatch.setenv("FAKE_KUBE_INACTIVE_SLOT", "1")
+    client.post(f"/api/kube-targets/{created['id']}/health", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    doc = client.get(f"/api/kube-targets/{created['id']}/health",
+                     auth=("viewer", "vpw")).json()
+    assert doc["health"]["status"] == "warn"
+    slot = next(f for f in doc["health"]["findings"] if f["id"] == "slots")
+    assert "pg_drop_replication_slot" in slot["remediation"]
+    assert slot["action"] == {"type": "diag", "checks": ["slots"]}
+    # the targets list badges the cached worst severity
+    kt = client.get(f"/api/kube-targets/{created['id']}",
+                    auth=("viewer", "vpw")).json()
+    assert kt["health_status"] == "warn" and kt["health_utc"]
+
+
+def test_params_diag_health_rbac(opsweb):
+    """Read-only intelligence ops are operator-level; viewers can only read."""
+    client, cfg = opsweb
+    created = _create_target(client)
+    _drain_queue(cfg)
+    for path in ("pg-params", "diag", "health"):
+        r = client.post(f"/api/kube-targets/{created['id']}/{path}",
+                        json={}, auth=("viewer", "vpw"))
+        assert r.status_code == 403, path
+
+
 # ── the extended leak gate ──
 
 def test_kube_secrets_never_leak_anywhere(opsweb):

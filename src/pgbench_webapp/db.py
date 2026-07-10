@@ -122,6 +122,22 @@ MIGRATIONS: list[tuple[int, str]] = [
     ALTER TABLE jobs ADD COLUMN kube_target_id INTEGER REFERENCES kube_targets(id);
     CREATE INDEX idx_ops_runs_created ON ops_runs(created_utc);
     """),
+    # 5: record the OUTCOME of the last validation (NULL = never validated,
+    #    1 = ok, 0 = failed) so the targets list can badge broken targets
+    #    instead of showing only when validation last ran.
+    (5, """
+    ALTER TABLE kube_targets ADD COLUMN last_validation_ok INTEGER;
+    """),
+    # 6: cached snapshots for the parameter map (full pg_settings catalog,
+    #    introspected from the leader) and the health-check findings — same
+    #    caching pattern as topology_json: filesystem/cluster is the source
+    #    of truth, these give the UI an instant last-known view.
+    (6, """
+    ALTER TABLE kube_targets ADD COLUMN params_json TEXT;
+    ALTER TABLE kube_targets ADD COLUMN params_utc TEXT;
+    ALTER TABLE kube_targets ADD COLUMN health_json TEXT;
+    ALTER TABLE kube_targets ADD COLUMN health_utc TEXT;
+    """),
 ]
 
 

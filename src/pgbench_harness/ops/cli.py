@@ -35,6 +35,14 @@ def add_ops_parser(sub: argparse._SubParsersAction) -> None:
     spec_args(sc)
     mo = osub.add_parser("monitor", help="continuous cluster telemetry sampler")
     spec_args(mo)
+    spec_args(osub.add_parser("pg-params",
+                              help="snapshot the full pg_settings parameter catalog"),
+              results=False)
+    dg = osub.add_parser("diag", help="run read-only diagnostics (live CSV results)")
+    spec_args(dg)
+    spec_args(osub.add_parser("health",
+                              help="evaluate health heuristics -> findings JSON"),
+              results=False)
     st = osub.add_parser("stitch", help="(re)stitch a scenario run dir from raw captures")
     st.add_argument("--run-dir", required=True, type=Path)
     rp = osub.add_parser("report", help="(re)generate the report for an op run dir")
@@ -78,4 +86,13 @@ def cmd_ops(args: argparse.Namespace) -> int:
     if cmd == "monitor":
         from pgbench_harness.ops.monitor import run_monitor
         return run_monitor(spec, args.results_dir)
+    if cmd == "pg-params":
+        from pgbench_harness.ops.params import run_pg_params
+        return run_pg_params(spec)
+    if cmd == "diag":
+        from pgbench_harness.ops.diag import run_diag
+        return run_diag(spec, args.results_dir)
+    if cmd == "health":
+        from pgbench_harness.ops.health import run_health
+        return run_health(spec)
     raise AssertionError(f"unhandled ops command {cmd}")

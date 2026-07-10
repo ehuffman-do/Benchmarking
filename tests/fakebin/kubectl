@@ -214,6 +214,9 @@ def pgbackrest_info(st):
 
 
 def pgbackrest_info_json(st):
+    # Dynamic timestamps: newest backup finished an hour ago (healthy for the
+    # backup-staleness heuristic), each older one a day further back.
+    n = len(st["backups"])
     return json.dumps([{
         "name": "db",
         "status": {"code": 0,
@@ -221,8 +224,9 @@ def pgbackrest_info_json(st):
         "backup": [{"label": b["label"], "type": b["type"],
                     "info": {"size": 13100000000, "delta": 13100000000,
                              "repository": {"size": 2040000000, "delta": 2040000000}},
-                    "timestamp": {"start": 1751846404, "stop": 1751848199}}
-                   for b in st["backups"]],
+                    "timestamp": {"start": int(now()) - (n - 1 - i) * 86400 - 5400,
+                                  "stop": int(now()) - (n - 1 - i) * 86400 - 3600}}
+                   for i, b in enumerate(st["backups"])],
     }])
 
 
@@ -232,12 +236,161 @@ PG_DEFAULTS = {
     "checkpoint_timeout": ("300", "s"), "checkpoint_completion_target": ("0.9", ""),
 }
 
+# Full-catalog rows for the pg-params snapshot (a representative slice of
+# pg_settings with every metadata column the console's parameter map uses).
+# (setting, unit, vartype, min, max, enumvals, context, category, desc)
+PG_CATALOG = {
+    "max_wal_size": ("4096", "MB", "integer", "2", "2147483647", None,
+                     "sighup", "Write-Ahead Log / Checkpoints",
+                     "Sets the WAL size that triggers a checkpoint."),
+    "min_wal_size": ("1024", "MB", "integer", "2", "2147483647", None,
+                     "sighup", "Write-Ahead Log / Checkpoints",
+                     "Sets the minimum size to shrink the WAL to."),
+    "archive_timeout": ("60", "s", "integer", "0", "1073741823", None,
+                        "sighup", "Write-Ahead Log / Archiving",
+                        "Sets the amount of time to wait before forcing a switch to the next WAL file."),
+    "wal_keep_size": ("0", "MB", "integer", "0", "2147483647", None,
+                      "sighup", "Replication / Sending Servers",
+                      "Sets the size of WAL files held for standby servers."),
+    "checkpoint_timeout": ("300", "s", "integer", "30", "86400", None,
+                           "sighup", "Write-Ahead Log / Checkpoints",
+                           "Sets the maximum time between automatic WAL checkpoints."),
+    "checkpoint_completion_target": ("0.9", None, "real", "0", "1", None,
+                                     "sighup", "Write-Ahead Log / Checkpoints",
+                                     "Time spent flushing dirty buffers during checkpoint."),
+    "max_connections": ("100", None, "integer", "1", "262143", None,
+                        "postmaster", "Connections and Authentication",
+                        "Sets the maximum number of concurrent connections."),
+    "shared_buffers": ("16384", "8kB", "integer", "16", "1073741823", None,
+                       "postmaster", "Resource Usage / Memory",
+                       "Sets the number of shared memory buffers used by the server."),
+    "work_mem": ("4096", "kB", "integer", "64", "2147483647", None,
+                 "user", "Resource Usage / Memory",
+                 "Sets the maximum memory to be used for query workspaces."),
+    "listen_addresses": ("*", None, "string", None, None, None,
+                         "postmaster", "Connections and Authentication",
+                         "Sets the host name or IP address(es) to listen to."),
+    "port": ("5432", None, "integer", "1", "65535", None,
+             "postmaster", "Connections and Authentication",
+             "Sets the TCP port the server listens on."),
+    "wal_level": ("logical", None, "enum", None, None,
+                  ["minimal", "replica", "logical"],
+                  "postmaster", "Write-Ahead Log / Settings",
+                  "Sets the level of information written to the WAL."),
+    "synchronous_commit": ("on", None, "enum", None, None,
+                           ["local", "remote_write", "remote_apply", "on", "off"],
+                           "user", "Write-Ahead Log / Settings",
+                           "Sets the current transaction's synchronization level."),
+    "autovacuum": ("on", None, "bool", None, None, None,
+                   "sighup", "Autovacuum",
+                   "Starts the autovacuum subprocess."),
+    "log_min_duration_statement": ("-1", "ms", "integer", "-1", "2147483647", None,
+                                   "superuser", "Reporting and Logging / When to Log",
+                                   "Sets the minimum execution time above which all statements will be logged."),
+    "random_page_cost": ("4", None, "real", "0", "1.79769e+308", None,
+                         "user", "Query Tuning / Planner Cost Constants",
+                         "Sets the planner's estimate of the cost of a nonsequentially fetched disk page."),
+    "archive_command": ("pgbackrest --stanza=db archive-push \"%p\"", None,
+                        "string", None, None, None,
+                        "sighup", "Write-Ahead Log / Archiving",
+                        "Sets the shell command that will be called to archive a WAL file."),
+    "block_size": ("8192", None, "integer", "8192", "8192", None,
+                   "internal", "Preset Options",
+                   "Shows the size of a disk block."),
+    "server_version_num": ("180000", None, "integer", "180000", "180000", None,
+                           "internal", "Preset Options",
+                           "Shows the server version as an integer."),
+}
+
+DIAG_SEP = "\x1f"
+
+
+def pg_catalog_rows(st):
+    """pg_settings rows (dicts) for the json_agg catalog query."""
+    params = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
+              ["parameters"])
+    rows = []
+    for name in sorted(PG_CATALOG):
+        setting, unit, vartype, mn, mx, enums, context, cat, desc = PG_CATALOG[name]
+        live = str(params.get(name, setting))
+        rows.append({
+            "name": name, "setting": live, "unit": unit, "vartype": vartype,
+            "min_val": mn, "max_val": mx, "enumvals": enums, "context": context,
+            "category": cat, "short_desc": desc, "boot_val": setting,
+            "reset_val": live,
+            "source": "configuration file" if name in params else "default",
+            "pending_restart": name in st.get("pending_restart", []),
+        })
+    return rows
+
 
 def run_sql(st, sql):
     """Answer the SQL the ops runners issue, from cluster state."""
     s = " ".join(sql.split()).lower()
     params = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
               ["parameters"])
+    j = DIAG_SEP.join
+    # ── marker-dispatched queries (params catalog, diag, health) ──
+    # These must run before the generic substring branches below.
+    if "json_agg" in s and "pg_settings" in s:
+        return json.dumps(pg_catalog_rows(st))
+    if "show server_version" in s:
+        return "18.0"
+    if "diag:connections" in s or "health:connections" in s:
+        used, mx = 12, int(params.get("max_connections", 100))
+        if "health:" in s:
+            return j([str(used), str(mx)])
+        return j(["12", "3", "8", "1", "0", str(mx),
+                  str(round(100.0 * used / mx, 1))])
+    if "health:idle_tx" in s:
+        return j(["0", "0"]) if not os.environ.get("FAKE_KUBE_IDLE_TX") \
+            else j(["2", os.environ["FAKE_KUBE_IDLE_TX"]])
+    if "health:longtx" in s:
+        return "42"
+    if "diag:long_running" in s:
+        return j(["4242", "doadmin", "active", "", "42",
+                  "SELECT * FROM sbtest1 WHERE id = $1"])
+    if "diag:blocked" in s:
+        return ""
+    if "diag:replication" in s or "health:slots" in s or "diag:slots" in s:
+        replicas = [i for i in st["instances"]
+                    if i["name"] != st["leader"] and pod_alive(st, i["name"])]
+        if "health:slots" in s:
+            if os.environ.get("FAKE_KUBE_INACTIVE_SLOT"):
+                return j([str(2 << 30), "1"])
+            return j(["0", "0"])
+        if "diag:slots" in s:
+            rows = [j([f"{r['name']}_slot", "physical", "true", "8388608"])
+                    for r in replicas]
+            if os.environ.get("FAKE_KUBE_INACTIVE_SLOT"):
+                rows.append(j(["orphaned_slot", "physical", "false", str(2 << 30)]))
+            return "\n".join(rows)
+        return "\n".join(j([r["name"], "streaming", "1024", "2048", "0.1"])
+                         for r in replicas)
+    if "diag:wraparound" in s or "health:wraparound" in s:
+        if "health:" in s:
+            return "180000000"
+        return "\n".join([j(["defaultdb", "180000000", "8.38"]),
+                          j(["postgres", "120000000", "5.59"])])
+    if "diag:cache_hit" in s or "health:cache_hit" in s:
+        if "health:" in s:
+            return "0.9987"
+        return j(["defaultdb", "3212", "2453411", "0.9987"])
+    if "health:pending" in s:
+        return str(len(st.get("pending_restart", [])))
+    if "diag:dead_tuples" in s:
+        return "\n".join([j(["public.sbtest1", "1000000", "52000", "4.9",
+                             "2026-07-10 01:00:00+00"]),
+                          j(["public.sbtest2", "1000000", "1200", "0.1", "never"])])
+    if "diag:table_sizes" in s:
+        return "\n".join([j(["public.sbtest1", "2147483648", "2048 MB"]),
+                          j(["public.sbtest2", "1073741824", "1024 MB"])])
+    if "diag:temp_files" in s:
+        return j(["defaultdb", "3", "104857600"])
+    if "diag:checkpoints" in s:
+        return j(["48", "9", "15.8"])
+    if "diag:wal_activity" in s:
+        return j([str((int(now()) % 100000) * 1048576), "5/AB000000"])
     if "pg_stat_archiver" in s:
         n = st["archived_base"] + int(now()) % 100000
         return (f"{int(now())},{n},0,0000000500000000000000AB,"
@@ -423,6 +576,13 @@ def main():
     args = cleaned
     if not args:
         return 2
+    # FAKE_KUBE_AUTH_FAIL=1: every API-touching command fails like an expired
+    # token / bad exec-credential kubeconfig (the DOKS doctl failure mode);
+    # client-only commands still work, exactly like real kubectl.
+    if os.environ.get("FAKE_KUBE_AUTH_FAIL") and args[0] not in ("version", "config"):
+        print("error: You must be logged in to the server (the server has asked "
+              "for the client to provide credentials)", file=sys.stderr)
+        return 1
     st = load()
     maybe_elect(st)
     settle_manual(st)
@@ -533,6 +693,10 @@ def main():
                 deadline = now() + float(os.environ.get("FAKE_KUBE_LOG_FOLLOW_S", "30"))
                 while now() < deadline:
                     time.sleep(1)
+            elif "--no-headers" in rest:
+                if any("type=Warning" in a for a in rest):
+                    out("32m Warning Unhealthy pod/cluster1-instance1-abcd-0 "
+                        "Readiness probe failed (historic)")
             else:
                 out("LAST SEEN TYPE REASON OBJECT MESSAGE")
             return 0
