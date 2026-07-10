@@ -83,7 +83,13 @@ def run_discover(spec: OpsSpec) -> int:
                             "cr_kind": "", "cr_name": t.cr_name}
 
     # CR (kind fallback, name auto-pick when the target doesn't pin one).
+    # Track whether any list actually SUCCEEDED: "no CR found" is only true
+    # when a query came back empty — if every attempt errored (bad auth,
+    # missing CRD, unreachable API server) report the real cause instead of
+    # a misleading empty-namespace message.
     cr_doc: Optional[dict[str, Any]] = None
+    listed_ok = False
+    last_err = ""
     for kind in ([t.cr_kind] + [k for k in CR_KINDS if k != t.cr_kind]):
         try:
             if t.cr_name:
@@ -91,6 +97,7 @@ def run_discover(spec: OpsSpec) -> int:
                 topo["cr_kind"], topo["cr_name"] = kind, t.cr_name
             else:
                 listing = kube.json(["get", kind])
+                listed_ok = True
                 items = listing.get("items") or []
                 if not items:
                     continue
@@ -98,14 +105,23 @@ def run_discover(spec: OpsSpec) -> int:
                 topo["cr_kind"] = kind
                 topo["cr_name"] = cr_doc.get("metadata", {}).get("name", "")
             break
-        except KubeError:
+        except KubeError as exc:
+            last_err = str(exc)
             continue
     if cr_doc is not None:
         topo["postgres_version"] = str(((cr_doc.get("spec") or {}).get("postgresVersion", "")))
         topo["backups"] = cr_backup_config(cr_doc)
         _check("cluster-cr", "ok", f"{topo['cr_kind']}/{topo['cr_name']}")
     else:
-        _check("cluster-cr", "fail", f"no {' / '.join(CR_KINDS)} found in '{t.namespace}'")
+        if not listed_ok and last_err:
+            detail = f"could not query cluster CRs: {last_err[:260]}"
+            low = last_err.lower()
+            if "credentials" in low or "unauthorized" in low or "forbidden" in low:
+                detail += " — kubeconfig auth problem; run Validate on this target for details"
+            _check("cluster-cr", "fail", detail)
+        else:
+            _check("cluster-cr", "fail",
+                   f"no {' / '.join(CR_KINDS)} found in '{t.namespace}'")
         print(f"{TOPOLOGY_MARKER} {json.dumps(topo)}", flush=True)
         return 3
 

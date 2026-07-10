@@ -568,3 +568,72 @@ from `raw/` at any time.
    C2 only against a disposable cluster.
 5. **Monitor:** start at 60 s; verify leader re-detection by doing a Case A
    switchover mid-run and watching the leader column change.
+6. **Parameter map:** take a snapshot; spot-check three parameters against
+   `kubectl exec <leader> -c database -- psql -c "SELECT name, setting, unit
+   FROM pg_settings WHERE name IN (...)"`; stage a benign change (e.g.
+   `work_mem`), dry-run, apply, and confirm the verify step reports it live.
+7. **Diagnostics:** run everything once; each selected check must produce a
+   CSV in the cockpit. Run `connections` with watch 1 min and see the chart
+   move.
+8. **Health:** run a health check on a healthy cluster (expect ✓); then leave
+   an idle transaction open (`psql` + `BEGIN;`) for >10 min and re-run —
+   expect the idle-in-transaction finding with its remediation.
+
+### 14.7 Parameter map, diagnostics, health (intelligence layer)
+
+- **Parameter map** (`ops pg-params`, console → target → *Parameter map*):
+  the FULL `pg_settings` catalog is introspected from the current leader —
+  names, live values, types, units, min/max, enum values, contexts, and
+  descriptions come from the server, never from a hand-typed list, so the map
+  is automatically correct for the running major version and its loaded
+  extensions. A static overlay classifies each parameter's **apply channel**:
+  - `cr` — normal: staged edits are applied via
+    `spec.patroni.dynamicConfiguration.postgresql.parameters` with the
+    existing dry-run → apply → verify loop;
+  - `dcs-coordinated` — Patroni coordinates these cluster-wide
+    (max_connections, wal_level, ...): applying works but expect
+    `pending_restart` and a rolling restart;
+  - `patroni-locked` — Patroni overrides these (listen_addresses, port, ...):
+    the console refuses to stage them;
+  - `operator-managed` — the operator owns these and reverts them on every
+    reconcile (TLS/socket/log plumbing, pgBackRest archive/restore commands,
+    Patroni recovery parameters): display only, with the reason shown;
+  - `readonly` — compiled in (`internal` context): display only.
+  The editors are typed (bool/enum selects, numeric inputs with the server's
+  own ranges), so an invalid value cannot be staged, let alone applied.
+- **Diagnostics** (`ops diag`, console → target → *Diagnostics*): a curated
+  catalog of read-only checks (sessions/locks, replication and slots,
+  wraparound, cache hit, dead tuples, sizes, temp spill, checkpoints, WAL,
+  patronictl, pgBackRest inventory, pods/events/PVC usage). Results stream
+  into the standard ops cockpit as CSVs (tables + charts). Checks marked
+  *live* support **watch mode** (re-sample every N seconds for up to an
+  hour) — pick `connections` + watch to get a live saturation chart during
+  an incident. Operator-level, no typed confirmation: nothing mutates.
+- **Health** (`ops health`, target page → *Run health check*): one pass over
+  field-standard heuristics — connection saturation, idle-in-transaction and
+  long transactions, inactive replication slots retaining WAL, wraparound
+  distance, cache hit ratio, `pending_restart` drift, Patroni member states
+  and lag, pod phases/restart loops, PVC fill, backup staleness. Findings
+  carry a severity (`info`/`warn`/`crit`), a one-line remediation, and a
+  deep-link to the diagnostic or parameter view that investigates it. The
+  worst severity is cached and badged on the targets list. Thresholds are
+  overridable per run via `params.thresholds`.
+
+### 14.8 Backups from a replica (backup-standby)
+
+A **direct exec** backup runs `pgbackrest` inside one pod and can only see
+that pod's local Postgres. On a replica that is a standby in recovery —
+pgBackRest exits rc=56 (`unable to find primary cluster`). The runner refuses
+this combination up front, and the console steers you right:
+
+1. Set **Source** to a replica → the trigger path locks to **operator**.
+2. `backup-standby: "y"` must be present in
+   `spec.backups.pgbackrest.global` — the backup form shows whether it is set
+   and offers a one-click enable (a normal cr-apply with dry-run/verify).
+3. The operator's repo-host Job then coordinates the backup: the **standby
+   copies the data files** while the **primary only handles backup start/stop
+   and WAL switching** — that is the point: near-zero I/O impact on the
+   writer.
+4. Requirements: at least one healthy streaming replica (check the health
+   panel), and both primary and standby reachable from the repo host. If the
+   standby lags heavily, backups take longer; fix lag first.

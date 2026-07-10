@@ -81,10 +81,78 @@ export interface KubeTarget {
   db_name: string;
   api_server: string;
   last_validated_utc: string | null;
+  last_validation_ok: boolean | null;
   topology_utc: string | null;
+  params_utc: string | null;
+  health_utc: string | null;
+  health_status: string | null;
   schedules_paused: boolean;
   schedules_paused_utc: string | null;
   created_utc: string;
+}
+
+// ── parameter map (introspected pg_settings + apply-channel overlay) ──
+
+export interface PgParam {
+  name: string;
+  setting: string | null;
+  unit: string | null;
+  vartype: string;                 // bool | enum | integer | real | string
+  min_val: string | null;
+  max_val: string | null;
+  enumvals: string[];
+  context: string;                 // internal|postmaster|sighup|superuser|user|backend...
+  category: string;
+  short_desc: string;
+  boot_val: string | null;
+  reset_val: string | null;
+  source: string | null;
+  pending_restart: boolean;
+  channel: "cr" | "dcs-coordinated" | "patroni-locked" | "operator-managed" | "readonly";
+  restart_required: boolean;
+  cr_value: string | null;
+}
+
+export interface PgParamsCatalog {
+  collected_utc: string;
+  leader: string;
+  pg_version: string;
+  params: PgParam[];
+  cr_managed: Record<string, string>;
+  pgbackrest_global: Record<string, string>;
+}
+
+// ── diagnostics workbench ──
+
+export interface DiagCheckInfo {
+  key: string;
+  title: string;
+  description: string;
+  category: string;
+  kind: string;
+  columns: string[];
+  watch: boolean;
+  chart: string;
+}
+
+// ── health checks ──
+
+export interface HealthFinding {
+  id: string;
+  severity: "ok" | "info" | "warn" | "crit";
+  title: string;
+  value: string;
+  detail: string;
+  remediation: string;
+  action: { type?: string; checks?: string[]; filter?: string };
+}
+
+export interface HealthDoc {
+  collected_utc: string;
+  status: string;
+  findings: HealthFinding[];
+  checked: number;
+  leader: string;
 }
 
 export interface PatroniMember {

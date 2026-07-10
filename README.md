@@ -488,6 +488,26 @@ kubeconfig — porting a field-tested bash methodology into first-class
   checkpoints, archive queue, replication lag, per-member disk) that
   re-detects the leader every cycle and never blanks a whole row when one
   collector fails.
+- **Parameter map** — the FULL `pg_settings` catalog introspected live from
+  the leader (types, units, ranges, enum values, contexts, descriptions —
+  never a hand-typed list), searchable and filterable, with typed editors
+  whose validation comes from the server itself, a Patroni apply-channel
+  overlay (CR-appliable vs DCS-coordinated vs Patroni-locked vs read-only),
+  CR-managed provenance badges, and staged changes flowing through the
+  existing dry-run → apply → verify loop.
+- **Diagnostics workbench** — a click-to-run catalog of read-only checks
+  covering sessions/locks, replication + slots, wraparound, cache hit, dead
+  tuples/autovacuum, relation sizes, temp spill, checkpoints, WAL,
+  patronictl, pgBackRest inventory, pods/events/PVC usage — results stream
+  live into the ops cockpit; *live* checks support watch mode (interval
+  re-sampling → moving charts). No kubectl or SQL knowledge required.
+- **Health checks** — built-in intelligence: one pass evaluates
+  field-standard heuristics (connection saturation, idle-in-transaction,
+  inactive slots retaining WAL, wraparound distance, cache hit,
+  pending_restart drift, Patroni states/lag, pod restart loops, PVC fill,
+  backup staleness) into findings with severities, one-line remediations,
+  and deep-links to the diagnostic that investigates each one; the worst
+  severity badges the targets list.
 
 Security invariants: kubeconfig contents and k8s-derived passwords never
 touch the DB, specs, logs, SSE streams, reports, or artifacts (enforced by

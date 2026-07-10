@@ -45,11 +45,26 @@ def _kt_json(row: sqlite3.Row) -> dict[str, Any]:
         "db_user": row["db_user"], "db_name": row["db_name"],
         "api_server": row["api_server"],
         "last_validated_utc": row["last_validated_utc"],
+        "last_validation_ok": (None if row["last_validation_ok"] is None
+                               else bool(row["last_validation_ok"])),
         "topology_utc": row["topology_utc"],
+        "params_utc": row["params_utc"],
+        "health_utc": row["health_utc"],
+        "health_status": _health_status(row),
         "schedules_paused": bool(row["schedules_snapshot"]),
         "schedules_paused_utc": row["schedules_paused_utc"],
         "created_utc": row["created_utc"],
     }
+
+
+def _health_status(row: sqlite3.Row) -> Optional[str]:
+    """Worst-severity summary from the cached health document (list badges)."""
+    if not row["health_json"]:
+        return None
+    try:
+        return json.loads(row["health_json"]).get("status")
+    except ValueError:
+        return None
 
 
 def _ops_run_json(row: sqlite3.Row) -> dict[str, Any]:
@@ -208,7 +223,18 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
             store.set(ref, payload["kubeconfig_content"])
             fields["kubeconfig_ref"] = ref
             fields["kubeconfig_path"] = ""
+        elif fields.get("kubeconfig_path"):
+            # Switching (back) to path mode: the worker prefers an imported
+            # copy over the path, so drop the stale encrypted copy or the new
+            # path would silently never be used.
+            if kt["kubeconfig_ref"]:
+                store.delete(kt["kubeconfig_ref"])
+                fields["kubeconfig_ref"] = ""
         if fields:
+            # Kubeconfig or coordinates changed — the previous validation
+            # verdict no longer applies; reset it until the next validate runs.
+            conn.execute("UPDATE kube_targets SET last_validation_ok=NULL WHERE id=?",
+                         (target_id,))
             queries.update_kube_target(conn, target_id, **fields)
         queries.audit(conn, user["username"], "kube_target_update", target=kt["name"],
                       detail=",".join(sorted(fields)))
@@ -263,6 +289,94 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
                 topo = None
         return JSONResponse({"topology": topo, "collected_utc": kt["topology_utc"],
                              "schedules_paused": bool(kt["schedules_snapshot"])})
+
+    # ── parameter map (introspected pg_settings catalog) ──
+
+    @app.post("/api/kube-targets/{target_id}/pg-params")
+    def kube_target_pg_params_refresh(target_id: int, request: Request,
+                                      conn: sqlite3.Connection = Depends(get_conn),
+                                      user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _csrf(request)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        job_id = _enqueue_ops(conn, kt, "pg-params", {},
+                              f"pg-params-{kt['name']}", user["username"])
+        return JSONResponse({"job_id": job_id})
+
+    @app.get("/api/kube-targets/{target_id}/pg-params")
+    def kube_target_pg_params(target_id: int,
+                              conn: sqlite3.Connection = Depends(get_conn),
+                              user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        kt = _kt_or_404(conn, target_id)
+        catalog: Any = None
+        if kt["params_json"]:
+            try:
+                catalog = json.loads(kt["params_json"])
+            except ValueError:
+                catalog = None
+        return JSONResponse({"catalog": catalog, "collected_utc": kt["params_utc"]})
+
+    # ── diagnostics workbench (read-only, operator-level) ──
+
+    @app.get("/api/ops/diag-catalog")
+    def ops_diag_catalog(user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        from pgbench_harness.ops.diag import catalog_json
+        return JSONResponse({"checks": catalog_json()})
+
+    @app.post("/api/kube-targets/{target_id}/diag")
+    def ops_diag(target_id: int, request: Request, payload: dict,
+                 conn: sqlite3.Connection = Depends(get_conn),
+                 user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        params = _params(payload)
+        from pgbench_harness.ops.diag import CHECKS_BY_KEY
+        checks = params.get("checks")
+        if checks is not None:
+            if not isinstance(checks, list) or not checks:
+                raise HTTPException(400, "'checks' must be a non-empty list")
+            bad = [c for c in checks if c not in CHECKS_BY_KEY]
+            if bad:
+                raise HTTPException(400, f"unknown checks: {', '.join(map(str, bad))}")
+        try:
+            watch_s = float(params.get("watch_s") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "'watch_s' must be a number")
+        if not 0 <= watch_s <= 3600:
+            raise HTTPException(400, "'watch_s' must be between 0 and 3600")
+        job_id = _enqueue_ops(conn, kt, "diag", params,
+                              payload.get("label") or "", user["username"])
+        return JSONResponse({"job_id": job_id})
+
+    # ── health checks (built-in intelligence) ──
+
+    @app.post("/api/kube-targets/{target_id}/health")
+    def ops_health_run(target_id: int, request: Request,
+                       conn: sqlite3.Connection = Depends(get_conn),
+                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        _csrf(request)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        job_id = _enqueue_ops(conn, kt, "health", {},
+                              f"health-{kt['name']}", user["username"])
+        return JSONResponse({"job_id": job_id})
+
+    @app.get("/api/kube-targets/{target_id}/health")
+    def ops_health_get(target_id: int,
+                       conn: sqlite3.Connection = Depends(get_conn),
+                       user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        kt = _kt_or_404(conn, target_id)
+        health: Any = None
+        if kt["health_json"]:
+            try:
+                health = json.loads(kt["health_json"])
+            except ValueError:
+                health = None
+        return JSONResponse({"health": health, "collected_utc": kt["health_utc"]})
 
     # ── operations (destructive: admin + typed confirmation) ──
 
