@@ -229,6 +229,25 @@ def run_backup(spec: OpsSpec, results_dir: Path) -> int:
         run.event("plan", f"{btype} backup via {path_mode} path",
                   f"source {source} ({source_role}); leader {leader}")
 
+        # Architecture guard: a direct `kubectl exec` into an instance pod runs
+        # pgBackRest against that pod's LOCAL Postgres only. On a replica that is
+        # a standby (in recovery), so pgBackRest fails with "unable to find
+        # primary cluster" (rc=56). A replica-offloaded backup must run on the
+        # operator's repo-host Job, which can reach both primary and standby.
+        if path_mode == "direct" and source_role == "replica":
+            run.event("preflight", "ABORT: replica-source backup needs the operator path",
+                      "In PGO, a direct exec into a replica pod can only see its "
+                      "local standby Postgres (pgBackRest rc=56: 'unable to find "
+                      "primary cluster'). For a replica-offloaded backup, set "
+                      "Trigger path = operator and backup-standby=y in "
+                      "spec.backups.pgbackrest.global; for a direct backup, set "
+                      "Source = leader.")
+            run.finalize("aborted", headline={"reason": "replica-direct-unsupported",
+                                              "type": btype, "path": path_mode,
+                                              "source": source, "source_role": source_role,
+                                              "leader": leader})
+            return EXIT_ABORTED
+
         clear, info_before, _bcfg = preflight(kube, run, spec, leader)
         if not clear:
             run.finalize("aborted", headline={"reason": "preflight",
@@ -306,18 +325,17 @@ def run_backup(spec: OpsSpec, results_dir: Path) -> int:
         run.meta["backup_end_epoch_ms"] = end_ms
         run.save_meta()
 
+        fail_headline = {"type": btype, "path": path_mode, "source": source,
+                         "source_role": source_role, "leader": leader, "rc": rc}
         if rc == 50:
             run.event("fire", "rc=50: lock collision mid-run",
                       "a concurrent backup grabbed the stanza lock despite "
                       "preflight — see operator schedules")
-            run.finalize("failed", headline={"type": btype, "path": path_mode,
-                                             "rc": rc})
+            run.finalize("failed", headline=fail_headline)
             return EXIT_FAILED
         if rc != 0:
             run.event("fire", f"backup failed rc={rc}", trigger_out[-300:])
-            run.finalize("failed", headline={"type": btype, "path": path_mode,
-                                             "rc": rc},
-                         error=f"backup rc={rc}")
+            run.finalize("failed", headline=fail_headline, error=f"backup rc={rc}")
             return EXIT_FAILED
         run.event("fire", "backup command completed",
                   f"{(end_ms - start_ms) / 1000:.1f}s")

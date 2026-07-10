@@ -565,10 +565,12 @@ def test_backup_operator_path_tracks_job(opsweb):
 
 
 def test_backup_from_replica_records_source(opsweb):
+    """A replica-source backup goes through the OPERATOR path (the repo-host Job
+    coordinates primary+standby); it records which node and samples both."""
     client, cfg = opsweb
     tid = _ready_target(client, cfg)
-    r = _fire_backup(client, tid, {"type": "incr", "path": "direct",
-                                   "source": "replica",
+    r = _fire_backup(client, tid, {"type": "incr", "path": "operator",
+                                   "source": "replica", "timeout_s": 30,
                                    "sample_interval_s": 0.2, "settle_s": 0.3})
     assert r.status_code == 200
     _drain_queue(cfg)
@@ -576,7 +578,7 @@ def test_backup_from_replica_records_source(opsweb):
     assert run["status"] == "complete", run
     h = run["headline"]
     assert h["source_role"] == "replica"
-    assert h["source"] != h["leader"]             # the work landed on a replica
+    assert h["source"] != h["leader"]             # the offload target is a replica
     # load sampler covered BOTH nodes
     load = (cfg.results_dir / "ops" / run["op_run_id"] / "parsed" /
             "load.csv").read_text()
@@ -1049,3 +1051,32 @@ def test_validate_reports_cleanly_when_kubeconfig_not_a_file(opsweb, tmp_path):
     assert "Traceback" not in out
     assert "not a regular file" in out
     assert "OPS_SUMMARY_JSON" in out
+
+
+def test_backup_replica_direct_aborts_with_clear_message(opsweb):
+    """PGO architecture guard: a direct-exec backup with source=replica can't
+    reach the primary (rc=56); it must abort with a clear message pointing at
+    the operator path, not fire a doomed backup."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_backup(client, tid, {"type": "full", "path": "direct",
+                                   "source": "replica",
+                                   "sample_interval_s": 0.2, "settle_s": 0.2})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "backup")
+    assert run["status"] == "aborted"
+    assert run["headline"]["source_role"] == "replica"
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    assert "replica-source backup needs the operator path" in events
+    assert "Source = leader" in events
+    # replica via the OPERATOR path is allowed (no abort at this guard)
+    r = _fire_backup(client, tid, {"type": "incr", "path": "operator",
+                                   "source": "replica",
+                                   "sample_interval_s": 0.2, "settle_s": 0.3,
+                                   "timeout_s": 30})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "backup")
+    assert run["status"] in ("complete", "failed")   # not aborted by the guard
+    assert run["headline"].get("reason") != "replica-direct-unsupported"
