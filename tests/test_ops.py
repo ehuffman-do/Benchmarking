@@ -443,6 +443,22 @@ def test_health_findings_and_target_badge(opsweb, monkeypatch):
     assert kt["health_status"] == "warn" and kt["health_utc"]
 
 
+def test_sidecar_catalog_served(opsweb):
+    """The curated pgBackRest/Patroni/pgBouncer option catalogs ship with the
+    package and are served with per-operator CR apply paths."""
+    client, _ = opsweb
+    r = client.get("/api/ops/sidecar-catalog", auth=("viewer", "vpw"))
+    assert r.status_code == 200
+    doc = r.json()
+    assert {"pgbackrest", "patroni", "pgbouncer"} <= set(doc)
+    names = {o["name"] for o in doc["pgbackrest"]}
+    assert "backup-standby" in names and "repoN-retention-full" in names
+    pool = next(o for o in doc["pgbouncer"] if o["name"] == "pool_mode")
+    assert pool["allowed"] == ["session", "transaction", "statement"]
+    assert pool["percona_path"] and pool["crunchy_path"]
+    assert any(o["name"] == "ttl" for o in doc["patroni"])
+
+
 def test_params_diag_health_rbac(opsweb):
     """Read-only intelligence ops are operator-level; viewers can only read."""
     client, cfg = opsweb
@@ -784,6 +800,10 @@ def test_backup_from_replica_records_source(opsweb):
     load = (cfg.results_dir / "ops" / run["op_run_id"] / "parsed" /
             "load.csv").read_text()
     assert h["leader"] in load and h["source"] in load
+    # the manual: block carried the one-off standby override (per-backup,
+    # no CR-global change needed)
+    patches = (Path(os.environ["FAKE_KUBE_STATE"]) / "patches.log").read_text()
+    assert "--backup-standby=y" in patches
 
 
 def test_backup_requires_confirmation_and_mutex(opsweb):

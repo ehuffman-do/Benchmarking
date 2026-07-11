@@ -324,6 +324,11 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         from pgbench_harness.ops.diag import catalog_json
         return JSONResponse({"checks": catalog_json()})
 
+    @app.get("/api/ops/sidecar-catalog")
+    def ops_sidecar_catalog(user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        from pgbench_harness.ops.params import sidecar_catalog
+        return JSONResponse(sidecar_catalog())
+
     @app.post("/api/kube-targets/{target_id}/diag")
     def ops_diag(target_id: int, request: Request, payload: dict,
                  conn: sqlite3.Connection = Depends(get_conn),

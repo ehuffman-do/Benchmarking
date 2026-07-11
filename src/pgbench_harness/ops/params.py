@@ -89,6 +89,17 @@ def _check(name: str, status: str, detail: str = "") -> None:
     print(json.dumps({"name": name, "status": status, "detail": detail}), flush=True)
 
 
+def sidecar_catalog() -> dict[str, Any]:
+    """Static option catalogs for the sidecar systems (pgBackRest, Patroni DCS,
+    pgBouncer) — research-curated with per-operator CR paths. Unlike the PG
+    catalog these cannot be introspected from a live system, so they ship as
+    packaged data; each entry names the exact CR path it applies through."""
+    from pathlib import Path
+    path = Path(__file__).parent / "sidecar_catalog.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    return doc if isinstance(doc, dict) else {}
+
+
 def classify(name: str, context: str) -> str:
     """The apply channel for one parameter (see module docstring)."""
     if context == "internal":

@@ -1,0 +1,2471 @@
+{
+ "pgbackrest": [
+  {
+   "name": "repoN-type",
+   "section": "repo",
+   "type": "string-id",
+   "default": "posix",
+   "allowed": [
+    "azure",
+    "cifs",
+    "gcs",
+    "posix",
+    "s3",
+    "sftp"
+   ],
+   "description": "Type of storage used for the repository. Operators set this automatically from repos[] union member (volume->posix on repo host, s3, gcs, azure). sftp/cifs have no typed CRD field (global map only; sftp also needs libssh2 in image).",
+   "percona_path": "spec.backups.pgbackrest.repos[].{volume|s3|gcs|azure} (auto) or spec.backups.pgbackrest.global[\"repoN-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.repos[].{volume|s3|gcs|azure} (auto) or spec.backups.pgbackrest.global[\"repoN-type\"]"
+  },
+  {
+   "name": "repoN-path",
+   "section": "repo",
+   "type": "path",
+   "default": "/var/lib/pgbackrest (upstream); /pgbackrest/repoN (operator-generated)",
+   "allowed": null,
+   "description": "Path where backups/archive are stored inside the repo. Both operators write repoN-path=/pgbackrest/repoN before merging user global, so it is overridable via global. Convention: /pgbackrest/<namespace>/<cluster>/repoN for shared buckets.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-path\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-path\"]"
+  },
+  {
+   "name": "repoN-cipher-type",
+   "section": "repo",
+   "type": "string-id",
+   "default": "none",
+   "allowed": [
+    "none",
+    "aes-256-cbc"
+   ],
+   "description": "Client-side encryption cipher for the repository. Must be set before stanza creation; cannot be changed on an existing repo.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-cipher-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-cipher-type\"]"
+  },
+  {
+   "name": "repoN-cipher-pass",
+   "section": "repo",
+   "type": "string (secure)",
+   "default": null,
+   "allowed": null,
+   "description": "Encryption passphrase; required when repoN-cipher-type=aes-256-cbc. Secure option - do NOT put in the CR global map (rendered into a ConfigMap); supply via configuration Secret projection.",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-cipher-pass=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-cipher-pass=...)"
+  },
+  {
+   "name": "repoN-retention-full-type",
+   "section": "repo",
+   "type": "string-id",
+   "default": "count",
+   "allowed": [
+    "count",
+    "time"
+   ],
+   "description": "Whether repoN-retention-full counts full backups (count) or days (time).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-retention-full-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-retention-full-type\"]"
+  },
+  {
+   "name": "repoN-retention-full",
+   "section": "repo",
+   "type": "integer",
+   "default": null,
+   "allowed": "[1, 9999999]",
+   "description": "Full backup retention count or days (per retention-full-type). Unset = keep forever (pgBackRest warns). Expire runs automatically after each backup unless expire-auto=n.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-retention-full\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-retention-full\"]"
+  },
+  {
+   "name": "repoN-retention-diff",
+   "section": "repo",
+   "type": "integer",
+   "default": null,
+   "allowed": "[1, 9999999]",
+   "description": "Number of differential backups to retain. Incrementals depending on an expired diff are expired with it.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-retention-diff\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-retention-diff\"]"
+  },
+  {
+   "name": "repoN-retention-archive-type",
+   "section": "repo",
+   "type": "string-id",
+   "default": "full",
+   "allowed": [
+    "full",
+    "diff",
+    "incr"
+   ],
+   "description": "Backup type WAL retention is applied to.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-retention-archive-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-retention-archive-type\"]"
+  },
+  {
+   "name": "repoN-retention-archive",
+   "section": "repo",
+   "type": "integer",
+   "default": null,
+   "allowed": "[1, 9999999]",
+   "description": "Number of backups worth of continuous WAL to retain. DANGEROUS if set below retention-full: can break PITR for older backups.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-retention-archive\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-retention-archive\"]"
+  },
+  {
+   "name": "repoN-retention-history",
+   "section": "repo",
+   "type": "integer",
+   "default": null,
+   "allowed": "[0, 9999999]",
+   "description": "Days of backup history manifests to retain after expiry (0 = expire immediately).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-retention-history\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-retention-history\"]"
+  },
+  {
+   "name": "repoN-bundle",
+   "section": "repo",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Bundle (combine) small files during backup into larger repo files. Reduces object count on S3/GCS/Azure. Disables repo-hardlink. Cannot be resumed.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-bundle\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-bundle\"]"
+  },
+  {
+   "name": "repoN-bundle-size",
+   "section": "repo",
+   "type": "size",
+   "default": "20MiB",
+   "allowed": "[1MiB, 1PiB]",
+   "description": "Target size of bundled files (values ~100MiB+ discouraged upstream).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-bundle-size\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-bundle-size\"]"
+  },
+  {
+   "name": "repoN-bundle-limit",
+   "section": "repo",
+   "type": "size",
+   "default": "2MiB",
+   "allowed": "[8KiB, 1PiB]",
+   "description": "Files larger than this are stored individually, not bundled.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-bundle-limit\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-bundle-limit\"]"
+  },
+  {
+   "name": "repoN-block",
+   "section": "repo",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Enable block incremental backup (delta at block level inside files). Requires repoN-bundle=y.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-block\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-block\"]"
+  },
+  {
+   "name": "repoN-hardlink",
+   "section": "repo",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Hardlink files between backups (posix repo, bundle off) so each backup looks full.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-hardlink\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-hardlink\"]"
+  },
+  {
+   "name": "repoN-symlink",
+   "section": "repo",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Maintain latest symlink in posix repositories.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-symlink\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-symlink\"]"
+  },
+  {
+   "name": "repoN-storage-verify-tls",
+   "section": "repo",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Verify TLS certificate of azure/gcs/s3 object store endpoint. Set n for self-signed MinIO etc. (prefer repoN-storage-ca-file).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-storage-verify-tls\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-storage-verify-tls\"]"
+  },
+  {
+   "name": "repoN-storage-ca-file",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "Custom CA file used to verify object-store TLS. File must be present in the container: mount via configuration Secret (lands in /etc/pgbackrest/conf.d/).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-storage-ca-file\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-storage-ca-file\"]"
+  },
+  {
+   "name": "repoN-storage-ca-path",
+   "section": "repo",
+   "type": "path",
+   "default": null,
+   "allowed": null,
+   "description": "Directory of CA certificates for object-store TLS verification.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-storage-ca-path\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-storage-ca-path\"]"
+  },
+  {
+   "name": "repoN-storage-host",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "Connect to this host/IP instead of the azure/s3 endpoint (endpoint still used for request signing/virtual-host).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-storage-host\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-storage-host\"]"
+  },
+  {
+   "name": "repoN-storage-port",
+   "section": "repo",
+   "type": "integer",
+   "default": "443",
+   "allowed": "[1, 65535]",
+   "description": "Port for object-store connection.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-storage-port\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-storage-port\"]"
+  },
+  {
+   "name": "repoN-storage-tag",
+   "section": "repo",
+   "type": "hash (key=value)",
+   "default": null,
+   "allowed": null,
+   "description": "Tags applied to objects written to azure/gcs/s3. hash type: one key=value per ini line; the CR global map allows only one value per option name, use configuration Secret for multiple tags.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-storage-tag\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-storage-tag\"]"
+  },
+  {
+   "name": "repoN-storage-upload-chunk-size",
+   "section": "repo",
+   "type": "size",
+   "default": "azure 4MiB, gcs 4MiB, s3 5MiB",
+   "allowed": "azure/gcs [4MiB, 1GiB], s3 [5MiB, 1GiB]",
+   "description": "Chunk size for multipart/resumable uploads. Larger = fewer requests, more memory per process.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-storage-upload-chunk-size\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-storage-upload-chunk-size\"]"
+  },
+  {
+   "name": "repoN-azure-account",
+   "section": "repo",
+   "type": "string (secure)",
+   "default": null,
+   "allowed": null,
+   "description": "Azure storage account. Secure option - supply via configuration Secret.",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-azure-account=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-azure-account=...)"
+  },
+  {
+   "name": "repoN-azure-container",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "Azure blob container for the repository.",
+   "percona_path": "spec.backups.pgbackrest.repos[].azure.container (typed, required)",
+   "crunchy_path": "spec.backups.pgbackrest.repos[].azure.container (typed, required)"
+  },
+  {
+   "name": "repoN-azure-endpoint",
+   "section": "repo",
+   "type": "string",
+   "default": "blob.core.windows.net",
+   "allowed": null,
+   "description": "Azure blob endpoint.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-azure-endpoint\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-azure-endpoint\"]"
+  },
+  {
+   "name": "repoN-azure-key",
+   "section": "repo",
+   "type": "string (secure)",
+   "default": null,
+   "allowed": null,
+   "description": "Azure shared account key or SAS token (per repoN-azure-key-type). Via configuration Secret.",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-azure-key=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-azure-key=...)"
+  },
+  {
+   "name": "repoN-azure-key-type",
+   "section": "repo",
+   "type": "string-id",
+   "default": "shared",
+   "allowed": [
+    "shared",
+    "sas",
+    "auto"
+   ],
+   "description": "Azure auth method; auto = workload-identity/managed identity (pgBackRest >=2.53).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-azure-key-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-azure-key-type\"]"
+  },
+  {
+   "name": "repoN-azure-uri-style",
+   "section": "repo",
+   "type": "string-id",
+   "default": "host",
+   "allowed": [
+    "host",
+    "path"
+   ],
+   "description": "URI style: host = account.endpoint, path = endpoint/account (use path for Azurite/emulators).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-azure-uri-style\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-azure-uri-style\"]"
+  },
+  {
+   "name": "repoN-gcs-bucket",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "GCS bucket for the repository.",
+   "percona_path": "spec.backups.pgbackrest.repos[].gcs.bucket (typed, required)",
+   "crunchy_path": "spec.backups.pgbackrest.repos[].gcs.bucket (typed, required)"
+  },
+  {
+   "name": "repoN-gcs-endpoint",
+   "section": "repo",
+   "type": "string",
+   "default": "storage.googleapis.com",
+   "allowed": null,
+   "description": "GCS endpoint (change for fake-gcs/proxies).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-gcs-endpoint\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-gcs-endpoint\"]"
+  },
+  {
+   "name": "repoN-gcs-key",
+   "section": "repo",
+   "type": "string (secure)",
+   "default": null,
+   "allowed": null,
+   "description": "Path to GCS service-account JSON key (key-type=service) or token (key-type=token). Put both the conf and the key file in the configuration Secret; files mount under /etc/pgbackrest/conf.d/.",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-gcs-key=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-gcs-key=...)"
+  },
+  {
+   "name": "repoN-gcs-key-type",
+   "section": "repo",
+   "type": "string-id",
+   "default": "service",
+   "allowed": [
+    "service",
+    "token",
+    "auto"
+   ],
+   "description": "GCS auth method; auto = instance/workload identity metadata.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-gcs-key-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-gcs-key-type\"]"
+  },
+  {
+   "name": "repoN-gcs-user-project",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "Project billed for requester-pays buckets.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-gcs-user-project\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-gcs-user-project\"]"
+  },
+  {
+   "name": "repoN-s3-bucket",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "S3 bucket for the repository.",
+   "percona_path": "spec.backups.pgbackrest.repos[].s3.bucket (typed, required)",
+   "crunchy_path": "spec.backups.pgbackrest.repos[].s3.bucket (typed, required)"
+  },
+  {
+   "name": "repoN-s3-endpoint",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "S3 endpoint, e.g. s3.amazonaws.com or MinIO host.",
+   "percona_path": "spec.backups.pgbackrest.repos[].s3.endpoint (typed, required)",
+   "crunchy_path": "spec.backups.pgbackrest.repos[].s3.endpoint (typed, required)"
+  },
+  {
+   "name": "repoN-s3-region",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "S3 region, e.g. us-east-1.",
+   "percona_path": "spec.backups.pgbackrest.repos[].s3.region (typed, required)",
+   "crunchy_path": "spec.backups.pgbackrest.repos[].s3.region (typed, required)"
+  },
+  {
+   "name": "repoN-s3-key",
+   "section": "repo",
+   "type": "string (secure)",
+   "default": null,
+   "allowed": null,
+   "description": "S3 access key id (key-type=shared). Via configuration Secret (Percona docs: s3.conf in cluster pgbackrest secrets).",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-s3-key=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-s3-key=...)"
+  },
+  {
+   "name": "repoN-s3-key-secret",
+   "section": "repo",
+   "type": "string (secure)",
+   "default": null,
+   "allowed": null,
+   "description": "S3 secret access key. Via configuration Secret.",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-s3-key-secret=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-s3-key-secret=...)"
+  },
+  {
+   "name": "repoN-s3-key-type",
+   "section": "repo",
+   "type": "string-id",
+   "default": "shared",
+   "allowed": [
+    "shared",
+    "auto",
+    "web-id",
+    "pod-id",
+    "process"
+   ],
+   "description": "S3 auth method: shared=static keys, auto=instance profile/IMDS, web-id=IRSA web identity (EKS), pod-id=EKS pod identity, process=external credential process.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-s3-key-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-s3-key-type\"]"
+  },
+  {
+   "name": "repoN-s3-token",
+   "section": "repo",
+   "type": "string (secure)",
+   "default": null,
+   "allowed": null,
+   "description": "S3 session token for temporary credentials.",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-s3-token=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-s3-token=...)"
+  },
+  {
+   "name": "repoN-s3-kms-key-id",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "SSE-KMS key id for server-side encryption.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-s3-kms-key-id\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-s3-kms-key-id\"]"
+  },
+  {
+   "name": "repoN-s3-sse-customer-key",
+   "section": "repo",
+   "type": "string (secure)",
+   "default": null,
+   "allowed": null,
+   "description": "SSE-C customer-provided encryption key (base64).",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-s3-sse-customer-key=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-s3-sse-customer-key=...)"
+  },
+  {
+   "name": "repoN-s3-role",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "IAM role for key-type=auto credential lookup (normally discovered automatically).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-s3-role\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-s3-role\"]"
+  },
+  {
+   "name": "repoN-s3-requester-pays",
+   "section": "repo",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Enable requester-pays on S3 requests.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-s3-requester-pays\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-s3-requester-pays\"]"
+  },
+  {
+   "name": "repoN-s3-sts-host",
+   "section": "repo",
+   "type": "string",
+   "default": "sts.amazonaws.com",
+   "allowed": null,
+   "description": "STS host used with key-type=web-id.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-s3-sts-host\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-s3-sts-host\"]"
+  },
+  {
+   "name": "repoN-s3-uri-style",
+   "section": "repo",
+   "type": "string-id",
+   "default": "host",
+   "allowed": [
+    "host",
+    "path"
+   ],
+   "description": "host = bucket.endpoint virtual-host style; path = endpoint/bucket (required by most MinIO setups).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-s3-uri-style\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-s3-uri-style\"]"
+  },
+  {
+   "name": "repoN-sftp-host",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "SFTP server host (repo-type=sftp). NOTE: repos[] union has no sftp member in either operator; sftp repos are not really provisionable via CRD and container images may lack libssh2.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host\"]"
+  },
+  {
+   "name": "repoN-sftp-host-port",
+   "section": "repo",
+   "type": "integer",
+   "default": "22",
+   "allowed": "[1, 65535]",
+   "description": "SFTP server port.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-port\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-port\"]"
+  },
+  {
+   "name": "repoN-sftp-host-user",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "SFTP username.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-user\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-user\"]"
+  },
+  {
+   "name": "repoN-sftp-host-key-check-type",
+   "section": "repo",
+   "type": "string-id",
+   "default": "strict",
+   "allowed": [
+    "accept-new",
+    "fingerprint",
+    "none",
+    "strict"
+   ],
+   "description": "Host key verification mode.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-key-check-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-key-check-type\"]"
+  },
+  {
+   "name": "repoN-sftp-host-fingerprint",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "Expected host fingerprint (check-type=fingerprint/strict).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-fingerprint\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-fingerprint\"]"
+  },
+  {
+   "name": "repoN-sftp-host-key-hash-type",
+   "section": "repo",
+   "type": "string-id",
+   "default": null,
+   "allowed": [
+    "md5",
+    "sha1",
+    "sha256"
+   ],
+   "description": "Hash used for host key verification (required for sftp).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-key-hash-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-sftp-host-key-hash-type\"]"
+  },
+  {
+   "name": "repoN-sftp-known-host",
+   "section": "repo",
+   "type": "list",
+   "default": null,
+   "allowed": null,
+   "description": "Explicit known-hosts entries (check-type accept-new/strict).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-sftp-known-host\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-sftp-known-host\"]"
+  },
+  {
+   "name": "repoN-sftp-private-key-file",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "Path to SSH private key (required for sftp).",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-sftp-private-key-file=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-sftp-private-key-file=...)"
+  },
+  {
+   "name": "repoN-sftp-private-key-passphrase",
+   "section": "repo",
+   "type": "string (secure)",
+   "default": null,
+   "allowed": null,
+   "description": "Passphrase for the private key.",
+   "percona_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-sftp-private-key-passphrase=...)",
+   "crunchy_path": "spec.backups.pgbackrest.configuration[] Secret conf file ([global] repoN-sftp-private-key-passphrase=...)"
+  },
+  {
+   "name": "repoN-sftp-public-key-file",
+   "section": "repo",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "Path to SSH public key.",
+   "percona_path": "spec.backups.pgbackrest.global[\"repoN-sftp-public-key-file\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repoN-sftp-public-key-file\"]"
+  },
+  {
+   "name": "compress-type",
+   "section": "global",
+   "type": "string-id",
+   "default": "gz",
+   "allowed": [
+    "none",
+    "bz2",
+    "gz",
+    "lz4",
+    "zst"
+   ],
+   "description": "Compression for backup files and WAL pushed to the repo. zst recommended when image built with libzstd (both operators' images are).",
+   "percona_path": "spec.backups.pgbackrest.global[\"compress-type\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"compress-type\"]"
+  },
+  {
+   "name": "compress-level",
+   "section": "global",
+   "type": "integer",
+   "default": "bz2:9, gz:6, lz4:1, zst:3",
+   "allowed": "bz2 [1,9], gz [-1,9], lz4 [-5,12], zst [-7,22]",
+   "description": "Compression level for compress-type (default and range depend on type).",
+   "percona_path": "spec.backups.pgbackrest.global[\"compress-level\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"compress-level\"]"
+  },
+  {
+   "name": "compress-level-network",
+   "section": "global",
+   "type": "integer",
+   "default": "1",
+   "allowed": "[-5, 12]",
+   "description": "lz4 compression applied to uncompressed protocol traffic (pg host <-> repo host).",
+   "percona_path": "spec.backups.pgbackrest.global[\"compress-level-network\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"compress-level-network\"]"
+  },
+  {
+   "name": "process-max",
+   "section": "global",
+   "type": "integer",
+   "default": "1",
+   "allowed": "[1, 999]",
+   "description": "Max parallel processes for compress/transfer during backup/restore/archive. Directly trades backup speed vs CPU pressure on the database node - key knob for pgbench interference experiments.",
+   "percona_path": "spec.backups.pgbackrest.global[\"process-max\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"process-max\"]"
+  },
+  {
+   "name": "delta",
+   "section": "global",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Use file checksums (not timestamps) to detect changed files during backup/restore; restore --delta reuses existing files in PGDATA instead of full copy.",
+   "percona_path": "spec.backups.pgbackrest.global[\"delta\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"delta\"]"
+  },
+  {
+   "name": "start-fast",
+   "section": "global",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Issue an immediate CHECKPOINT so the backup starts without waiting for checkpoint_timeout/checkpoint_completion_target. Causes an IO burst - visible in pgbench latency.",
+   "percona_path": "spec.backups.pgbackrest.global[\"start-fast\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"start-fast\"]"
+  },
+  {
+   "name": "archive-timeout",
+   "section": "global",
+   "type": "time",
+   "default": "1m",
+   "allowed": "[100ms, 1d]",
+   "description": "Seconds to wait for the WAL segment needed to make a backup consistent to reach the archive before failing the backup/check.",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-timeout\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-timeout\"]"
+  },
+  {
+   "name": "archive-async",
+   "section": "global",
+   "type": "boolean",
+   "default": "n (upstream); y (operator-generated instance config)",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Asynchronous archive-push/archive-get with parallel workers (process-max) and local spool. Both operators force y in the generated instance config, but a user value in the CR global map is written later and wins.",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-async\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-async\"]"
+  },
+  {
+   "name": "archive-get-queue-max",
+   "section": "global",
+   "type": "size",
+   "default": "128MiB",
+   "allowed": "[0B, 4PiB]",
+   "description": "Max spool size of WAL prefetched by asynchronous archive-get on replicas.",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-get-queue-max\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-get-queue-max\"]"
+  },
+  {
+   "name": "archive-push-queue-max",
+   "section": "global",
+   "type": "size",
+   "default": null,
+   "allowed": "[0B, 4PiB]",
+   "description": "Max WAL queue size before archive-push starts DROPPING WAL (reports success to Postgres without storing). Prevents pg_wal filling disk at the cost of broken PITR continuity.",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-push-queue-max\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-push-queue-max\"]"
+  },
+  {
+   "name": "archive-push-batch-size",
+   "section": "global",
+   "type": "size",
+   "default": "16GiB",
+   "allowed": "[1MiB, 4PiB]",
+   "description": "Total WAL bytes a single async archive-push batch may transfer.",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-push-batch-size\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-push-batch-size\"]"
+  },
+  {
+   "name": "archive-header-check",
+   "section": "global",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Check WAL header (version/system-id) matches the stanza on push.",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-header-check\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-header-check\"]"
+  },
+  {
+   "name": "archive-missing-retry",
+   "section": "global",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Retry missing WAL segments on archive-get to smooth over archive lag.",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-missing-retry\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-missing-retry\"]"
+  },
+  {
+   "name": "spool-path",
+   "section": "global",
+   "type": "path",
+   "default": "/var/spool/pgbackrest (upstream); /pgdata/pgbackrest-spool (operator)",
+   "allowed": null,
+   "description": "Local spool directory for async archiving. Operators co-locate it with PGDATA volume; overriding requires the path to exist and be writable.",
+   "percona_path": "spec.backups.pgbackrest.global[\"spool-path\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"spool-path\"]"
+  },
+  {
+   "name": "backup-standby",
+   "section": "global",
+   "type": "string-id (bool-like)",
+   "default": "n",
+   "allowed": [
+    "n",
+    "prefer",
+    "y"
+   ],
+   "description": "Perform the backup from a standby (pages copied from standby after primary checkpoint). y fails if no standby; prefer falls back to primary. Requires >=2 replicas and, on Crunchy/Percona, works because all pg hosts are listed in the stanza (pg1..pgN). Key option for offloading backup IO from the primary.",
+   "percona_path": "spec.backups.pgbackrest.global[\"backup-standby\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"backup-standby\"]"
+  },
+  {
+   "name": "checksum-page",
+   "section": "global",
+   "type": "boolean",
+   "default": "auto-detected from cluster (data checksums)",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Validate data-page checksums during backup. Operators initdb with --data-checksums, so effectively on.",
+   "percona_path": "spec.backups.pgbackrest.global[\"checksum-page\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"checksum-page\"]"
+  },
+  {
+   "name": "page-header-check",
+   "section": "global",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Validate page headers during backup when page checksums unavailable.",
+   "percona_path": "spec.backups.pgbackrest.global[\"page-header-check\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"page-header-check\"]"
+  },
+  {
+   "name": "exclude",
+   "section": "global (backup)",
+   "type": "list",
+   "default": null,
+   "allowed": null,
+   "description": "Paths relative to PGDATA to exclude from the backup (does not apply to restore). Repeatable - use configuration Secret for multiple values.",
+   "percona_path": "spec.backups.pgbackrest.global[\"exclude\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"exclude\"]"
+  },
+  {
+   "name": "expire-auto",
+   "section": "global (backup)",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Run expire automatically after each successful backup.",
+   "percona_path": "spec.backups.pgbackrest.global[\"expire-auto\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"expire-auto\"]"
+  },
+  {
+   "name": "manifest-save-threshold",
+   "section": "global (backup)",
+   "type": "size",
+   "default": "1GiB",
+   "allowed": "[1B, 1TiB]",
+   "description": "How often (bytes backed up) the manifest is checkpointed for resume.",
+   "percona_path": "spec.backups.pgbackrest.global[\"manifest-save-threshold\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"manifest-save-threshold\"]"
+  },
+  {
+   "name": "resume",
+   "section": "global (backup)",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Resume an aborted backup of the same type instead of starting over.",
+   "percona_path": "spec.backups.pgbackrest.global[\"resume\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"resume\"]"
+  },
+  {
+   "name": "annotation",
+   "section": "global (backup/annotate)",
+   "type": "hash (key=value)",
+   "default": null,
+   "allowed": null,
+   "description": "Key/value annotations stored with the backup (shown by info --set). Crunchy/Percona also auto-annotate manual backups.",
+   "percona_path": "spec.backups.pgbackrest.global[\"annotation\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"annotation\"]"
+  },
+  {
+   "name": "archive-check",
+   "section": "global (backup)",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Verify WAL required for consistency reaches the archive before the backup completes (online only).",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-check\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-check\"]"
+  },
+  {
+   "name": "archive-copy",
+   "section": "global (backup)",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Copy required WAL into the backup itself so it is restorable without the archive (requires archive-check).",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-copy\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-copy\"]"
+  },
+  {
+   "name": "archive-mode-check",
+   "section": "global",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Fail if archive_mode=always is detected (set n to allow, at risk of duplicate archives).",
+   "percona_path": "spec.backups.pgbackrest.global[\"archive-mode-check\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"archive-mode-check\"]"
+  },
+  {
+   "name": "log-level-console",
+   "section": "global",
+   "type": "string-id",
+   "default": "warn",
+   "allowed": [
+    "off",
+    "error",
+    "warn",
+    "info",
+    "detail",
+    "debug",
+    "trace"
+   ],
+   "description": "Log level for console/stdout output (what kubectl logs of the job container shows).",
+   "percona_path": "spec.backups.pgbackrest.global[\"log-level-console\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"log-level-console\"]"
+  },
+  {
+   "name": "log-level-file",
+   "section": "global",
+   "type": "string-id",
+   "default": "info",
+   "allowed": [
+    "off",
+    "error",
+    "warn",
+    "info",
+    "detail",
+    "debug",
+    "trace"
+   ],
+   "description": "Log level for file logging under log-path. Crunchy sets log-level-file=off in job configs when no log volume is available.",
+   "percona_path": "spec.backups.pgbackrest.global[\"log-level-file\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"log-level-file\"]"
+  },
+  {
+   "name": "log-level-stderr",
+   "section": "global",
+   "type": "string-id",
+   "default": "off (current main; older releases: warn)",
+   "allowed": [
+    "off",
+    "error",
+    "warn",
+    "info",
+    "detail",
+    "debug",
+    "trace"
+   ],
+   "description": "Log level for stderr output.",
+   "percona_path": "spec.backups.pgbackrest.global[\"log-level-stderr\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"log-level-stderr\"]"
+  },
+  {
+   "name": "log-path",
+   "section": "global",
+   "type": "path",
+   "default": "/var/log/pgbackrest (upstream); operator sets a per-pod path on the pgdata/repo volume",
+   "allowed": null,
+   "description": "Directory for pgBackRest log files. Crunchy 5.8+/Percona expose spec.backups.pgbackrest.log / jobs.log / repoHost.log for path+level tuning.",
+   "percona_path": "spec.backups.pgbackrest.global[\"log-path\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"log-path\"]"
+  },
+  {
+   "name": "log-timestamp",
+   "section": "global",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Prefix log entries with timestamps.",
+   "percona_path": "spec.backups.pgbackrest.global[\"log-timestamp\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"log-timestamp\"]"
+  },
+  {
+   "name": "log-subprocess",
+   "section": "global",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Also write logs from local/remote worker subprocesses.",
+   "percona_path": "spec.backups.pgbackrest.global[\"log-subprocess\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"log-subprocess\"]"
+  },
+  {
+   "name": "io-timeout",
+   "section": "global",
+   "type": "time",
+   "default": "1m",
+   "allowed": "[100ms, 1h]",
+   "description": "IO timeout for read/write on connections (raise for slow object stores).",
+   "percona_path": "spec.backups.pgbackrest.global[\"io-timeout\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"io-timeout\"]"
+  },
+  {
+   "name": "protocol-timeout",
+   "section": "global",
+   "type": "time",
+   "default": "31m",
+   "allowed": "[100ms, 7d]",
+   "description": "Max silence on the pgBackRest protocol between processes; must be greater than db-timeout.",
+   "percona_path": "spec.backups.pgbackrest.global[\"protocol-timeout\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"protocol-timeout\"]"
+  },
+  {
+   "name": "db-timeout",
+   "section": "global",
+   "type": "time",
+   "default": "30m",
+   "allowed": "[100ms, 7d]",
+   "description": "Timeout for database queries incl. backup start/stop (pg_backup_start/stop).",
+   "percona_path": "spec.backups.pgbackrest.global[\"db-timeout\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"db-timeout\"]"
+  },
+  {
+   "name": "buffer-size",
+   "section": "global",
+   "type": "size",
+   "default": "1MiB",
+   "allowed": [
+    "16KiB",
+    "32KiB",
+    "64KiB",
+    "128KiB",
+    "256KiB",
+    "512KiB",
+    "1MiB",
+    "2MiB",
+    "4MiB",
+    "8MiB",
+    "16MiB"
+   ],
+   "description": "IO buffer size (memory use scales with process-max * buffers).",
+   "percona_path": "spec.backups.pgbackrest.global[\"buffer-size\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"buffer-size\"]"
+  },
+  {
+   "name": "sck-keep-alive",
+   "section": "global",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Enable TCP keep-alive on sockets.",
+   "percona_path": "spec.backups.pgbackrest.global[\"sck-keep-alive\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"sck-keep-alive\"]"
+  },
+  {
+   "name": "tcp-keep-alive-count",
+   "section": "global",
+   "type": "integer",
+   "default": null,
+   "allowed": "[1, 32]",
+   "description": "Keep-alive probe count before drop.",
+   "percona_path": "spec.backups.pgbackrest.global[\"tcp-keep-alive-count\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"tcp-keep-alive-count\"]"
+  },
+  {
+   "name": "tcp-keep-alive-idle",
+   "section": "global",
+   "type": "integer",
+   "default": null,
+   "allowed": "[1, 3600]",
+   "description": "Seconds idle before keep-alive probes.",
+   "percona_path": "spec.backups.pgbackrest.global[\"tcp-keep-alive-idle\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"tcp-keep-alive-idle\"]"
+  },
+  {
+   "name": "tcp-keep-alive-interval",
+   "section": "global",
+   "type": "integer",
+   "default": null,
+   "allowed": "[1, 900]",
+   "description": "Seconds between keep-alive probes.",
+   "percona_path": "spec.backups.pgbackrest.global[\"tcp-keep-alive-interval\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"tcp-keep-alive-interval\"]"
+  },
+  {
+   "name": "lock-path",
+   "section": "global",
+   "type": "path",
+   "default": "/tmp/pgbackrest",
+   "allowed": null,
+   "description": "Directory for command lock files.",
+   "percona_path": "spec.backups.pgbackrest.global[\"lock-path\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"lock-path\"]"
+  },
+  {
+   "name": "repo-target-time",
+   "section": "global",
+   "type": "string (timestamp)",
+   "default": null,
+   "allowed": null,
+   "description": "Read repo state as of a point in time (versioned buckets) for restore/info/repo-* commands (pgBackRest >=2.55).",
+   "percona_path": "spec.backups.pgbackrest.global[\"repo-target-time\"]",
+   "crunchy_path": "spec.backups.pgbackrest.global[\"repo-target-time\"]"
+  },
+  {
+   "name": "type (backup)",
+   "section": "command: backup",
+   "type": "string-id",
+   "default": "incr",
+   "allowed": [
+    "full",
+    "diff",
+    "incr"
+   ],
+   "description": "Backup type. incr auto-promotes to full when no prior full exists.",
+   "percona_path": "PerconaPGBackup CR spec.options[] (or spec.backups.pgbackrest.manual.options[])",
+   "crunchy_path": "spec.backups.pgbackrest.manual.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-backup"
+  },
+  {
+   "name": "online",
+   "section": "command: backup/stanza-create",
+   "type": "boolean",
+   "default": "y",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Perform online backup (--no-online only for shut-down clusters; not applicable under operators).",
+   "percona_path": "PerconaPGBackup CR spec.options[] (or spec.backups.pgbackrest.manual.options[])",
+   "crunchy_path": "spec.backups.pgbackrest.manual.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-backup"
+  },
+  {
+   "name": "force (backup)",
+   "section": "command: backup",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Allow offline backup when cluster is shut down (requires --no-online).",
+   "percona_path": "PerconaPGBackup CR spec.options[] (or spec.backups.pgbackrest.manual.options[])",
+   "crunchy_path": "spec.backups.pgbackrest.manual.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-backup"
+  },
+  {
+   "name": "type (restore)",
+   "section": "command: restore",
+   "type": "string-id",
+   "default": "default",
+   "allowed": [
+    "default",
+    "preserve",
+    "immediate",
+    "standby",
+    "none",
+    "name",
+    "time",
+    "lsn",
+    "xid"
+   ],
+   "description": "Recovery type: default=recover to end of archive; immediate=stop at consistency; time/lsn/xid/name=PITR to --target; standby=leave as standby; preserve=keep existing recovery settings; none=no recovery config.",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "target",
+   "section": "command: restore",
+   "type": "string",
+   "default": null,
+   "allowed": null,
+   "description": "Recovery target value; required for type=time/lsn/xid/name. Time format e.g. '2026-07-10 15:04:05+00' (must include timezone).",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "target-action",
+   "section": "command: restore",
+   "type": "string-id",
+   "default": "pause",
+   "allowed": [
+    "pause",
+    "promote",
+    "shutdown"
+   ],
+   "description": "recovery_target_action once target reached. NOTE for operators: leaving pause keeps the instance in recovery and Patroni will not accept writes until promoted; promote is the usual choice.",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "target-exclusive",
+   "section": "command: restore",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Stop just before the target (exclusive) for type=time/lsn/xid.",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "target-timeline",
+   "section": "command: restore",
+   "type": "string ('current','latest' or integer)",
+   "default": null,
+   "allowed": null,
+   "description": "Timeline to follow during recovery (PostgreSQL default: latest).",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "set",
+   "section": "command: restore/info/expire",
+   "type": "string",
+   "default": "latest",
+   "allowed": null,
+   "description": "Backup set label to restore (e.g. 20260710-000001F) instead of latest; for expire: set to expire (with --repo).",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "db-include",
+   "section": "command: restore",
+   "type": "list",
+   "default": null,
+   "allowed": null,
+   "description": "Restore only listed databases (others become unusable stubs); repeatable.",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "db-exclude",
+   "section": "command: restore",
+   "type": "list",
+   "default": null,
+   "allowed": null,
+   "description": "Exclude databases from restore (with db-include semantics).",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "link-all",
+   "section": "command: restore",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Restore all symlinks recorded in the manifest.",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "link-map",
+   "section": "command: restore",
+   "type": "hash (link=path)",
+   "default": null,
+   "allowed": null,
+   "description": "Remap symlinks on restore.",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "tablespace-map",
+   "section": "command: restore",
+   "type": "hash (tablespace=path)",
+   "default": null,
+   "allowed": null,
+   "description": "Remap tablespaces on restore.",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "tablespace-map-all",
+   "section": "command: restore",
+   "type": "string (path)",
+   "default": null,
+   "allowed": null,
+   "description": "Remap ALL tablespaces under this base path.",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "recovery-option",
+   "section": "command: restore",
+   "type": "hash (guc=value)",
+   "default": null,
+   "allowed": null,
+   "description": "Extra recovery GUCs written to postgresql.auto.conf (e.g. recovery_target_inclusive). Only for recovery types that generate recovery settings.",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "archive-mode (restore)",
+   "section": "command: restore",
+   "type": "string-id",
+   "default": "preserve",
+   "allowed": [
+    "preserve",
+    "off"
+   ],
+   "description": "off disables archiving on the restored host (prevents a cloned cluster from pushing WAL into the source repo).",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "delta (restore/backup flag)",
+   "section": "command: restore/backup",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "As --delta on restore: checksum-based in-place restore into non-empty PGDATA (what PGO uses for in-place PITR).",
+   "percona_path": "PerconaPGRestore CR -> cluster spec.backups.pgbackrest.restore.options[]",
+   "crunchy_path": "spec.backups.pgbackrest.restore.options[] + annotation postgres-operator.crunchydata.com/pgbackrest-restore (restore.enabled=true), or spec.dataSource.pgbackrest/postgresCluster.options for clone"
+  },
+  {
+   "name": "archive-expire-before",
+   "section": "command: expire",
+   "type": "string (timestamp)",
+   "default": null,
+   "allowed": null,
+   "description": "Expire WAL older than timestamp regardless of backup retention (advanced; kubectl exec only under operators).",
+   "percona_path": "kubectl exec repo-host -- pgbackrest expire ...",
+   "crunchy_path": "kubectl exec repo-host -- pgbackrest expire ..."
+  },
+  {
+   "name": "dry-run",
+   "section": "command: expire",
+   "type": "boolean",
+   "default": "n",
+   "allowed": [
+    "y",
+    "n"
+   ],
+   "description": "Report what expire would remove without removing it.",
+   "percona_path": "kubectl exec repo-host -- pgbackrest expire --dry-run",
+   "crunchy_path": "kubectl exec repo-host -- pgbackrest expire --dry-run"
+  },
+  {
+   "name": "stanza",
+   "section": "command-line",
+   "type": "string",
+   "default": "db (operator-fixed)",
+   "allowed": null,
+   "description": "Stanza name. Both operators hardcode 'db' (DefaultStanzaName); dataSource restores accept spec.dataSource.pgbackrest.stanza (default db).",
+   "percona_path": "fixed 'db' (spec.dataSource.pgbackrest.stanza for clone-from-repo)",
+   "crunchy_path": "fixed 'db' (spec.dataSource.pgbackrest.stanza for clone-from-repo)"
+  }
+ ],
+ "patroni": [
+  {
+   "name": "ttl",
+   "section": "dcs",
+   "type": "integer (seconds)",
+   "default": "30",
+   "allowed": "min 20 (upstream); CRD field min 3",
+   "description": "Leader lock TTL - time before automatic failover starts after leader stops updating the lock. Constraint: loop_wait + 2*retry_timeout <= ttl. OPERATOR: value in dynamicConfiguration is OVERWRITTEN by spec.patroni.leaderLeaseDurationSeconds (default 30); set it there. Changing it restarts pods (probe timings derive from it: failureThreshold = ttl/loop_wait).",
+   "percona_path": "spec.patroni.leaderLeaseDurationSeconds (int32, default 30, min 3) - dynamicConfiguration.ttl ignored",
+   "crunchy_path": "spec.patroni.leaderLeaseDurationSeconds (int32, default 30, min 3) - dynamicConfiguration.ttl ignored"
+  },
+  {
+   "name": "loop_wait",
+   "section": "dcs",
+   "type": "integer (seconds)",
+   "default": "10",
+   "allowed": "min 1",
+   "description": "Seconds the Patroni HA loop sleeps between iterations. Lower = faster reaction, more DCS (Kubernetes API) load. OPERATOR: overwritten by spec.patroni.syncPeriodSeconds (default 10); probes use periodSeconds=syncPeriodSeconds, timeoutSeconds=syncPeriodSeconds/2.",
+   "percona_path": "spec.patroni.syncPeriodSeconds (int32, default 10, min 1) - dynamicConfiguration.loop_wait ignored",
+   "crunchy_path": "spec.patroni.syncPeriodSeconds (int32, default 10, min 1) - dynamicConfiguration.loop_wait ignored"
+  },
+  {
+   "name": "retry_timeout",
+   "section": "dcs",
+   "type": "integer (seconds)",
+   "default": "10",
+   "allowed": "min 3",
+   "description": "Timeout for DCS and PostgreSQL operation retries; DCS/network outages shorter than this do not demote the leader. Must satisfy loop_wait + 2*retry_timeout <= ttl.",
+   "percona_path": "spec.patroni.dynamicConfiguration.retry_timeout",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.retry_timeout"
+  },
+  {
+   "name": "maximum_lag_on_failover",
+   "section": "dcs",
+   "type": "integer (bytes)",
+   "default": "1048576",
+   "allowed": null,
+   "description": "Max WAL bytes a replica may lag and still participate in leader election. Raise for write-heavy pgbench workloads to avoid failed elections; lower to bound data loss.",
+   "percona_path": "spec.patroni.dynamicConfiguration.maximum_lag_on_failover",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.maximum_lag_on_failover"
+  },
+  {
+   "name": "maximum_lag_on_syncnode",
+   "section": "dcs",
+   "type": "integer (bytes)",
+   "default": "-1",
+   "allowed": null,
+   "description": "Max lag before an unhealthy synchronous follower is swapped for a healthy async one; <=0 disables swapping.",
+   "percona_path": "spec.patroni.dynamicConfiguration.maximum_lag_on_syncnode",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.maximum_lag_on_syncnode"
+  },
+  {
+   "name": "max_timelines_history",
+   "section": "dcs",
+   "type": "integer",
+   "default": "0",
+   "allowed": null,
+   "description": "Max timeline-history items kept in DCS (0 = full history).",
+   "percona_path": "spec.patroni.dynamicConfiguration.max_timelines_history",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.max_timelines_history"
+  },
+  {
+   "name": "primary_start_timeout",
+   "section": "dcs",
+   "type": "integer (seconds)",
+   "default": "300",
+   "allowed": null,
+   "description": "Time a failed primary may attempt recovery before failover triggers (0 = fail over immediately on crash detection). Worst-case failover time on primary failure: loop_wait + primary_start_timeout + loop_wait. Legacy alias: master_start_timeout.",
+   "percona_path": "spec.patroni.dynamicConfiguration.primary_start_timeout",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.primary_start_timeout"
+  },
+  {
+   "name": "primary_stop_timeout",
+   "section": "dcs",
+   "type": "integer (seconds)",
+   "default": "0 (disabled)",
+   "allowed": null,
+   "description": "Only with synchronous_mode: seconds allowed for Postgres stop before Patroni SIGKILLs the postmaster; <=0 disables. Legacy alias: master_stop_timeout.",
+   "percona_path": "spec.patroni.dynamicConfiguration.primary_stop_timeout",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.primary_stop_timeout"
+  },
+  {
+   "name": "primary_race_backoff",
+   "section": "dcs",
+   "type": "integer (seconds)",
+   "default": "0 (disabled)",
+   "allowed": null,
+   "description": "Patroni >=4.1: postpone leader race on standbys while WAL replication from the primary is still advancing, to avoid failovers on briefly unresponsive Patroni.",
+   "percona_path": "spec.patroni.dynamicConfiguration.primary_race_backoff",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.primary_race_backoff"
+  },
+  {
+   "name": "synchronous_mode",
+   "section": "dcs",
+   "type": "boolean | string",
+   "default": "off",
+   "allowed": [
+    "off",
+    "on",
+    "quorum"
+   ],
+   "description": "Synchronous replication management: Patroni maintains synchronous_standby_names and only the last leader or a sync replica may win elections. 'quorum' (Patroni >=4.0) uses ANY k(...) quorum commit. Percona/Crunchy: set via dynamicConfiguration; nosync/nofailover instance tags are not exposed by the CRDs.",
+   "percona_path": "spec.patroni.dynamicConfiguration.synchronous_mode",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.synchronous_mode"
+  },
+  {
+   "name": "synchronous_mode_strict",
+   "section": "dcs",
+   "type": "boolean",
+   "default": "false",
+   "allowed": [
+    true,
+    false
+   ],
+   "description": "Refuse to disable sync replication when no sync replicas are available - blocks writes (synchronous_standby_names kept/placeholder '__patroni_strict_sync_replica_placeholder__' in Patroni 4.x). Availability trade-off.",
+   "percona_path": "spec.patroni.dynamicConfiguration.synchronous_mode_strict",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.synchronous_mode_strict"
+  },
+  {
+   "name": "synchronous_node_count",
+   "section": "dcs",
+   "type": "integer",
+   "default": "1",
+   "allowed": "auto-capped at eligible node count",
+   "description": "Number of synchronous standbys Patroni maintains in synchronous_standby_names (synchronous_mode=on/quorum).",
+   "percona_path": "spec.patroni.dynamicConfiguration.synchronous_node_count",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.synchronous_node_count"
+  },
+  {
+   "name": "failsafe_mode",
+   "section": "dcs",
+   "type": "boolean",
+   "default": "false",
+   "allowed": [
+    true,
+    false
+   ],
+   "description": "Patroni >=3.0 DCS Failsafe Mode: on total DCS (Kubernetes API) outage, primary keeps running if it can reach ALL cluster members via their REST API (POST /failsafe); otherwise demotes. Prevents demotion on API-server blips.",
+   "percona_path": "spec.patroni.dynamicConfiguration.failsafe_mode",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.failsafe_mode"
+  },
+  {
+   "name": "check_timeline",
+   "section": "dcs",
+   "type": "boolean",
+   "default": "false",
+   "allowed": [
+    true,
+    false
+   ],
+   "description": "Require candidate's timeline to match the primary's before it may win the leader race.",
+   "percona_path": "spec.patroni.dynamicConfiguration.check_timeline",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.check_timeline"
+  },
+  {
+   "name": "member_slots_ttl",
+   "section": "dcs",
+   "type": "time (e.g. '30min')",
+   "default": "30min",
+   "allowed": "0 = drop slot as soon as member key expires",
+   "description": "Patroni >=4.0 (PG>=11): retention of physical replication slots of members that shut down, protecting WAL for temporarily-down replicas (watch pg_wal growth).",
+   "percona_path": "spec.patroni.dynamicConfiguration.member_slots_ttl",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.member_slots_ttl"
+  },
+  {
+   "name": "postgresql.use_pg_rewind",
+   "section": "dcs",
+   "type": "boolean",
+   "default": "false (upstream)",
+   "allowed": [
+    true,
+    false
+   ],
+   "description": "Run pg_rewind on a demoted primary so it can rejoin without reinit (needs data checksums or wal_log_hints; operators initdb with --data-checksums). OPERATOR: FORCED to true for postgresVersion > 10 AFTER merging user config - cannot be disabled via CR.",
+   "percona_path": "forced: operator sets postgresql.use_pg_rewind = (postgresVersion > 10)",
+   "crunchy_path": "forced: operator sets postgresql.use_pg_rewind = (postgresVersion > 10)"
+  },
+  {
+   "name": "postgresql.use_slots",
+   "section": "dcs",
+   "type": "boolean",
+   "default": "true (upstream); false (operator default)",
+   "allowed": [
+    true,
+    false
+   ],
+   "description": "Use physical replication slots between members. Operator writes use_slots:false as its default but the user's dynamicConfiguration.postgresql section is merged OVER it, so it IS overridable (needed for permanent 'slots' support).",
+   "percona_path": "spec.patroni.dynamicConfiguration.postgresql.use_slots",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.postgresql.use_slots"
+  },
+  {
+   "name": "postgresql.remove_data_directory_on_rewind_failure",
+   "section": "dcs",
+   "type": "boolean",
+   "default": "false",
+   "allowed": [
+    true,
+    false
+   ],
+   "description": "If pg_rewind fails, wipe PGDATA and reinitialize the replica from scratch (auto-heal at the cost of a full re-clone).",
+   "percona_path": "spec.patroni.dynamicConfiguration.postgresql.remove_data_directory_on_rewind_failure",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.postgresql.remove_data_directory_on_rewind_failure"
+  },
+  {
+   "name": "postgresql.remove_data_directory_on_diverged_timelines",
+   "section": "dcs",
+   "type": "boolean",
+   "default": "false",
+   "allowed": [
+    true,
+    false
+   ],
+   "description": "If timelines diverged and pg_rewind unusable, wipe PGDATA and re-clone.",
+   "percona_path": "spec.patroni.dynamicConfiguration.postgresql.remove_data_directory_on_diverged_timelines",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.postgresql.remove_data_directory_on_diverged_timelines"
+  },
+  {
+   "name": "postgresql.parameters",
+   "section": "dcs",
+   "type": "map<string,string|number>",
+   "default": "see description",
+   "allowed": null,
+   "description": "PostgreSQL GUCs distributed via DCS. OPERATOR precedence (low->high): operator defaults (e.g. jit=off, password_encryption=scram-sha-256) < dynamicConfiguration.postgresql.parameters < spec.config.parameters < operator-mandatory (unix_socket_directories, ssl* cert paths, wal_level=logical on current main, archive_mode=on, archive_command='pgbackrest ... archive-push', restore_command, log_file_mode; shared_preload_libraries gets mandatory libs prepended). Patroni-controlled GUCs (max_connections, max_wal_senders, max_prepared_transactions, max_locks_per_transaction, wal_level, track_commit_timestamp) change only via DCS and may require restart (pending_restart).",
+   "percona_path": "spec.config.parameters (preferred) or spec.patroni.dynamicConfiguration.postgresql.parameters",
+   "crunchy_path": "spec.config.parameters (preferred) or spec.patroni.dynamicConfiguration.postgresql.parameters"
+  },
+  {
+   "name": "postgresql.pg_hba",
+   "section": "dcs",
+   "type": "list<string>",
+   "default": null,
+   "allowed": null,
+   "description": "pg_hba.conf lines managed by Patroni (ignored if hba_file GUC changed). OPERATOR order: operator-mandatory rules first, then spec.authentication.rules, then dynamicConfiguration.postgresql.pg_hba, then built-in defaults only if no user rules. A bad line can lock out replication - operators prepend their required TLS/replication rules.",
+   "percona_path": "spec.authentication.rules (preferred) or spec.patroni.dynamicConfiguration.postgresql.pg_hba",
+   "crunchy_path": "spec.authentication.rules (preferred) or spec.patroni.dynamicConfiguration.postgresql.pg_hba"
+  },
+  {
+   "name": "postgresql.pg_ident",
+   "section": "dcs",
+   "type": "list<string>",
+   "default": null,
+   "allowed": null,
+   "description": "pg_ident.conf mapping lines (ignored if ident_file GUC set).",
+   "percona_path": "spec.patroni.dynamicConfiguration.postgresql.pg_ident",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.postgresql.pg_ident"
+  },
+  {
+   "name": "standby_cluster.host",
+   "section": "dcs",
+   "type": "string",
+   "default": "''",
+   "allowed": null,
+   "description": "Remote primary host for a standby cluster. OPERATOR: managed via spec.standby.{enabled,host,port,repoName}; operator injects host/port and create_replica_methods, deletes user restore_command and sets it from pgBackRest when repoName given.",
+   "percona_path": "spec.standby.host (with spec.standby.enabled=true)",
+   "crunchy_path": "spec.standby.host (with spec.standby.enabled=true)"
+  },
+  {
+   "name": "standby_cluster.port",
+   "section": "dcs",
+   "type": "integer",
+   "default": "''",
+   "allowed": null,
+   "description": "Remote primary port.",
+   "percona_path": "spec.standby.port",
+   "crunchy_path": "spec.standby.port"
+  },
+  {
+   "name": "standby_cluster.primary_slot_name",
+   "section": "dcs",
+   "type": "string",
+   "default": "derived from member name",
+   "allowed": null,
+   "description": "Replication slot on the remote primary to use.",
+   "percona_path": "spec.patroni.dynamicConfiguration.standby_cluster.primary_slot_name",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.standby_cluster.primary_slot_name"
+  },
+  {
+   "name": "standby_cluster.create_replica_methods",
+   "section": "dcs",
+   "type": "list<string>",
+   "default": "''",
+   "allowed": [
+    "pgbackrest",
+    "basebackup"
+   ],
+   "description": "Ordered bootstrap methods for the standby leader. OPERATOR: computed - pgbackrest first when spec.standby.repoName set, basebackup when host set.",
+   "percona_path": "computed from spec.standby.{host,repoName}",
+   "crunchy_path": "computed from spec.standby.{host,repoName}"
+  },
+  {
+   "name": "standby_cluster.restore_command",
+   "section": "dcs",
+   "type": "string",
+   "default": "''",
+   "allowed": null,
+   "description": "WAL fetch command for standby-cluster nodes. OPERATOR: overwritten with the pgBackRest archive-get command when spec.standby.repoName is set.",
+   "percona_path": "computed (pgbackrest archive-get) when spec.standby.repoName set",
+   "crunchy_path": "computed (pgbackrest archive-get) when spec.standby.repoName set"
+  },
+  {
+   "name": "standby_cluster.archive_cleanup_command",
+   "section": "dcs",
+   "type": "string",
+   "default": "''",
+   "allowed": null,
+   "description": "Cleanup command run on the standby leader.",
+   "percona_path": "spec.patroni.dynamicConfiguration.standby_cluster.archive_cleanup_command",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.standby_cluster.archive_cleanup_command"
+  },
+  {
+   "name": "standby_cluster.recovery_min_apply_delay",
+   "section": "dcs",
+   "type": "string/integer",
+   "default": null,
+   "allowed": null,
+   "description": "Delay WAL apply on the standby leader (delayed replica).",
+   "percona_path": "spec.patroni.dynamicConfiguration.standby_cluster.recovery_min_apply_delay",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.standby_cluster.recovery_min_apply_delay"
+  },
+  {
+   "name": "slots",
+   "section": "dcs",
+   "type": "map<slotName,{type,database,plugin,cluster_type}>",
+   "default": null,
+   "allowed": null,
+   "description": "Permanent replication slots preserved across switchover/failover; physical slots on all nodes advance every loop_wait (PG>=11); logical slots require use_slots=true and auto-enable hot_standby_feedback. Slot names must be lowercase word chars; slots matching member names persist through member outages.",
+   "percona_path": "spec.patroni.dynamicConfiguration.slots",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.slots"
+  },
+  {
+   "name": "ignore_slots",
+   "section": "dcs",
+   "type": "array<{name,type,database,plugin}>",
+   "default": null,
+   "allowed": null,
+   "description": "Slot matchers Patroni must NOT manage/drop (slots managed outside Patroni). Any matching property subset causes the slot to be ignored.",
+   "percona_path": "spec.patroni.dynamicConfiguration.ignore_slots",
+   "crunchy_path": "spec.patroni.dynamicConfiguration.ignore_slots"
+  }
+ ],
+ "pgbouncer": [
+  {
+   "name": "pool_mode",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "enum",
+   "default": "session",
+   "allowed": [
+    "session",
+    "transaction",
+    "statement"
+   ],
+   "description": "When a server connection is released back to the pool: session=on client disconnect, transaction=on commit/rollback, statement=after each statement (multi-statement tx forbidden). Also settable per-database/per-user via config.databases/config.users. OPERATOR: safe to set; transaction is the usual choice for pgbench-style high client counts (breaks session features: prepared statements need max_prepared_statements, no SET/LISTEN).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"pool_mode\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"pool_mode\"]"
+  },
+  {
+   "name": "max_client_conn",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "100",
+   "allowed": null,
+   "description": "Max total client connections to PgBouncer (file descriptors must accommodate it).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"max_client_conn\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"max_client_conn\"]"
+  },
+  {
+   "name": "default_pool_size",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "20",
+   "allowed": null,
+   "description": "Max server connections per user+database pair when no per-db/user pool_size set.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"default_pool_size\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"default_pool_size\"]"
+  },
+  {
+   "name": "min_pool_size",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "0 (disabled)",
+   "allowed": null,
+   "description": "Keep at least this many server connections in a pool (capped at pool size; only for pools with a forced user or >=1 client). Warms pools after idle periods.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"min_pool_size\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"min_pool_size\"]"
+  },
+  {
+   "name": "reserve_pool_size",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "0 (disabled)",
+   "allowed": null,
+   "description": "Extra connections allowed to a pool once a client has waited reserve_pool_timeout.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"reserve_pool_size\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"reserve_pool_size\"]"
+  },
+  {
+   "name": "reserve_pool_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "5.0",
+   "allowed": null,
+   "description": "Client wait time before the reserve pool is used; 0 disables.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"reserve_pool_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"reserve_pool_timeout\"]"
+  },
+  {
+   "name": "max_db_connections",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "0 (unlimited)",
+   "allowed": null,
+   "description": "Server-connection cap per database (all users combined). Also per-db in config.databases.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"max_db_connections\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"max_db_connections\"]"
+  },
+  {
+   "name": "max_db_client_connections",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "0 (unlimited)",
+   "allowed": null,
+   "description": "PgBouncer >=1.23: client-connection cap per database.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"max_db_client_connections\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"max_db_client_connections\"]"
+  },
+  {
+   "name": "max_user_connections",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "0 (unlimited)",
+   "allowed": null,
+   "description": "Server-connection cap per user (all databases). Also per-user in config.users.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"max_user_connections\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"max_user_connections\"]"
+  },
+  {
+   "name": "max_user_client_connections",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "0 (unlimited)",
+   "allowed": null,
+   "description": "PgBouncer >=1.23: client-connection cap per user.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"max_user_client_connections\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"max_user_client_connections\"]"
+  },
+  {
+   "name": "server_round_robin",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "0",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "Use server connections round-robin (LIFO default concentrates load on few connections).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_round_robin\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_round_robin\"]"
+  },
+  {
+   "name": "server_idle_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "600.0",
+   "allowed": null,
+   "description": "Close server connections idle longer than this; 0 disables.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_idle_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_idle_timeout\"]"
+  },
+  {
+   "name": "server_lifetime",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "3600.0",
+   "allowed": null,
+   "description": "Close unused server connections older than this; 0 = use once then close. Also per-db.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_lifetime\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_lifetime\"]"
+  },
+  {
+   "name": "server_connect_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "15.0",
+   "allowed": null,
+   "description": "Abandon connect+login to PostgreSQL after this long.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_connect_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_connect_timeout\"]"
+  },
+  {
+   "name": "server_login_retry",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "15.0",
+   "allowed": null,
+   "description": "Wait after failed server login before retrying (new clients error immediately during the wait).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_login_retry\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_login_retry\"]"
+  },
+  {
+   "name": "server_reset_query",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "string",
+   "default": "DISCARD ALL",
+   "allowed": null,
+   "description": "Query run when a server connection is released (session pooling). Lighter alternative: DEALLOCATE ALL.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_reset_query\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_reset_query\"]"
+  },
+  {
+   "name": "server_reset_query_always",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "0",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "Run server_reset_query in all pool modes (workaround for session state under transaction pooling).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_reset_query_always\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_reset_query_always\"]"
+  },
+  {
+   "name": "server_check_delay",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "30.0",
+   "allowed": null,
+   "description": "Reuse a released connection without health check if it was checked within this window; 0 = always check.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_check_delay\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_check_delay\"]"
+  },
+  {
+   "name": "server_check_query",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "string",
+   "default": "<empty> (send empty query; older releases: select 1)",
+   "allowed": null,
+   "description": "Sanity-check query for idle server connections; empty string disables checking.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_check_query\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_check_query\"]"
+  },
+  {
+   "name": "server_fast_close",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "0",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "In session pooling, close 'close_needed' server connections at transaction end rather than session end (faster config/DNS rollover, may interrupt idle sessions).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_fast_close\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_fast_close\"]"
+  },
+  {
+   "name": "query_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "0.0 (disabled)",
+   "allowed": null,
+   "description": "Cancel queries running longer than this (client also disconnected). Keep slightly larger than server-side statement_timeout - last-resort network guard.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"query_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"query_timeout\"]"
+  },
+  {
+   "name": "query_wait_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "120.0",
+   "allowed": null,
+   "description": "Max time a query may wait in queue for a server connection before the client is disconnected. Primary knob behind 'query_wait_timeout' errors during saturation/failover.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"query_wait_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"query_wait_timeout\"]"
+  },
+  {
+   "name": "cancel_wait_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "10.0",
+   "allowed": null,
+   "description": "Max time a cancel request may wait for forwarding before its client is dropped.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"cancel_wait_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"cancel_wait_timeout\"]"
+  },
+  {
+   "name": "client_idle_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "0.0 (disabled)",
+   "allowed": null,
+   "description": "Disconnect clients idle longer than this (dangerous with app-side pooled idle connections).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"client_idle_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"client_idle_timeout\"]"
+  },
+  {
+   "name": "client_login_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "60.0",
+   "allowed": null,
+   "description": "Disconnect clients that fail to complete login within this time.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"client_login_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"client_login_timeout\"]"
+  },
+  {
+   "name": "idle_transaction_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "0.0 (disabled)",
+   "allowed": null,
+   "description": "Disconnect clients 'idle in transaction' longer than this.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"idle_transaction_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"idle_transaction_timeout\"]"
+  },
+  {
+   "name": "transaction_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "0.0 (disabled)",
+   "allowed": null,
+   "description": "PgBouncer >=1.24: disconnect clients in a transaction longer than this.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"transaction_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"transaction_timeout\"]"
+  },
+  {
+   "name": "autodb_idle_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "3600.0",
+   "allowed": null,
+   "description": "Free unused wildcard ('*') database pools after this idle time (stats forgotten). Relevant: both operators define databases via '*' by default.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"autodb_idle_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"autodb_idle_timeout\"]"
+  },
+  {
+   "name": "pool_idle_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "0 (disabled)",
+   "allowed": null,
+   "description": "PgBouncer >=1.25: free individual idle pools (db/user pair) after this many seconds.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"pool_idle_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"pool_idle_timeout\"]"
+  },
+  {
+   "name": "suspend_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "seconds (float)",
+   "default": "10",
+   "allowed": null,
+   "description": "Buffer-flush wait during SUSPEND/online restart before dropping connections.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"suspend_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"suspend_timeout\"]"
+  },
+  {
+   "name": "ignore_startup_parameters",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "comma list",
+   "default": "empty (upstream)",
+   "allowed": null,
+   "description": "Startup parameters PgBouncer should accept-and-ignore rather than error on (e.g. options, extra_float_digits). OPERATOR: operator default: 'extra_float_digits' (for JDBC). Overriding REPLACES it - include extra_float_digits in any custom value.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"ignore_startup_parameters\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"ignore_startup_parameters\"]"
+  },
+  {
+   "name": "track_extra_parameters",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "comma list",
+   "default": "IntervalStyle",
+   "allowed": null,
+   "description": "Extra GUCs tracked per-client and restored on server reuse (only parameters PostgreSQL reports to clients). client_encoding/datestyle/timezone/standard_conforming_strings/application_name are always tracked.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"track_extra_parameters\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"track_extra_parameters\"]"
+  },
+  {
+   "name": "tcp_keepalive",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "1",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "Enable TCP keepalive with OS defaults on sockets.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"tcp_keepalive\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"tcp_keepalive\"]"
+  },
+  {
+   "name": "tcp_keepcnt",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "not set (OS default, Linux 9)",
+   "allowed": null,
+   "description": "Keepalive probe count.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"tcp_keepcnt\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"tcp_keepcnt\"]"
+  },
+  {
+   "name": "tcp_keepidle",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer (seconds)",
+   "default": "not set (OS default, Linux 7200)",
+   "allowed": null,
+   "description": "Idle time before keepalive probes.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"tcp_keepidle\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"tcp_keepidle\"]"
+  },
+  {
+   "name": "tcp_keepintvl",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer (seconds)",
+   "default": "not set (OS default, Linux 75)",
+   "allowed": null,
+   "description": "Interval between keepalive probes.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"tcp_keepintvl\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"tcp_keepintvl\"]"
+  },
+  {
+   "name": "tcp_user_timeout",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "milliseconds",
+   "default": "0 (OS default)",
+   "allowed": null,
+   "description": "TCP_USER_TIMEOUT: max unacked transmit time before the kernel closes the connection (Linux only).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"tcp_user_timeout\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"tcp_user_timeout\"]"
+  },
+  {
+   "name": "tcp_defer_accept",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean-ish",
+   "default": "1 on Linux, else 0",
+   "allowed": null,
+   "description": "TCP_DEFER_ACCEPT socket option (value hardcoded 45s when enabled).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"tcp_defer_accept\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"tcp_defer_accept\"]"
+  },
+  {
+   "name": "tcp_socket_buffer",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer (bytes)",
+   "default": "not set",
+   "allowed": null,
+   "description": "Socket buffer size override.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"tcp_socket_buffer\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"tcp_socket_buffer\"]"
+  },
+  {
+   "name": "listen_backlog",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "128",
+   "allowed": null,
+   "description": "listen(2) backlog for new connection attempts (startup-only, needs restart).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"listen_backlog\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"listen_backlog\"]"
+  },
+  {
+   "name": "so_reuseport",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "0",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "SO_REUSEPORT for running multiple pgbouncer processes on one port (not applicable to operator single-process pods; scale spec.proxy.pgBouncer.replicas instead).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"so_reuseport\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"so_reuseport\"]"
+  },
+  {
+   "name": "pkt_buf",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer (bytes)",
+   "default": "4096",
+   "allowed": null,
+   "description": "Internal packet buffer size.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"pkt_buf\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"pkt_buf\"]"
+  },
+  {
+   "name": "max_packet_size",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer (bytes)",
+   "default": "2147483647",
+   "allowed": null,
+   "description": "Max PostgreSQL packet size allowed through.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"max_packet_size\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"max_packet_size\"]"
+  },
+  {
+   "name": "sbuf_loopcnt",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "5",
+   "allowed": null,
+   "description": "Data-processing loops per connection event before yielding (0=no limit).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"sbuf_loopcnt\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"sbuf_loopcnt\"]"
+  },
+  {
+   "name": "max_prepared_statements",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "200 (>=1.22; 0 in 1.21)",
+   "allowed": "0 disables",
+   "description": "Track/replay protocol-level named prepared statements across server connections in transaction/statement pooling. Essential for pgbench -M prepared through transaction pooling.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"max_prepared_statements\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"max_prepared_statements\"]"
+  },
+  {
+   "name": "scram_iterations",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "4096",
+   "allowed": null,
+   "description": "Iterations when encrypting passwords with SCRAM-SHA-256.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"scram_iterations\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"scram_iterations\"]"
+  },
+  {
+   "name": "auth_type",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "enum",
+   "default": "md5",
+   "allowed": [
+    "cert",
+    "md5",
+    "scram-sha-256",
+    "plain",
+    "trust",
+    "any",
+    "hba",
+    "ldap",
+    "pam"
+   ],
+   "description": "Client authentication method. md5 auto-upgrades to SCRAM when the stored secret is SCRAM. OPERATOR: neither operator sets auth_type (effective default md5). The operator wires auth_file+auth_user+auth_query (Crunchy/Percona: SELECT username,password FROM pgbouncer.get_auth($1) as _crunchypgbouncer against the primary). Changing auth_type to hba/cert/ldap requires supplying files via config.files and is unsupported territory; scram-sha-256 works only because verifiers come from auth_query - frontend SCRAM cannot do channel binding through PgBouncer.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"auth_type\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"auth_type\"]"
+  },
+  {
+   "name": "auth_file",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "path",
+   "default": "not set (operator: /etc/pgbouncer/~postgres-operator/users.txt)",
+   "allowed": null,
+   "description": "userlist file with credentials. OPERATOR: operator-managed Secret projection containing the _crunchypgbouncer credential; override only with config.files.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"auth_file\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"auth_file\"]"
+  },
+  {
+   "name": "auth_user",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "string",
+   "default": "not set (operator: _crunchypgbouncer)",
+   "allowed": null,
+   "description": "User for auth_query lookups of users missing from auth_file. OPERATOR: operator-set; overridable via global but breaks managed auth.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"auth_user\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"auth_user\"]"
+  },
+  {
+   "name": "auth_query",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "string",
+   "default": "SELECT rolname, CASE WHEN rolvaliduntil < now() THEN NULL ELSE rolpassword END FROM pg_authid WHERE rolname=$1 AND rolcanlogin (upstream)",
+   "allowed": null,
+   "description": "Query to fetch password verifier for a user. OPERATOR: operator sets SELECT username, password from pgbouncer.get_auth($1) (function installed in each database by the operator).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"auth_query\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"auth_query\"]"
+  },
+  {
+   "name": "auth_dbname",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "string",
+   "default": "not set",
+   "allowed": null,
+   "description": "Database used for auth_query when the target db is inaccessible.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"auth_dbname\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"auth_dbname\"]"
+  },
+  {
+   "name": "admin_users",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "comma list",
+   "default": "empty",
+   "allowed": null,
+   "description": "Users allowed to connect to the pgbouncer admin console with full rights.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"admin_users\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"admin_users\"]"
+  },
+  {
+   "name": "stats_users",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "comma list",
+   "default": "empty",
+   "allowed": null,
+   "description": "Users allowed read-only console access (SHOW STATS etc.). OPERATOR: Crunchy sets stats_users=_crunchypgbouncer when OpenTelemetry metrics enabled; Percona PMM sidecar likewise queries SHOW via the operator user.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"stats_users\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"stats_users\"]"
+  },
+  {
+   "name": "stats_period",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer (seconds)",
+   "default": "60",
+   "allowed": null,
+   "description": "Aggregation period for SHOW STATS averages and periodic log_stats lines.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"stats_period\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"stats_period\"]"
+  },
+  {
+   "name": "log_connections",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "1",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "Log successful client logins.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"log_connections\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"log_connections\"]"
+  },
+  {
+   "name": "log_disconnections",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "1",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "Log client disconnects with reason.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"log_disconnections\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"log_disconnections\"]"
+  },
+  {
+   "name": "log_pooler_errors",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "1",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "Log pooler errors sent to clients.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"log_pooler_errors\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"log_pooler_errors\"]"
+  },
+  {
+   "name": "log_stats",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "1",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "Write aggregated stats to log every stats_period.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"log_stats\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"log_stats\"]"
+  },
+  {
+   "name": "verbose",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "0",
+   "allowed": "0-2 (repeatable)",
+   "description": "Log verbosity (1=some debug, 2=noisy). Increase temporarily when debugging pool behavior.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"verbose\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"verbose\"]"
+  },
+  {
+   "name": "application_name_add_host",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "0",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "Append client host:port to application_name at connection start.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"application_name_add_host\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"application_name_add_host\"]"
+  },
+  {
+   "name": "disable_pqexec",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "boolean (0/1)",
+   "default": "0",
+   "allowed": [
+    "0",
+    "1"
+   ],
+   "description": "Reject Simple Query protocol (multi-statement packets) for security.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"disable_pqexec\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"disable_pqexec\"]"
+  },
+  {
+   "name": "client_tls_sslmode",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "enum",
+   "default": "disable (upstream)",
+   "allowed": [
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full"
+   ],
+   "description": "TLS mode for client->PgBouncer connections. OPERATOR: operator default: require, with operator-issued frontend cert (client_tls_cert_file/key/ca preset). Overridable via global; setting disable turns off TLS to PgBouncer.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"client_tls_sslmode\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"client_tls_sslmode\"]"
+  },
+  {
+   "name": "server_tls_sslmode",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "enum",
+   "default": "prefer (upstream)",
+   "allowed": [
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full"
+   ],
+   "description": "TLS mode for PgBouncer->PostgreSQL connections. OPERATOR: operator default: verify-full with cluster CA (server_tls_ca_file preset).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"server_tls_sslmode\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"server_tls_sslmode\"]"
+  },
+  {
+   "name": "listen_addr",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "string",
+   "default": "not set (upstream)",
+   "allowed": null,
+   "description": "Addresses to listen on. OPERATOR: operator forces '*'; do not override (breaks Service traffic). Startup-only option.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"listen_addr\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"listen_addr\"]"
+  },
+  {
+   "name": "listen_port",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "integer",
+   "default": "6432 (upstream)",
+   "allowed": null,
+   "description": "Port PgBouncer listens on. OPERATOR: operator sets from spec.proxy.pgBouncer.port (default 5432, CRD min 1024). Do not set via global - change the CRD field so Service/probes stay in sync.",
+   "percona_path": "spec.proxy.pgBouncer.port (CRD field, default 5432)",
+   "crunchy_path": "spec.proxy.pgBouncer.port (CRD field, default 5432)"
+  },
+  {
+   "name": "unix_socket_dir",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "string",
+   "default": "/tmp (upstream)",
+   "allowed": null,
+   "description": "Unix socket directory. OPERATOR: operator sets empty (sockets disabled, read-only fs). Leave alone.",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"unix_socket_dir\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"unix_socket_dir\"]"
+  },
+  {
+   "name": "conffile",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "path",
+   "default": "file from command line",
+   "allowed": null,
+   "description": "Location of the main config file. OPERATOR: LOCKED - operator writes conffile after merging user settings; cannot be overridden via config.global.",
+   "percona_path": "locked (operator-managed)",
+   "crunchy_path": "locked (operator-managed)"
+  },
+  {
+   "name": "logfile",
+   "section": "pgbouncer(ini [pgbouncer])",
+   "type": "path",
+   "default": "not set",
+   "allowed": null,
+   "description": "Additional log file destination (stdout logging always on in containers). OPERATOR: Crunchy CRD validation (current main): value must end with '.log'; auto-set when OpenTelemetry logs enabled. config.global map is limited to 50 keys (CRD MaxProperties).",
+   "percona_path": "spec.proxy.pgBouncer.config.global[\"logfile\"]",
+   "crunchy_path": "spec.proxy.pgBouncer.config.global[\"logfile\"]"
+  }
+ ]
+}
