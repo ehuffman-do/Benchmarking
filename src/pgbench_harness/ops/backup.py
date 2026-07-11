@@ -309,15 +309,16 @@ def run_backup(spec: OpsSpec, results_dir: Path) -> int:
         rc: int
         trigger_out = ""
         if path_mode == "direct":
+            # Replica+direct was refused in preflight, so this is always a
+            # local backup against the leader's own Postgres.
             argv = ["pgbackrest", "--stanza=db", "backup", f"--type={btype}"]
-            if source_role == "replica" and params.get("backup_standby", True):
-                argv.append("--backup-standby=y")
             res = kube.exec(source, "pgbackrest", argv, timeout_s=timeout_s)
             if not res.ok and "unknown container" in (res.stderr or ""):
                 res = kube.exec(source, "database", argv, timeout_s=timeout_s)
             rc, trigger_out = res.returncode, (res.stdout + res.stderr)
         else:
-            rc, trigger_out = _operator_path(kube, run, spec, btype, timeout_s)
+            rc, trigger_out = _operator_path(kube, run, spec, btype, timeout_s,
+                                             source_role=source_role)
         atomic_write_text(run.raw_path("trigger_output.txt"), trigger_out)
 
         end_iso, end_ms = utc_now_iso(), utc_ms()
@@ -409,11 +410,17 @@ def run_backup(spec: OpsSpec, results_dir: Path) -> int:
 
 
 def _operator_path(kube: Kube, run: OpsRun, spec: OpsSpec, btype: str,
-                   timeout_s: float) -> tuple[int, str]:
+                   timeout_s: float, source_role: str = "leader") -> tuple[int, str]:
     """Operator path: set the CR manual: block, annotate, track the Job.
 
     Different lock/scheduling interactions than direct exec — which path ran
     is recorded in meta/report (they are not interchangeable evidence).
+
+    A replica source adds ``--backup-standby=y`` to the manual options — a
+    per-backup override, so this one backup copies files from the standby
+    (primary only coordinates start/stop + WAL switch) WITHOUT changing the
+    CR's global map. Scheduled backups can't carry extra options, so making
+    ALL backups standby-sourced still requires global backup-standby: "y".
     """
     t = spec.target
 
@@ -427,8 +434,14 @@ def _operator_path(kube: Kube, run: OpsRun, spec: OpsSpec, btype: str,
     # class: reporting done/failed in 0.1s from a stale Job before ours exists).
     pre_existing = {j.get("metadata", {}).get("name", "") for j in _backup_jobs()}
 
+    options = [f"--type={btype}"]
+    if source_role == "replica":
+        options.append("--backup-standby=y")
+        run.event("fire", "backup-standby requested for this backup",
+                  "one-off --backup-standby=y in manual options; requires a "
+                  "healthy streaming replica or pgBackRest exits rc=56")
     patch = {"spec": {"backups": {"pgbackrest": {"manual": {
-        "repoName": "repo1", "options": [f"--type={btype}"]}}}}}
+        "repoName": "repo1", "options": options}}}}}
     kube.run(["patch", t.cr_kind, t.cr_name, "--type", "merge",
               "-p", json.dumps(patch)], check=True)
     stamp = utc_now_iso().replace(":", "-")

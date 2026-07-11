@@ -5,6 +5,26 @@ import type { KubeTarget, Me, PgParam, PgParamsCatalog } from "../types";
 import { openJobStream, CheckEvent } from "../lib/sse";
 import { CheckList } from "./ClusterOps";
 
+interface SidecarOption {
+  name: string;
+  section: string;
+  type: string;
+  default: string | null;
+  allowed: string[] | string | null;
+  description: string;
+  percona_path: string;
+  crunchy_path: string;
+}
+type SidecarCatalog = Record<string, SidecarOption[]>;
+
+const TABS = [
+  ["pg", "PostgreSQL"],
+  ["pgbackrest", "pgBackRest"],
+  ["patroni", "Patroni DCS"],
+  ["pgbouncer", "pgBouncer"],
+] as const;
+type Tab = (typeof TABS)[number][0];
+
 const CHANNEL_HELP: Record<string, string> = {
   cr: "applied via the CR (spec.patroni.dynamicConfiguration) — Patroni reloads it",
   "dcs-coordinated": "Patroni coordinates this cluster-wide through DCS — expect a rolling restart",
@@ -126,6 +146,9 @@ export function KubeParams({ me }: { me: Me }) {
   const [staged, setStaged] = useState<Record<string, string>>({});
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>("pg");
+  const [sidecar, setSidecar] = useState<SidecarCatalog | null>(null);
+  const [stagedBk, setStagedBk] = useState<Record<string, string>>({});
   const [confirm, setConfirm] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [checks, setChecks] = useState<CheckEvent[] | null>(null);
@@ -139,6 +162,7 @@ export function KubeParams({ me }: { me: Me }) {
       `/api/kube-targets/${targetId}/pg-params`)
       .then((r) => { setCat(r.catalog); setCollectedUtc(r.collected_utc); })
       .catch((e) => setErr(e.message));
+    api.get<SidecarCatalog>("/api/ops/sidecar-catalog").then(setSidecar).catch(() => undefined);
   }, [targetId]);
   useEffect(load, [load]);
 
@@ -213,6 +237,24 @@ export function KubeParams({ me }: { me: Me }) {
     }
   }
 
+  async function applyBk(dryRun: boolean) {
+    setErr(null);
+    try {
+      const body: Record<string, unknown> = {
+        params: { action: "pgbackrest_global", global: stagedBk,
+                  ...(dryRun ? { dry_run: true } : {}) },
+        label: `pgbackrest-${Object.keys(stagedBk).length}-changes`,
+      };
+      if (!dryRun) body.confirm = confirm;
+      const r = await api.post<{ job_id: number }>(
+        `/api/kube-targets/${targetId}/cr-apply`, body);
+      nav(`/ops/runs?job=${r.job_id}`);
+    } catch (ex) {
+      setErr((ex as Error).message);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }
+
   if (!kt) return <p className="subtle mono">{err ?? "loading…"}</p>;
   const stagedNames = Object.keys(staged);
   const dcsStaged = stagedNames.filter((n) =>
@@ -233,16 +275,37 @@ export function KubeParams({ me }: { me: Me }) {
         <Link className="btn" to={`/ops/targets/${targetId}`}>← target</Link>
       </div>
       <p className="subtle" style={{ marginTop: -8, marginBottom: 12 }}>
-        Every parameter below is introspected live from <code>pg_settings</code> on the leader —
-        names, types, units, ranges and enum values come from the server itself, so a typo'd name
-        or out-of-range value cannot be staged. Changes apply through the operator CR
-        (Patroni dynamicConfiguration) with an automatic verify loop.
+        {tab === "pg"
+          ? <>Every parameter below is introspected live from <code>pg_settings</code> on the
+              leader — names, types, units, ranges and enum values come from the server itself,
+              so a typo'd name or out-of-range value cannot be staged. Changes apply through the
+              operator CR (Patroni dynamicConfiguration) with an automatic verify loop.</>
+          : <>Sidecar options cannot be introspected from a live server, so this catalog is
+              research-curated (types, defaults, allowed values) and every option shows the exact
+              CR path it applies through on your operator ({kt.cr_kind}).</>}
       </p>
+
+      <div style={{ marginBottom: 12 }}>
+        {TABS.map(([k, l]) => (
+          <button key={k} className={`btn-sm ${tab === k ? "primary" : ""}`}
+                  style={{ marginRight: 6 }} onClick={() => setTab(k)}>
+            {l}{sidecar && k !== "pg" ? ` (${(sidecar[k] ?? []).length})` : ""}
+          </button>
+        ))}
+      </div>
 
       {err && <div className="banner-err">{err}</div>}
       {checks && checks.length > 0 && <div className="card"><CheckList checks={checks} /></div>}
 
-      {stagedNames.length > 0 && (
+      {tab !== "pg" && (
+        <SidecarPanel kind={tab} options={sidecar?.[tab] ?? []} crKind={kt.cr_kind}
+                      isAdmin={isAdmin} live={cat?.pgbackrest_global ?? {}}
+                      staged={stagedBk} setStaged={setStagedBk}
+                      confirm={confirm} setConfirm={setConfirm}
+                      confirmName={kt.cr_name || kt.name} onApply={applyBk} />
+      )}
+
+      {tab === "pg" && stagedNames.length > 0 && (
         <div className="card" style={{ marginBottom: 12 }}>
           <div className="card-head"><h2>Staged changes ({stagedNames.length})</h2></div>
           <table>
@@ -280,7 +343,7 @@ export function KubeParams({ me }: { me: Me }) {
         </div>
       )}
 
-      <div className="card">
+      {tab === "pg" && <div className="card">
         <div className="card-head" style={{ flexWrap: "wrap", gap: 8 }}>
           <input placeholder="Search parameters (name, description, category)…"
                  value={q} onChange={(e) => setQ(e.target.value)} style={{ minWidth: 280 }} />
@@ -373,20 +436,120 @@ export function KubeParams({ me }: { me: Me }) {
             </table>
           </>
         )}
-      </div>
+      </div>}
+    </>
+  );
+}
 
-      {cat && Object.keys(cat.pgbackrest_global).length > 0 && (
-        <div className="card" style={{ marginTop: 12 }}>
-          <div className="card-head"><h2>pgBackRest global options (from the CR)</h2></div>
+function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
+                        confirm, setConfirm, confirmName, onApply }: {
+  kind: string;
+  options: SidecarOption[];
+  crKind: string;
+  isAdmin: boolean;
+  live: Record<string, string>;
+  staged: Record<string, string>;
+  setStaged: (f: (s: Record<string, string>) => Record<string, string>) => void;
+  confirm: string;
+  setConfirm: (v: string) => void;
+  confirmName: string;
+  onApply: (dryRun: boolean) => void;
+}) {
+  const [q, setQ] = useState("");
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const pathFor = (o: SidecarOption) =>
+    crKind === "postgrescluster" ? o.crunchy_path : o.percona_path;
+  // Only options living in spec.backups.pgbackrest.global have a click-apply
+  // path today (the existing pgbackrest_global action); the rest show their
+  // CR path as guidance.
+  const stageable = (o: SidecarOption) =>
+    kind === "pgbackrest" && /backups\.pgbackrest\.global/.test(pathFor(o)) &&
+    !/secure/i.test(o.type);
+  const needle = q.trim().toLowerCase();
+  const visible = options.filter((o) =>
+    !needle || o.name.toLowerCase().includes(needle) ||
+    o.description.toLowerCase().includes(needle) ||
+    o.section.toLowerCase().includes(needle));
+  const stagedNames = Object.keys(staged);
+
+  return (
+    <>
+      {stagedNames.length > 0 && (
+        <div className="card" style={{ marginBottom: 12 }}>
+          <div className="card-head"><h2>Staged pgBackRest changes ({stagedNames.length})</h2></div>
           <table><tbody>
-            {Object.entries(cat.pgbackrest_global).map(([k, v]) => (
-              <tr key={k}><td className="mono">{k}</td><td className="mono">{v}</td></tr>
+            {stagedNames.map((n) => (
+              <tr key={n}><td className="mono">{n}</td>
+                <td className="mono">{live[n] ?? "—"} → <strong>{staged[n]}</strong></td>
+                <td><button className="btn-sm" onClick={() =>
+                  setStaged((s) => { const x = { ...s }; delete x[n]; return x; })}>remove</button></td></tr>
             ))}
           </tbody></table>
-          <p className="subtle">Edit these from the target page's CR configuration panel
-            (pgBackRest bundle) — they never appear in pg_settings.</p>
+          <div style={{ marginTop: 8 }}>
+            <button onClick={() => onApply(true)}>Dry-run (patch + diff, no change)</button>{" "}
+            {isAdmin && (
+              <>
+                <input value={confirm} onChange={(e) => setConfirm(e.target.value)}
+                       placeholder={confirmName} className="mono" style={{ width: 160 }} />{" "}
+                <button className="primary" onClick={() => onApply(false)}>Apply & verify</button>
+              </>
+            )}
+            <span className="subtle"> — verified against the rendered pgBackRest config in the pod.</span>
+          </div>
         </div>
       )}
+
+      <div className="card">
+        <div className="card-head">
+          <input placeholder={`Search ${kind} options…`} value={q}
+                 onChange={(e) => setQ(e.target.value)} style={{ minWidth: 280 }} />
+          <div className="spacer" />
+          <span className="subtle mono">{visible.length} of {options.length}</span>
+        </div>
+        {kind === "patroni" && (
+          <p className="subtle">Percona v2 honors only <code>postgresql.parameters</code> and{" "}
+            <code>pg_hba</code> under dynamicConfiguration — DCS timing settings map to dedicated
+            CR fields (shown per option below).</p>
+        )}
+        {kind === "pgbouncer" && (
+          <p className="subtle">Applied via <code>proxy.pgBouncer.config.global</code> in the CR —
+            click-to-apply for these lands next phase; the exact path is shown per option.</p>
+        )}
+        <table>
+          <thead><tr><th>Option</th><th>Current / default</th><th>Type</th><th>Allowed</th><th>Applies via</th><th /></tr></thead>
+          <tbody>
+            {visible.map((o) => {
+              const cur = kind === "pgbackrest" ? live[o.name] : undefined;
+              const draft = drafts[o.name] ?? staged[o.name] ?? cur ?? o.default ?? "";
+              return (
+                <tr key={o.name}>
+                  <td style={{ maxWidth: 380 }}>
+                    <span className="mono">{o.name}</span>
+                    {cur !== undefined && <span className="badge ok" style={{ marginLeft: 6 }}>CR</span>}
+                    <div className="subtle" style={{ fontSize: 12 }}>{o.description}</div>
+                  </td>
+                  <td className="mono">{cur ?? o.default ?? "—"}</td>
+                  <td className="mono">{o.type}</td>
+                  <td className="mono" style={{ fontSize: 11, maxWidth: 160 }}>
+                    {Array.isArray(o.allowed) ? o.allowed.join(" | ") : o.allowed ?? "—"}</td>
+                  <td className="mono" style={{ fontSize: 11, maxWidth: 220 }}>{pathFor(o)}</td>
+                  <td style={{ whiteSpace: "nowrap" }}>
+                    {stageable(o) && (
+                      <>
+                        <input className="mono" style={{ width: 90 }} value={draft}
+                               onChange={(e) => setDrafts((d) => ({ ...d, [o.name]: e.target.value }))} />{" "}
+                        <button className="btn-sm" disabled={!String(draft).trim()}
+                                onClick={() => setStaged((s) => ({ ...s, [o.name]: String(draft) }))}>
+                          stage</button>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </>
   );
 }

@@ -26,6 +26,21 @@
   `backup-standby: "y"` is set and offers a one-click enable; the runner
   aborts replica+direct with the rc=56 explanation instead of failing
   mid-run.
+- **Sidecar option catalogs** — research-curated maps of every
+  operator-relevant pgBackRest option (119), Patroni DCS setting (31), and
+  pgBouncer ini option (68), each with type/default/allowed values and the
+  exact CR path it applies through on Percona v2 vs Crunchy v5; new tabs in
+  the Parameter map page with search; pgBackRest global options are
+  click-to-apply through the existing dry-run/verify loop.
+- **Replica backups without a CR change** — the operator trigger path now
+  adds a one-off `--backup-standby=y` to the manual options when the source
+  is a replica, so a single standby-sourced backup needs no global CR edit
+  (schedules still need `backup-standby: "y"` in the global map).
+- **Research + roadmap** — eight source-verified research reports under
+  `docs/research/` (Percona v2 CRD surface, Crunchy v5 CRD, PostgreSQL
+  parameter internals, sidecar options, ranked day-2 operations catalog,
+  replica-backup mechanics, enterprise UX + intelligence patterns, and a
+  completeness critique), synthesized into `docs/CLUSTER_OPS_ROADMAP.md`.
 - **Target management polish** — edit an existing Kube Target from the
   console (including kubeconfig replacement; switching back to path mode
   drops the stale imported copy), validation records a pass/fail verdict
