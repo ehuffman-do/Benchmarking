@@ -86,6 +86,7 @@ export interface KubeTarget {
   params_utc: string | null;
   health_utc: string | null;
   health_status: string | null;
+  auto_health_s: number;
   schedules_paused: boolean;
   schedules_paused_utc: string | null;
   created_utc: string;
@@ -153,6 +154,7 @@ export interface HealthDoc {
   findings: HealthFinding[];
   checked: number;
   leader: string;
+  metrics?: Record<string, number>;
 }
 
 export interface PatroniMember {

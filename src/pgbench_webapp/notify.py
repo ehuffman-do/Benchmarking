@@ -82,6 +82,36 @@ def _send_slack(webhook: Optional[str], text: str) -> bool:
     return True
 
 
+def notify_health(conn: sqlite3.Connection, store: SecretStore, *, target: str,
+                  prev_status: str, status: str, summary: str = "") -> list[str]:
+    """Health TRANSITION alert (ok→warn, warn→crit, recovery...). Same
+    channels and best-effort rules as run notifications."""
+    c = get_config(conn)
+    base_url = queries.get_setting(conn, "base_url", "")
+    arrow = {"ok": "✅", "info": "ℹ️", "warn": "⚠️", "crit": "🔴"}.get(status, "•")
+    subject = f"[pgbench-harness] {target} health: {prev_status} → {status} {arrow}"
+    lines = [f"Cluster: {target}", f"Health: {prev_status} → {status}"]
+    if summary:
+        lines.append(f"Top findings: {summary}")
+    if base_url:
+        lines.append(f"Console: {base_url.rstrip('/')}/ui/ops")
+    body = "\n".join(lines)
+    sent: list[str] = []
+    if (c.get("smtp") or {}).get("host"):
+        try:
+            if _send_email(c, store.get(SMTP_PASSWORD_REF), subject, body):
+                sent.append("email")
+        except Exception:  # noqa: BLE001
+            pass
+    if (c.get("slack") or {}).get("enabled"):
+        try:
+            if _send_slack(store.get(SLACK_WEBHOOK_REF), f"*{subject}*\n{body}"):
+                sent.append("slack")
+        except Exception:  # noqa: BLE001
+            pass
+    return sent
+
+
 def notify(conn: sqlite3.Connection, store: SecretStore, *, state: str,
            run_id: Optional[str], label: str, peak_qps: Optional[float] = None) -> list[str]:
     """Fire configured notifications. Returns the channels attempted; never raises."""

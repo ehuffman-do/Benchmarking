@@ -51,6 +51,7 @@ def _kt_json(row: sqlite3.Row) -> dict[str, Any]:
         "params_utc": row["params_utc"],
         "health_utc": row["health_utc"],
         "health_status": _health_status(row),
+        "auto_health_s": int(row["auto_health_s"] or 0),
         "schedules_paused": bool(row["schedules_snapshot"]),
         "schedules_paused_utc": row["schedules_paused_utc"],
         "created_utc": row["created_utc"],
@@ -218,6 +219,14 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         allowed = ("kubeconfig_path", "context", "namespace", "cr_kind", "cr_name",
                    "pguser_secret", "pguser_secret_key", "db_user", "db_name")
         fields = {k: payload[k] for k in allowed if k in payload}
+        if "auto_health_s" in payload:
+            try:
+                iv = int(payload["auto_health_s"])
+            except (TypeError, ValueError):
+                raise HTTPException(400, "auto_health_s must be an integer (seconds)")
+            if iv != 0 and not 300 <= iv <= 86400:
+                raise HTTPException(400, "auto_health_s must be 0 (off) or 300–86400")
+            fields["auto_health_s"] = iv
         if payload.get("kubeconfig_content"):
             ref = kt["kubeconfig_ref"] or ops_support.kubeconfig_ref(kt["name"])
             store.set(ref, payload["kubeconfig_content"])
@@ -233,8 +242,10 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         if fields:
             # Kubeconfig or coordinates changed — the previous validation
             # verdict no longer applies; reset it until the next validate runs.
-            conn.execute("UPDATE kube_targets SET last_validation_ok=NULL WHERE id=?",
-                         (target_id,))
+            # (auto_health_s alone is a scheduling knob, not a coordinate.)
+            if any(k in fields for k in allowed + ("kubeconfig_ref",)):
+                conn.execute("UPDATE kube_targets SET last_validation_ok=NULL "
+                             "WHERE id=?", (target_id,))
             queries.update_kube_target(conn, target_id, **fields)
         queries.audit(conn, user["username"], "kube_target_update", target=kt["name"],
                       detail=",".join(sorted(fields)))
@@ -400,7 +411,7 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         mutex: tuple[str, ...] = ()
         if not dry_run:
             _require_confirm(kt, payload)
-            mutex = ("ops_cr_apply", "ops_scenario", "ops_backup")
+            mutex = ("ops_cr_apply", "ops_scenario", "ops_backup", "ops_operate")
         job_id = _enqueue_ops(conn, kt, "cr-apply", params,
                               payload.get("label") or "", user["username"], mutex)
         return JSONResponse({"job_id": job_id})
@@ -417,7 +428,7 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         params = _params(payload)
         job_id = _enqueue_ops(conn, kt, "backup", params,
                               payload.get("label") or "", user["username"],
-                              ("ops_backup", "ops_scenario", "ops_cr_apply"))
+                              ("ops_backup", "ops_scenario", "ops_cr_apply", "ops_operate"))
         return JSONResponse({"job_id": job_id})
 
     @app.post("/api/kube-targets/{target_id}/scenario")
@@ -435,8 +446,46 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         params = _params(payload)
         job_id = _enqueue_ops(conn, kt, "scenario", params,
                               payload.get("label") or "", user["username"],
-                              ("ops_scenario", "ops_backup", "ops_cr_apply"))
+                              ("ops_scenario", "ops_backup", "ops_cr_apply", "ops_operate"))
         return JSONResponse({"job_id": job_id})
+
+    @app.post("/api/kube-targets/{target_id}/operate")
+    def ops_operate(target_id: int, request: Request, payload: dict,
+                    conn: sqlite3.Connection = Depends(get_conn),
+                    user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        """Day-2 operation (restart/switchover/failover/scale/resize/schedules).
+        Dry-run needs no confirmation or mutex; a real execution needs both."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        params = _params(payload)
+        dry_run = bool(params.get("dry_run"))
+        mutex: tuple[str, ...] = ()
+        if not dry_run:
+            _require_confirm(kt, payload)
+            mutex = ("ops_operate", "ops_cr_apply", "ops_scenario", "ops_backup")
+        job_id = _enqueue_ops(conn, kt, "operate", params,
+                              payload.get("label") or
+                              f"{params.get('operation', 'operate')}-{kt['name']}",
+                              user["username"], mutex)
+        return JSONResponse({"job_id": job_id})
+
+    @app.get("/api/kube-targets/{target_id}/health-history")
+    def ops_health_history(target_id: int,
+                           conn: sqlite3.Connection = Depends(get_conn),
+                           user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        _kt_or_404(conn, target_id)
+        rows = queries.list_health_history(conn, target_id, limit=200)
+        out = []
+        for r in rows:
+            try:
+                metrics = json.loads(r["metrics"] or "{}")
+            except ValueError:
+                metrics = {}
+            out.append({"ts_utc": r["ts_utc"], "status": r["status"],
+                        "crit": r["crit"], "warn": r["warn"], "metrics": metrics})
+        return JSONResponse({"history": out})
 
     @app.post("/api/kube-targets/{target_id}/monitor")
     def ops_monitor_start(target_id: int, request: Request, payload: dict,
@@ -524,6 +573,8 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         rel = name
         if rel.startswith("raw/"):
             path = run_dir / "raw" / _safe_segment(rel[4:])
+        elif rel.startswith("parsed/"):
+            path = run_dir / "parsed" / _safe_segment(rel[7:])
         else:
             path = run_dir / _safe_segment(rel)
         if not path.is_file():

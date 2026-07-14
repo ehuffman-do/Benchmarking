@@ -138,6 +138,22 @@ MIGRATIONS: list[tuple[int, str]] = [
     ALTER TABLE kube_targets ADD COLUMN health_json TEXT;
     ALTER TABLE kube_targets ADD COLUMN health_utc TEXT;
     """),
+    # 7: continuous intelligence — per-target auto-health interval (0 = off)
+    #    and a compact history of health evaluations (status + raw metrics)
+    #    for transition alerts and trend analysis (disk-fill projection).
+    (7, """
+    ALTER TABLE kube_targets ADD COLUMN auto_health_s INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE health_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kube_target_id INTEGER NOT NULL REFERENCES kube_targets(id),
+        ts_utc TEXT NOT NULL,
+        status TEXT NOT NULL,
+        crit INTEGER NOT NULL DEFAULT 0,
+        warn INTEGER NOT NULL DEFAULT 0,
+        metrics TEXT
+    );
+    CREATE INDEX idx_health_hist ON health_history(kube_target_id, ts_utc);
+    """),
 ]
 
 

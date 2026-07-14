@@ -43,6 +43,10 @@ def add_ops_parser(sub: argparse._SubParsersAction) -> None:
     spec_args(osub.add_parser("health",
                               help="evaluate health heuristics -> findings JSON"),
               results=False)
+    opr = osub.add_parser("operate",
+                          help="day-2 operation: restart|switchover|failover|"
+                               "scale|resize|schedules")
+    spec_args(opr)
     st = osub.add_parser("stitch", help="(re)stitch a scenario run dir from raw captures")
     st.add_argument("--run-dir", required=True, type=Path)
     rp = osub.add_parser("report", help="(re)generate the report for an op run dir")
@@ -95,4 +99,7 @@ def cmd_ops(args: argparse.Namespace) -> int:
     if cmd == "health":
         from pgbench_harness.ops.health import run_health
         return run_health(spec)
+    if cmd == "operate":
+        from pgbench_harness.ops.operate import run_operate
+        return run_operate(spec, args.results_dir)
     raise AssertionError(f"unhandled ops command {cmd}")

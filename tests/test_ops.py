@@ -470,6 +470,258 @@ def test_params_diag_health_rbac(opsweb):
         assert r.status_code == 403, path
 
 
+# ── day-2 operations catalog ──
+
+def _operate(client, tid, params, confirm="cluster1", dry=False):
+    body = {"params": {**params, **({"dry_run": True} if dry else {})}}
+    if not dry:
+        body["confirm"] = confirm
+    return client.post(f"/api/kube-targets/{tid}/operate", json=body,
+                       auth=("admin", "apw"))
+
+
+def test_operate_switchover_end_to_end(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    # dry-run needs no confirmation and makes no change
+    r = _operate(client, tid, {"operation": "switchover"}, dry=True)
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "complete" and run["headline"]["dry_run"] is True
+    # real switchover to an explicit target
+    target = "cluster1-instance1-efgh-0"
+    r = _operate(client, tid, {"operation": "switchover", "target": target,
+                               "timeout_s": 30})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    h = run["headline"]
+    assert run["status"] == "complete", run
+    assert h["flipped"] is True and h["leader_after"] == target
+    assert h["tl_after"] == h["tl_before"] + 1
+    # target-is-now-leader refused up front
+    r = _operate(client, tid, {"operation": "switchover", "target": target})
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "aborted"
+    assert run["headline"]["reason"] == "target-is-leader"
+
+
+def test_operate_scale_up_then_down(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _operate(client, tid, {"operation": "scale", "replicas": 4,
+                               "timeout_s": 30})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "complete", run
+    assert run["headline"] == {"operation": "scale", "from": 3, "to": 4,
+                               "settled": True}
+    # topology reflects 4 members
+    client.post(f"/api/kube-targets/{tid}/discover", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    topo = client.get(f"/api/kube-targets/{tid}/topology",
+                      auth=("viewer", "vpw")).json()["topology"]
+    assert len(topo["pods"]["instances"]) == 4
+    # and back down
+    r = _operate(client, tid, {"operation": "scale", "replicas": 3,
+                               "timeout_s": 30})
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "complete" and run["headline"]["to"] == 3
+    # no-change scale refused in preflight
+    r = _operate(client, tid, {"operation": "scale", "replicas": 3})
+    _drain_queue(cfg)
+    assert _last_ops_run(client, "operate")["status"] == "aborted"
+
+
+def test_operate_restart_member_and_cluster(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    member = "cluster1-instance1-ijkl-0"
+    r = _operate(client, tid, {"operation": "restart", "scope": member,
+                               "timeout_s": 30, "settle_grace_s": 0})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "complete", run
+    restarts = (Path(os.environ["FAKE_KUBE_STATE"]) / "restarts.log").read_text()
+    assert member in restarts
+    # cluster-wide: dry-run shows the annotation plan
+    r = _operate(client, tid, {"operation": "restart"}, dry=True)
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "complete" and run["headline"]["scope"] == "cluster"
+    assert "restartedAt" in run["headline"]["plan"]
+
+
+def test_operate_resize_with_oom_preflight(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    resources = {"requests": {"cpu": "2", "memory": "4Gi"},
+                 "limits": {"cpu": "4", "memory": "8Gi"}}
+    r = _operate(client, tid, {"operation": "resize", "resources": resources,
+                               "timeout_s": 30})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "complete", run
+    assert run["headline"]["resources"] == resources
+    # garbage quantity refused in preflight
+    r = _operate(client, tid, {"operation": "resize",
+                               "resources": {"limits": {"memory": "lots"}}})
+    _drain_queue(cfg)
+    assert _last_ops_run(client, "operate")["status"] == "aborted"
+
+
+def test_operate_schedules_and_retention(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _operate(client, tid, {"operation": "schedules", "repo": "repo1",
+                               "schedules": {"incremental": "*/30 * * * *",
+                                             "differential": None},
+                               "retention": {"repo1-retention-full": "4"}})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "complete", run
+    assert run["headline"]["verified"] is True
+    # bad cron refused
+    r = _operate(client, tid, {"operation": "schedules",
+                               "schedules": {"full": "whenever"}})
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "operate")
+    assert run["status"] == "aborted" and run["headline"]["reason"] == "bad-cron"
+
+
+def test_operate_validation_rbac_and_mutex(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    # unknown operation and out-of-range replicas → clean 400 at enqueue
+    r = _operate(client, tid, {"operation": "explode"})
+    assert r.status_code == 400
+    r = _operate(client, tid, {"operation": "scale", "replicas": 99})
+    assert r.status_code == 400
+    # a real execution needs the typed confirmation
+    r = client.post(f"/api/kube-targets/{tid}/operate",
+                    json={"params": {"operation": "switchover"}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 400
+    # operator role cannot operate
+    r = client.post(f"/api/kube-targets/{tid}/operate",
+                    json={"params": {"operation": "switchover", "dry_run": True}},
+                    auth=("op", "oppw"))
+    assert r.status_code == 403
+    # destructive mutex: an operate blocks a backup on the same target
+    r = _operate(client, tid, {"operation": "switchover", "timeout_s": 30})
+    assert r.status_code == 200
+    r = client.post(f"/api/kube-targets/{tid}/backup",
+                    json={"confirm": "cluster1", "params": {"type": "incr"}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 409
+    _drain_queue(cfg)
+
+
+def test_pgbouncer_global_apply_and_verify(opsweb):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    params = {"action": "pgbouncer_global",
+              "global": {"pool_mode": "transaction", "max_client_conn": "500"}}
+    # dry-run first: diff against the live CR
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"params": {**params, "dry_run": True}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["headline"]["changed"]["pool_mode"] == ["session", "transaction"]
+    # apply & verify against the rendered ini in the pgbouncer pod
+    r = client.post(f"/api/kube-targets/{tid}/cr-apply",
+                    json={"confirm": "cluster1", "params": params},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    assert run["headline"]["verified"] is True
+
+
+# ── continuous intelligence ──
+
+def test_auto_health_scheduling_and_history(opsweb):
+    from pgbench_webapp import ops_support, queries
+    from pgbench_webapp.db import connect
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    # interval bounds enforced
+    r = client.post(f"/api/kube-targets/{tid}", json={"auto_health_s": 30},
+                    auth=("admin", "apw"))
+    assert r.status_code == 400
+    r = client.post(f"/api/kube-targets/{tid}", json={"auto_health_s": 900},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200 and r.json()["auto_health_s"] == 900
+    # a scheduling-only edit must NOT reset the validation verdict
+    assert r.json()["last_validation_ok"] is True
+
+    conn = connect(cfg.db_path)
+    try:
+        assert ops_support.maybe_enqueue_auto_health(cfg, conn) == 1
+        assert ops_support.maybe_enqueue_auto_health(cfg, conn) == 0  # already queued
+    finally:
+        conn.close()
+    _drain_queue(cfg)
+    hist = client.get(f"/api/kube-targets/{tid}/health-history",
+                      auth=("viewer", "vpw")).json()["history"]
+    assert len(hist) == 1 and hist[0]["status"] == "ok"
+    assert hist[0]["metrics"]["disk_pct_max"] == 38.0
+    conn = connect(cfg.db_path)
+    try:
+        # fresh health_utc → interval not yet elapsed → nothing enqueued
+        assert ops_support.maybe_enqueue_auto_health(cfg, conn) == 0
+    finally:
+        conn.close()
+
+
+def test_health_transitions_recorded(opsweb, monkeypatch):
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    client.post(f"/api/kube-targets/{tid}/health", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    monkeypatch.setenv("FAKE_KUBE_INACTIVE_SLOT", "1")
+    client.post(f"/api/kube-targets/{tid}/health", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    hist = client.get(f"/api/kube-targets/{tid}/health-history",
+                      auth=("viewer", "vpw")).json()["history"]
+    assert [h["status"] for h in hist] == ["warn", "ok"]    # newest first
+
+
+def test_disk_trend_projection():
+    import json as _json
+    from pgbench_webapp.ops_support import _disk_trend_finding
+    rows = [   # newest first: +1%/day at 84% → ~6 days to 90%
+        {"metrics": _json.dumps({"disk_pct_max": 84}), "ts_utc": "2026-07-10T00:00:00Z"},
+        {"metrics": _json.dumps({"disk_pct_max": 83}), "ts_utc": "2026-07-09T00:00:00Z"},
+        {"metrics": _json.dumps({"disk_pct_max": 82}), "ts_utc": "2026-07-08T00:00:00Z"},
+    ]
+    f = _disk_trend_finding(rows, None)
+    assert f is not None and f["severity"] == "warn"
+    assert "days to 90%" in f["value"]
+    # a flat series never projects
+    flat = [{"metrics": _json.dumps({"disk_pct_max": 38}),
+             "ts_utc": f"2026-07-0{d}T00:00:00Z"} for d in (9, 8, 7)]
+    assert _disk_trend_finding(flat, 38) is None
+    # 3 days out escalates to crit
+    steep = [
+        {"metrics": _json.dumps({"disk_pct_max": 88}), "ts_utc": "2026-07-10T00:00:00Z"},
+        {"metrics": _json.dumps({"disk_pct_max": 86}), "ts_utc": "2026-07-09T00:00:00Z"},
+        {"metrics": _json.dumps({"disk_pct_max": 84}), "ts_utc": "2026-07-08T00:00:00Z"},
+    ]
+    f = _disk_trend_finding(steep, None)
+    assert f is not None and f["severity"] == "crit"
+
+
 # ── the extended leak gate ──
 
 def test_kube_secrets_never_leak_anywhere(opsweb):

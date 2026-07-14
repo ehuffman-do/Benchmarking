@@ -50,6 +50,7 @@ _SAFE_DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 PATRONI_PARAMS_PATH = ("spec", "patroni", "dynamicConfiguration", "postgresql",
                        "parameters")
 PGBACKREST_GLOBAL_PATH = ("spec", "backups", "pgbackrest", "global")
+PGBOUNCER_GLOBAL_PATH = ("spec", "proxy", "pgBouncer", "config", "global")
 
 SCHEDULES_MARKER = "OPS_SCHEDULES_JSON"
 
@@ -167,6 +168,37 @@ def verify_pgbackrest_config(kube: Kube, leader: str, expected: dict[str, Any],
         ok = all(rendered.get(k) == str(v) for k, v in expected.items())
         if ok or time.monotonic() >= deadline:
             return rendered, ok
+        time.sleep(poll_s)
+
+
+def verify_pgbouncer_config(kube: Kube, cr_name: str, expected: dict[str, Any],
+                            timeout_s: float, poll_s: float = 2.0) -> tuple[dict[str, str], bool]:
+    """CR -> rendered pgBouncer ini in a pgbouncer pod: grep for the keys.
+
+    The operators render config.global into the generated ini (key = value
+    lines); reload is a SIGHUP — no pod restart, so convergence is quick."""
+    from pgbench_harness.ops.discover import classify_pods
+    pattern = "|".join(expected)
+    deadline = time.monotonic() + timeout_s
+    rendered: dict[str, str] = {}
+    while True:
+        pods = classify_pods(kube.json(["get", "pods"]).get("items") or [], cr_name)
+        pod = next((p["name"] for p in pods["pgbouncer"]
+                    if p["phase"] == "Running"), None)
+        if pod is not None:
+            res = kube.exec(pod, "pgbouncer",
+                            ["grep", "-hrE", pattern, "/etc/pgbouncer/"],
+                            timeout_s=20)
+            rendered = {}
+            for line in res.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    rendered[k.strip()] = v.strip()
+            ok = all(rendered.get(k) == str(v) for k, v in expected.items())
+            if ok:
+                return rendered, True
+        if time.monotonic() >= deadline:
+            return rendered, False
         time.sleep(poll_s)
 
 
@@ -302,11 +334,18 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             proposed = dict(params.get("parameters") or PATRONI_BUNDLE)
         elif action == "pgbackrest_global":
             proposed = dict(params.get("global") or PGBACKREST_BUNDLE)
+        elif action == "pgbouncer_global":
+            proposed = dict(params.get("global") or {})
+            if not proposed:
+                run.finalize("failed", error="pgbouncer_global: params.global is empty")
+                return EXIT_FAILED
         else:
             run.finalize("failed", error=f"unknown action '{action}'")
             return EXIT_FAILED
 
-        path = PATRONI_PARAMS_PATH if action == "patroni_params" else PGBACKREST_GLOBAL_PATH
+        path = {"patroni_params": PATRONI_PARAMS_PATH,
+                "pgbackrest_global": PGBACKREST_GLOBAL_PATH,
+                "pgbouncer_global": PGBOUNCER_GLOBAL_PATH}[action]
         current = _dig(cr, path)
         changes = value_diff(current, {k: v for k, v in proposed.items() if v is not None})
         removed = [k for k, v in proposed.items() if v is None and k in current]
@@ -380,6 +419,22 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
                                    "never showed the new values")
                 return EXIT_FAILED
             run.event("verify", "all values live in pg_settings on the leader", leader)
+        elif action == "pgbouncer_global":
+            expected = {k: v[1] for k, v in changes.items()}
+            rendered, ok = verify_pgbouncer_config(kube, t.cr_name, expected,
+                                                   verify_timeout)
+            atomic_write_text(run.run_dir / "verify.json", json.dumps(
+                {"rendered": rendered, "matched": ok}, indent=2))
+            headline["verified"] = ok
+            if not ok:
+                run.event("verify", "rendered pgbouncer ini did not converge",
+                          json.dumps(rendered)[:300])
+                run.finalize("failed", headline=headline,
+                             error="verify timeout: /etc/pgbouncer never rendered "
+                                   "the new values")
+                return EXIT_FAILED
+            run.event("verify", "values rendered in /etc/pgbouncer (SIGHUP reload; "
+                      "no pod restart)")
         else:   # pgbackrest_global
             expected = {k: v[1] for k, v in changes.items()}
             rendered, ok = verify_pgbackrest_config(kube, leader, expected,

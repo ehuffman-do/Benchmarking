@@ -6,6 +6,7 @@ and hashed passwords. Keep these functions small and explicit.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any, Optional
 
@@ -319,6 +320,27 @@ def delete_kube_target(conn: sqlite3.Connection, target_id: int) -> None:
     conn.execute("UPDATE jobs SET kube_target_id=NULL WHERE kube_target_id=?", (target_id,))
     conn.execute("UPDATE ops_runs SET kube_target_id=NULL WHERE kube_target_id=?", (target_id,))
     conn.execute("DELETE FROM kube_targets WHERE id=?", (target_id,))
+
+
+def insert_health_history(conn: sqlite3.Connection, kube_target_id: int,
+                          status: str, crit: int, warn: int,
+                          metrics: dict[str, Any]) -> None:
+    conn.execute("INSERT INTO health_history(kube_target_id, ts_utc, status, "
+                 "crit, warn, metrics) VALUES (?,?,?,?,?,?)",
+                 (kube_target_id, utc_now_iso(), status, crit, warn,
+                  json.dumps(metrics)))
+    # Keep the history bounded: this is a cache for trends/transitions, not an
+    # archive (the ops job logs remain the full record).
+    conn.execute("DELETE FROM health_history WHERE kube_target_id=? AND id NOT IN "
+                 "(SELECT id FROM health_history WHERE kube_target_id=? "
+                 " ORDER BY id DESC LIMIT 500)", (kube_target_id, kube_target_id))
+
+
+def list_health_history(conn: sqlite3.Connection, kube_target_id: int,
+                        limit: int = 100) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM health_history WHERE kube_target_id=? "
+        "ORDER BY id DESC LIMIT ?", (kube_target_id, limit)))
 
 
 def active_ops_jobs(conn: sqlite3.Connection, kube_target_id: int,

@@ -35,9 +35,10 @@ OPS_KINDS: dict[str, str] = {
     "ops_pg_params": "pg-params",
     "ops_diag": "diag",
     "ops_health": "health",
+    "ops_operate": "operate",
 }
 RUN_DIR_KINDS = ("ops_cr_apply", "ops_backup", "ops_scenario", "ops_monitor",
-                 "ops_diag")
+                 "ops_diag", "ops_operate")
 
 SUMMARY_MARKER = "OPS_SUMMARY_JSON"
 TOPOLOGY_MARKER = "OPS_TOPOLOGY_JSON"
@@ -254,6 +255,130 @@ def reconcile_stale_ops_jobs(cfg: Config, conn: sqlite3.Connection,
     return n
 
 
+SEVERITY_ORDER = ("ok", "info", "warn", "crit")
+
+
+def _disk_trend_finding(history: list[sqlite3.Row],
+                        now_pct: Optional[float]) -> Optional[dict[str, Any]]:
+    """Least-squares projection of data-volume fill from health history.
+
+    Returns a synthetic finding when the trend crosses 90% within 14 days —
+    the alert that matters BEFORE the disk_pct threshold ever fires."""
+    import time as _time
+    from datetime import datetime, timezone
+    pts: list[tuple[float, float]] = []
+    for row in reversed(history):        # oldest -> newest
+        try:
+            m = json.loads(row["metrics"] or "{}")
+            pct = m.get("disk_pct_max")
+            if pct is None:
+                continue
+            ts = datetime.strptime(row["ts_utc"], "%Y-%m-%dT%H:%M:%SZ")
+            pts.append((ts.replace(tzinfo=timezone.utc).timestamp(), float(pct)))
+        except (ValueError, KeyError, TypeError):
+            continue
+    if now_pct is not None:
+        pts.append((_time.time(), float(now_pct)))
+    if len(pts) < 3:
+        return None
+    xs = [p[0] / 86400 for p in pts]     # days
+    ys = [p[1] for p in pts]
+    n = len(pts)
+    mx, my = sum(xs) / n, sum(ys) / n
+    denom = sum((x - mx) ** 2 for x in xs)
+    if denom == 0:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom  # %/day
+    if slope < 0.1:                       # flat or shrinking — no projection
+        return None
+    latest = ys[-1]
+    days_to_90 = (90.0 - latest) / slope
+    if days_to_90 > 14 or days_to_90 < 0:
+        return None
+    sev = "crit" if days_to_90 <= 3 else "warn"
+    return {"id": "disk_trend", "severity": sev,
+            "title": "Data volume trending toward full",
+            "value": f"~{days_to_90:.1f} days to 90% (+{slope:.2f}%/day)",
+            "detail": "Linear projection over recent health samples. When "
+                      "/pgdata fills, Postgres PANICs and the pod crash-loops.",
+            "remediation": "Expand the PVC now (storage class must allow "
+                           "expansion), check inactive slots and WAL retention.",
+            "action": {"type": "diag", "checks": ["pvc_usage", "slots"]}}
+
+
+def _record_health(cfg: Config, conn: sqlite3.Connection, kt_id: int,
+                   health: dict[str, Any]) -> None:
+    """Cache the health doc, append history, inject the trend finding, and
+    fire a notification on a status transition."""
+    prev = queries.list_health_history(conn, kt_id, limit=60)
+    prev_status = prev[0]["status"] if prev else None
+
+    metrics = health.get("metrics") or {}
+    trend = _disk_trend_finding(prev, metrics.get("disk_pct_max"))
+    if trend is not None:
+        findings = [f for f in (health.get("findings") or [])
+                    if f.get("id") != "disk_trend"]
+        findings.insert(0, trend)
+        health["findings"] = findings
+        worst = max((SEVERITY_ORDER.index(f.get("severity", "ok"))
+                     for f in findings), default=0)
+        health["status"] = SEVERITY_ORDER[worst]
+
+    status = str(health.get("status") or "ok")
+    findings = health.get("findings") or []
+    crit = sum(1 for f in findings if f.get("severity") == "crit")
+    warn = sum(1 for f in findings if f.get("severity") == "warn")
+    queries.update_kube_target(conn, kt_id, health_json=json.dumps(health),
+                               health_utc=utc_now_iso())
+    queries.insert_health_history(conn, kt_id, status, crit, warn,
+                                  {k: v for k, v in metrics.items()})
+
+    # Notify on TRANSITIONS, not states — an always-warn cluster shouldn't
+    # page every 15 minutes.
+    if prev_status is not None and status != prev_status:
+        kt = queries.get_kube_target(conn, kt_id)
+        try:
+            from pgbench_webapp.notify import notify_health
+            from pgbench_webapp.secrets_store import SecretStore
+            store = SecretStore(cfg.secret_key_path, cfg.data_dir / "secrets.enc")
+            top = "; ".join(f"{f.get('title')} ({f.get('value')})"
+                            for f in findings[:3])
+            notify_health(conn, store,
+                          target=kt["name"] if kt else str(kt_id),
+                          prev_status=prev_status, status=status, summary=top)
+        except Exception:  # noqa: BLE001 — notifications are best-effort
+            pass
+
+
+def maybe_enqueue_auto_health(cfg: Config, conn: sqlite3.Connection) -> int:
+    """Continuous intelligence: enqueue a health check for every target whose
+    auto-health interval has elapsed. Called from the worker loop."""
+    from datetime import datetime, timezone
+    n = 0
+    for kt in queries.list_kube_targets(conn):
+        interval = int(kt["auto_health_s"] or 0)
+        if interval <= 0 or not kt["cr_name"]:
+            continue
+        last = kt["health_utc"]
+        if last:
+            try:
+                ts = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ") \
+                    .replace(tzinfo=timezone.utc).timestamp()
+                if (datetime.now(timezone.utc).timestamp() - ts) < interval:
+                    continue
+            except ValueError:
+                pass
+        if queries.active_ops_jobs(conn, kt["id"], ("ops_health",)):
+            continue
+        from pgbench_webapp.ops_routes import build_ops_spec_yaml
+        spec_yaml = build_ops_spec_yaml(kt, "health", {},
+                                        f"auto-health-{kt['name']}")
+        if queries.enqueue_ops_job_atomic(conn, "ops_health", spec_yaml,
+                                          "system:auto-health", kt["id"], ()):
+            n += 1
+    return n
+
+
 def postprocess(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                 state: str, op_run_id: Optional[str], log_path: Path) -> None:
     """After an ops job ends: cache validate/discover results onto the kube
@@ -295,9 +420,7 @@ def postprocess(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
     if kt_id and kind == "ops_health":
         health = _marker_payload(log_path, HEALTH_MARKER)
         if health:
-            queries.update_kube_target(conn, kt_id,
-                                       health_json=json.dumps(health),
-                                       health_utc=utc_now_iso())
+            _record_health(cfg, conn, kt_id, health)
     if kt_id:
         sched = _marker_payload(log_path, SCHEDULES_MARKER)
         if sched is not None:

@@ -50,6 +50,8 @@ export function Palette({ me }: { me: Me }) {
                      to: `/ops/targets/${t.id}/params`, group: "Clusters" });
         items.push({ label: `${t.name} — diagnostics`, hint: "click-to-run checks",
                      to: `/ops/targets/${t.id}/diag`, group: "Clusters" });
+        items.push({ label: `${t.name} — operations`, hint: "restart · switchover · scale · resize · schedules",
+                     to: `/ops/targets/${t.id}/operate`, group: "Clusters" });
       }
       for (const r of runs.slice(0, 12)) {
         items.push({ label: r.run_id, hint: [r.label, r.status].filter(Boolean).join(" · "),

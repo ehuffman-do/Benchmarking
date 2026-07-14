@@ -58,6 +58,9 @@ def default_state():
                          "generation": 3},
             "spec": {
                 "postgresVersion": 18,
+                "instances": [{"name": "instance1", "replicas": 3}],
+                "proxy": {"pgBouncer": {"replicas": 2, "config": {"global": {
+                    "pool_mode": "session"}}}},
                 "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {
                     "max_wal_size": "4096", "min_wal_size": "1024",
                     "checkpoint_timeout": "300"}}}},
@@ -91,6 +94,29 @@ def save(st):
 
 def now():
     return time.time()
+
+
+def sync_instances(st):
+    """Mirror spec.instances[0].replicas into the running pod list —
+    grow with fresh member names, shrink from the tail (never the leader)."""
+    sets = st["cr"]["spec"].get("instances") or []
+    want = int((sets[0] or {}).get("replicas", len(st["instances"]))) if sets \
+        else len(st["instances"])
+    cur = len(st["instances"])
+    suffixes = ["mnop", "qrst", "uvwx", "yz01", "2345"]
+    while len(st["instances"]) < want:
+        i = len(st["instances"])
+        name = f"{st['cluster']}-instance1-{suffixes[i % len(suffixes)]}-0"
+        st["instances"].append({"name": name, "node": f"node-{i}",
+                                "ip": f"10.244.0.{20 + i}"})
+    while len(st["instances"]) > want:
+        tail = st["instances"][-1]
+        if tail["name"] == st["leader"]:
+            break
+        st["instances"].pop()
+    if cur != want:
+        st["deleted"] = {k: v for k, v in st["deleted"].items()
+                         if any(i["name"] == k for i in st["instances"])}
 
 
 def pod_alive(st, name):
@@ -389,6 +415,8 @@ def run_sql(st, sql):
         return j(["defaultdb", "3", "104857600"])
     if "diag:checkpoints" in s:
         return j(["48", "9", "15.8"])
+    if "op:shared_buffers" in s:
+        return str(16384 * 8192)
     if "diag:wal_activity" in s:
         return j([str((int(now()) % 100000) * 1048576), "5/AB000000"])
     if "pg_stat_archiver" in s:
@@ -447,9 +475,17 @@ def handle_exec(st, pod, argv):
                 "".join(f"    {k}: {v}\n" for k, v in sorted(params.items())) +
                 "retry_timeout: 10\nttl: 30")
             return 0
-        if argv[1] == "switchover":
+        if argv[1] in ("switchover", "failover"):
+            cand = None
+            if "--candidate" in argv:
+                cand = argv[argv.index("--candidate") + 1]
             candidates = [i["name"] for i in st["instances"]
                           if i["name"] != st["leader"] and pod_alive(st, i["name"])]
+            if cand is not None:
+                if cand not in candidates:
+                    sys.stderr.write(f"candidate {cand} is not a running replica\n")
+                    return 1
+                candidates = [cand]
             if not candidates:
                 sys.stderr.write("no candidates for switchover\n")
                 return 1
@@ -458,6 +494,14 @@ def handle_exec(st, pod, argv):
             st["tl"] += 1
             save(st)
             out(f"Successfully switched over to \"{candidates[0]}\"")
+            return 0
+        if argv[1] == "restart":
+            member = next((a for a in argv[2:]
+                           if not a.startswith("-") and "-" in a
+                           and a != st["cluster"] + "-ha"), None)
+            (STATE_DIR / "restarts.log").open("a").write(
+                json.dumps({"member": member or "cluster", "t": now()}) + "\n")
+            out(f"Success: restart for member {member or '(all)'}")
             return 0
     if argv[0] == "pgbackrest" or (argv[0] == "bash" and "pgbackrest" in joined):
         if "info" in argv:
@@ -500,6 +544,14 @@ def handle_exec(st, pod, argv):
         st["killed_at"] = now()
         save(st)
         return 0
+    if argv[0] == "grep" and "/etc/pgbouncer" in joined:
+        gl = (st["cr"]["spec"].get("proxy", {}).get("pgBouncer", {})
+              .get("config", {}).get("global", {}))
+        hits = [f"{k} = {v}" for k, v in sorted(gl.items())]
+        if hits:
+            out("\n".join(hits))
+            return 0
+        return 1
     if argv[0] == "grep" or (argv[0] == "bash" and "grep" in joined
                              and "pgbackrest" in joined):
         gl = st["cr"]["spec"]["backups"]["pgbackrest"].get("global", {})
@@ -710,6 +762,26 @@ def main():
             except ValueError:
                 return 2
         patch = json.loads(args[pi + 1])
+
+        if isinstance(patch, list):
+            # kubectl patch --type json: replace/add on a /-separated path.
+            for op in patch:
+                path = [seg for seg in op.get("path", "").split("/") if seg]
+                cur = st["cr"]
+                for seg in path[:-1]:
+                    cur = cur[int(seg)] if isinstance(cur, list) else \
+                        cur.setdefault(seg, {})
+                leaf = path[-1]
+                if isinstance(cur, list):
+                    cur[int(leaf)] = op.get("value")
+                else:
+                    cur[leaf] = op.get("value")
+            sync_instances(st)
+            st["cr"]["metadata"]["generation"] += 1
+            save(st)
+            (STATE_DIR / "patches.log").open("a").write(json.dumps(patch) + "\n")
+            out(f"{CR_KIND}.pgv2.percona.com/{st['cluster']} patched")
+            return 0
 
         def deep_merge(dst, src):
             for k, v in src.items():

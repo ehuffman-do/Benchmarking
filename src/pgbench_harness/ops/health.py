@@ -66,6 +66,10 @@ class Findings:
     def __init__(self) -> None:
         self.items: list[dict[str, Any]] = []
         self.checked = 0
+        # Raw numeric signals, kept even when no finding fired — the webapp
+        # stores these per run so it can do trend analysis (disk-fill
+        # projection, connection growth) across health history.
+        self.metrics: dict[str, float] = {}
 
     def add(self, fid: str, severity: str, title: str, value: str,
             detail: str, remediation: str = "",
@@ -100,6 +104,8 @@ def evaluate_sql_signals(kube: Kube, leader: str, th: dict[str, float],
                          "current_setting('max_connections')::int "
                          "FROM pg_stat_activity")
     used, mx = _f(v, 0), _f(v, 1)
+    if used is not None and mx:
+        out.metrics["conn_pct"] = round(100.0 * used / mx, 1)
     if used is None or not mx:
         out.add("connections", "info", "Connection saturation", "unknown",
                 "could not query pg_stat_activity")
@@ -205,6 +211,8 @@ def evaluate_sql_signals(kube: Kube, leader: str, th: dict[str, float],
     v = _q(kube, leader, "/*health:pending*/ SELECT count(*) "
                          "FROM pg_settings WHERE pending_restart")
     pend = _f(v, 0)
+    if pend is not None:
+        out.metrics["pending_restart"] = pend
     if pend:
         out.add("pending_restart", "warn", "Parameters awaiting restart",
                 f"{pend:.0f} parameter(s)",
@@ -241,6 +249,9 @@ def evaluate_patroni(kube: Kube, leader_pod: str, th: dict[str, float],
                     "Check the pod's patroni container logs and recent "
                     "Kubernetes warnings.",
                     {"type": "diag", "checks": ["patroni_list", "pods"]})
+        if m.lag_mb is not None:
+            out.metrics["lag_mb_max"] = max(out.metrics.get("lag_mb_max", 0.0),
+                                            float(m.lag_mb))
         if m.lag_mb is not None and m.lag_mb >= th["lag_mb_warn"]:
             out.add(f"lag_{m.name}", "warn", f"Replica {m.name} lagging",
                     f"{m.lag_mb:.0f} MB",
@@ -292,6 +303,7 @@ def evaluate_kube(kube: Kube, cr_name: str, instances: list[str],
             parts = ln.split()
             if len(parts) >= 5 and parts[4].endswith("%"):
                 pct = float(parts[4].rstrip("%"))
+                out.metrics["disk_pct_max"] = max(out.metrics.get("disk_pct_max", 0.0), pct)
                 sev = ("crit" if pct >= th["disk_pct_crit"] else
                        "warn" if pct >= th["disk_pct_warn"] else "ok")
                 if sev != "ok":
@@ -336,6 +348,7 @@ def evaluate_backups(kube: Kube, leader_pod: str, th: dict[str, float],
     newest = max(float(s) for s in stops if s) if any(stops) else 0
     if newest:
         age_s = _time.time() - newest
+        out.metrics["backup_age_h"] = round(age_s / 3600, 2)
         sev = ("crit" if age_s >= th["backup_age_crit_s"] else
                "warn" if age_s >= th["backup_age_warn_s"] else "ok")
         if sev != "ok":
@@ -386,6 +399,7 @@ def run_health(spec: OpsSpec) -> int:
     evaluate_kube(kube, t.cr_name, instances, th, out)
     evaluate_backups(kube, leader, th, out)
 
+    payload["metrics"] = out.metrics
     payload["findings"] = sorted(
         out.items, key=lambda f: -SEVERITY_ORDER.index(f.get("severity", "ok")))
     payload["checked"] = out.checked

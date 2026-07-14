@@ -15,7 +15,10 @@ from typing import Any
 from pgbench_harness.errors import SpecError
 
 OPS_KINDS = ("validate", "discover", "cr-apply", "backup", "scenario", "monitor",
-             "pg-params", "diag", "health")
+             "pg-params", "diag", "health", "operate")
+
+OPERATE_OPERATIONS = ("restart", "switchover", "failover", "scale", "resize",
+                      "schedules")
 
 # CR kinds we know how to drive, in fallback order (Percona first, then the
 # upstream Crunchy kind it is built on).
@@ -106,5 +109,20 @@ def parse_ops_spec(doc: Any) -> OpsSpec:
         btype = str(params.get("type") or "incr")
         if btype not in ("full", "diff", "incr"):
             raise SpecError(f"ops spec: backup params.type must be full|diff|incr (got '{btype}')")
+    if op == "operate":
+        operation = str(params.get("operation") or "")
+        if operation not in OPERATE_OPERATIONS:
+            raise SpecError(f"ops spec: operate params.operation must be one of "
+                            f"{', '.join(OPERATE_OPERATIONS)} (got '{operation or '<missing>'}')")
+        if operation == "scale":
+            try:
+                n = int(params.get("replicas"))
+            except (TypeError, ValueError):
+                raise SpecError("ops spec: scale needs integer params.replicas")
+            if not 0 <= n <= 16:
+                raise SpecError(f"ops spec: scale replicas must be 0..16 (got {n})")
+        if operation == "resize" and not isinstance(params.get("resources"), dict):
+            raise SpecError("ops spec: resize needs params.resources "
+                            "{requests/limits: {cpu, memory}}")
     label = str(doc.get("label") or f"{op}-{target.name}")
     return OpsSpec(op=op, target=target, label=label, params=dict(params), raw=dict(doc))

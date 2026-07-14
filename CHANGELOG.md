@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — day-2 operations catalog + continuous intelligence
+
+- **New: guided operations** (`ops operate` + console → target → Operations):
+  rolling **restart** (cluster-wide via the operator's annotation channel, or
+  a single member via patronictl — wired to the pending_restart health
+  finding's "inspect" button), everyday **switchover/failover** with a
+  target picker (preflight refuses leaderless/no-replica states),
+  **scale replicas** (JSON-patch + watch until new members stream;
+  scale-down warns PVCs are deleted), **vertical resize** (preflight warns
+  when the memory limit is under 2× shared_buffers — the OOM-loop classic),
+  and a **backup schedules & retention editor** (cron-validated, verified
+  against the CR). Every operation: preflight → dry-run plan → typed
+  confirmation → live watch → verify; one destructive op per target.
+- **Continuous intelligence**: per-target **auto health checks** (off/15m/1h/6h,
+  scheduled by the worker), a bounded **health history** (migration 7) with a
+  new /health-history API, **transition notifications** (ok→warn→crit and
+  recoveries; state changes only, never repeats) through the existing
+  Slack/email channels, and a **disk-fill trend projection** — a linear fit
+  over history that raises "~N days to 90%" as a warn (<14 d) or crit (<3 d)
+  finding long before the static threshold fires.
+- **pgBouncer click-to-apply**: new `pgbouncer_global` cr-apply action
+  patching `proxy.pgBouncer.config.global` with dry-run diff and a verify
+  loop against the rendered ini in the pgbouncer pod (SIGHUP reload — no
+  restart); the pgBouncer catalog tab is now stageable like pgBackRest.
+- **Cluster overview**: the target page opens with KPI tiles (leader,
+  healthy members, timeline, health) plus **sparklines** for WAL rate, data
+  volume fill, and replica lag fed from the latest monitor run's CSVs.
+
 ## Unreleased — console redesign (single pane of glass)
 
 - **Sidebar shell** — grouped left navigation (Observe / Benchmarking /

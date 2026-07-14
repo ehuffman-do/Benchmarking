@@ -18,7 +18,40 @@ function findingLink(targetId: string | undefined, f: HealthFinding): string | n
   if (a.type === "params") {
     return `/ops/targets/${targetId}/params${a.filter ? `?filter=${a.filter}` : ""}`;
   }
+  if (a.type === "operate") {
+    return `/ops/targets/${targetId}/operate${(a as { operation?: string }).operation ? `?op=${(a as { operation?: string }).operation}` : ""}`;
+  }
   return null;
+}
+
+function Spark({ data, color }: { data: number[]; color: string }) {
+  if (data.length < 2) return <span className="subtle mono">—</span>;
+  const w = 110, h = 26;
+  const min = Math.min(...data), max = Math.max(...data);
+  const span = max - min || 1;
+  const pts = data.map((v, i) =>
+    `${(i / (data.length - 1)) * w},${h - 2 - ((v - min) / span) * (h - 4)}`).join(" ");
+  return (
+    <svg width={w} height={h} style={{ display: "block" }}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.6" />
+    </svg>
+  );
+}
+
+function seriesFromCsv(text: string, valueOf: (cols: string[], f: string[]) => number | null,
+                       maxPts = 60): number[] {
+  const lines = text.trim().split("\n");
+  if (lines.length < 2) return [];
+  const cols = lines[0].split(",");
+  const byEpoch = new Map<string, number>();
+  for (const ln of lines.slice(1)) {
+    const f = ln.split(",");
+    const v = valueOf(cols, f);
+    if (v === null || Number.isNaN(v)) continue;
+    const key = f[0];
+    byEpoch.set(key, Math.max(byEpoch.get(key) ?? -Infinity, v));
+  }
+  return [...byEpoch.values()].slice(-maxPts);
 }
 
 const PATRONI_BUNDLE = JSON.stringify({
@@ -53,6 +86,7 @@ export function KubeTargetView({ me }: { me: Me }) {
   const [health, setHealth] = useState<HealthDoc | null>(null);
   const [healthUtc, setHealthUtc] = useState<string | null>(null);
   const [healthRunning, setHealthRunning] = useState(false);
+  const [spark, setSpark] = useState<{ wal: number[]; disk: number[]; lag: number[] } | null>(null);
   const isAdmin = me.role === "admin";
   const canOp = me.role !== "viewer";
 
@@ -122,6 +156,32 @@ export function KubeTargetView({ me }: { me: Me }) {
     try { return JSON.parse(crParams); } catch { return null; }
   }
 
+  // Sparklines feed from the newest monitor run's parsed CSVs (live or done).
+  useEffect(() => {
+    const mon = runs.find((r) => r.kind === "monitor");
+    if (!mon) return;
+    const base = `/ops/runs/${mon.op_run_id}/file?name=parsed/`;
+    const get = (f: string) => fetch(base + f, { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.text() : "")).catch(() => "");
+    Promise.all([get("monitor.csv"), get("disk.csv"), get("replication.csv")])
+      .then(([mcsv, dcsv, rcsv]) => {
+        const walTotals = seriesFromCsv(mcsv, (cols, f) => {
+          const i = cols.indexOf("wal_bytes");
+          return i >= 0 ? Number(f[i]) : null;
+        }, 61);
+        const wal = walTotals.slice(1).map((v, i) => Math.max(0, v - walTotals[i]));
+        const disk = seriesFromCsv(dcsv, (cols, f) => {
+          const i = cols.indexOf("pgdata_use_pct");
+          return i >= 0 ? Number(f[i]) : null;
+        });
+        const lag = seriesFromCsv(rcsv, (cols, f) => {
+          const i = cols.indexOf("lag_bytes");
+          return i >= 0 ? Number(f[i]) : null;
+        });
+        setSpark({ wal, disk, lag });
+      });
+  }, [runs]);
+
   const activeMonitor = jobs.find((j) =>
     j.kind === "ops_monitor" && ["queued", "running"].includes(j.state) &&
     (j as unknown as { kube_target_id: number | null }).kube_target_id === Number(targetId));
@@ -136,9 +196,39 @@ export function KubeTargetView({ me }: { me: Me }) {
         <h1>{kt.name}</h1>
         <span className="mono subtle">{kt.cr_kind}/{kt.cr_name || "?"} · ns {kt.namespace} · {kt.api_server || "API server unknown"}</span>
         <div className="spacer" />
+        <Link className="btn primary" to={`/ops/targets/${targetId}/operate`}>Operations</Link>{" "}
         <Link className="btn" to={`/ops/targets/${targetId}/params`}>Parameter map</Link>{" "}
         <Link className="btn" to={`/ops/targets/${targetId}/diag`}>Diagnostics</Link>{" "}
         <Link className="btn" to="/ops">← targets</Link>
+      </div>
+
+      <div className="kpi-row" style={{ marginBottom: 16 }}>
+        <div className="kpi"><div className="label">Leader</div>
+          <div className="value" style={{ fontSize: 15 }}>
+            {topo?.patroni?.leader ? "👑 …" + topo.patroni.leader.slice(-9) : "—"}</div></div>
+        <div className="kpi"><div className="label">Members healthy</div>
+          <div className="value">
+            {members.length ? `${members.filter((m) =>
+              ["running", "streaming"].includes(m.state)).length}/${members.length}` : "—"}
+          </div></div>
+        <div className="kpi"><div className="label">Timeline</div>
+          <div className="value">{topo?.patroni?.timeline ?? "—"}</div></div>
+        <div className="kpi"><div className="label">Health</div>
+          <div className="value" style={{ fontSize: 14, marginTop: 8 }}>
+            {health ? <span className={`badge ${SEV_BADGE[health.status] ?? "ok"}`}>
+              {health.status === "ok" ? "✓ healthy" : health.status}</span> : "—"}</div></div>
+        <div className="kpi"><div className="label">WAL rate / cycle</div>
+          <Spark data={spark?.wal ?? []} color="var(--live)" />
+          <div className="subtle mono" style={{ fontSize: 11 }}>
+            {spark?.wal.length ? `${(spark.wal[spark.wal.length - 1] / 1048576).toFixed(1)} MB` : "start the monitor"}</div></div>
+        <div className="kpi"><div className="label">Data volume</div>
+          <Spark data={spark?.disk ?? []} color="var(--warn)" />
+          <div className="subtle mono" style={{ fontSize: 11 }}>
+            {spark?.disk.length ? `${spark.disk[spark.disk.length - 1].toFixed(0)}% used (max pod)` : "—"}</div></div>
+        <div className="kpi"><div className="label">Replica lag</div>
+          <Spark data={spark?.lag ?? []} color="var(--brand)" />
+          <div className="subtle mono" style={{ fontSize: 11 }}>
+            {spark?.lag.length ? `${(spark.lag[spark.lag.length - 1] / 1024).toFixed(0)} KiB` : "—"}</div></div>
       </div>
 
       {err && <div className="banner-err">{err}</div>}
@@ -163,6 +253,22 @@ export function KubeTargetView({ me }: { me: Me }) {
             {healthUtc && <span className="subtle mono" style={{ marginLeft: 8 }}>as of {healthUtc}</span>}
           </h2>
           <div className="spacer" />
+          {isAdmin && (
+            <label className="subtle" style={{ fontSize: 12 }}>auto-check&nbsp;
+              <select value={kt.auto_health_s} onChange={async (e) => {
+                try {
+                  await api.post(`/api/kube-targets/${targetId}`,
+                                 { auto_health_s: Number(e.target.value) });
+                  load();
+                } catch (ex) { setErr((ex as Error).message); }
+              }}>
+                <option value={0}>off</option>
+                <option value={900}>every 15 min</option>
+                <option value={3600}>hourly</option>
+                <option value={21600}>every 6 h</option>
+              </select>
+            </label>
+          )}
           {canOp && <button disabled={healthRunning} onClick={async () => {
             setHealthRunning(true);
             try {

@@ -240,11 +240,12 @@ export function KubeParams({ me }: { me: Me }) {
 
   async function applyBk(dryRun: boolean) {
     setErr(null);
+    const action = tab === "pgbouncer" ? "pgbouncer_global" : "pgbackrest_global";
     try {
       const body: Record<string, unknown> = {
-        params: { action: "pgbackrest_global", global: stagedBk,
+        params: { action, global: stagedBk,
                   ...(dryRun ? { dry_run: true } : {}) },
-        label: `pgbackrest-${Object.keys(stagedBk).length}-changes`,
+        label: `${action}-${Object.keys(stagedBk).length}-changes`,
       };
       if (!dryRun) body.confirm = confirm;
       const r = await api.post<{ job_id: number }>(
@@ -290,7 +291,8 @@ export function KubeParams({ me }: { me: Me }) {
       <div style={{ marginBottom: 12 }}>
         {TABS.map(([k, l]) => (
           <button key={k} className={`btn-sm ${tab === k ? "primary" : ""}`}
-                  style={{ marginRight: 6 }} onClick={() => setTab(k)}>
+                  style={{ marginRight: 6 }}
+                  onClick={() => { setTab(k); setStagedBk({}); }}>
             {l}{sidecar && k !== "pg" ? ` (${(sidecar[k] ?? []).length})` : ""}
           </button>
         ))}
@@ -461,11 +463,12 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const pathFor = (o: SidecarOption) =>
     crKind === "postgrescluster" ? o.crunchy_path : o.percona_path;
-  // Only options living in spec.backups.pgbackrest.global have a click-apply
-  // path today (the existing pgbackrest_global action); the rest show their
-  // CR path as guidance.
+  // Click-apply lands wherever a cr-apply action exists: the pgBackRest
+  // global map and the pgBouncer config.global map. Everything else shows
+  // its CR path as guidance. Secure options never go into the CR.
   const stageable = (o: SidecarOption) =>
-    kind === "pgbackrest" && /backups\.pgbackrest\.global/.test(pathFor(o)) &&
+    ((kind === "pgbackrest" && /backups\.pgbackrest\.global/.test(pathFor(o))) ||
+     (kind === "pgbouncer" && /pgBouncer\.config\.global/.test(pathFor(o)))) &&
     !/secure/i.test(o.type);
   const needle = q.trim().toLowerCase();
   const visible = options.filter((o) =>
@@ -478,7 +481,7 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
     <>
       {stagedNames.length > 0 && (
         <div className="card" style={{ marginBottom: 12 }}>
-          <div className="card-head"><h2>Staged pgBackRest changes ({stagedNames.length})</h2></div>
+          <div className="card-head"><h2>Staged {kind} changes ({stagedNames.length})</h2></div>
           <table><tbody>
             {stagedNames.map((n) => (
               <tr key={n}><td className="mono">{n}</td>
@@ -496,7 +499,7 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
                 <button className="primary" onClick={() => onApply(false)}>Apply & verify</button>
               </>
             )}
-            <span className="subtle"> — verified against the rendered pgBackRest config in the pod.</span>
+            <span className="subtle"> — verified against the rendered config inside the pod (pgBouncer reloads via SIGHUP, no restart).</span>
           </div>
         </div>
       )}
@@ -515,7 +518,8 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
         )}
         {kind === "pgbouncer" && (
           <p className="subtle">Applied via <code>proxy.pgBouncer.config.global</code> in the CR —
-            click-to-apply for these lands next phase; the exact path is shown per option.</p>
+            stage values below and apply with the dry-run/verify loop. pgBouncer reloads on
+            SIGHUP: no pod restart, existing connections keep their old settings.</p>
         )}
         <div className="table-scroll">
           <table style={{ tableLayout: "fixed", minWidth: 860 }}>

@@ -337,9 +337,18 @@ def worker_loop(cfg: Optional[Config] = None) -> None:
     # Absolute backstop so a fleet of per-target monitors can't spawn unbounded
     # threads even though each is admissible on its own lane.
     monitor_cap = 32
+    last_auto_health = 0.0
     while True:
         for jid in [j for j, (t, _k) in active.items() if not t.is_alive()]:
             active.pop(jid)[0].join()
+        # Continuous intelligence: enqueue due auto-health checks (cheap scan,
+        # throttled — the per-target interval itself gates actual enqueues).
+        if time.monotonic() - last_auto_health > 30:
+            last_auto_health = time.monotonic()
+            try:
+                ops_support.maybe_enqueue_auto_health(cfg, conn)
+            except Exception:  # noqa: BLE001 — scheduling must never kill the loop
+                pass
         max_conc = max(1, int(queries.get_setting(conn, "max_concurrency", "1") or "1"))
         slotted = sum(1 for _t, k in active.values() if k != "ops_monitor")
         monitors = len(active) - slotted
