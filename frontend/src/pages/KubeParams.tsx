@@ -303,7 +303,9 @@ export function KubeParams({ me }: { me: Me }) {
 
       {tab !== "pg" && (
         <SidecarPanel kind={tab} options={sidecar?.[tab] ?? []} crKind={kt.cr_kind}
-                      isAdmin={isAdmin} live={cat?.pgbackrest_global ?? {}}
+                      isAdmin={isAdmin}
+                      live={tab === "pgbouncer" ? (cat?.pgbouncer_global ?? {})
+                            : tab === "pgbackrest" ? (cat?.pgbackrest_global ?? {}) : {}}
                       staged={stagedBk} setStaged={setStagedBk}
                       confirm={confirm} setConfirm={setConfirm}
                       confirmName={kt.cr_name || kt.name} onApply={applyBk} />
@@ -479,6 +481,11 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
 
   return (
     <>
+      {kind !== "patroni" && (
+        <p className="subtle" style={{ margin: "0 0 8px" }}>
+          Current values come from the last parameter snapshot — hit <em>Refresh
+          snapshot</em> after an apply to see them update.</p>
+      )}
       {stagedNames.length > 0 && (
         <div className="card" style={{ marginBottom: 12 }}>
           <div className="card-head"><h2>Staged {kind} changes ({stagedNames.length})</h2></div>
@@ -531,7 +538,7 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
             <thead><tr><th>Option</th><th>Current / default</th><th>Type</th><th>Allowed</th><th>Applies via</th><th /></tr></thead>
             <tbody>
               {visible.map((o) => {
-                const cur = kind === "pgbackrest" ? live[o.name] : undefined;
+                const cur = kind !== "patroni" ? live[o.name] : undefined;
                 const draft = drafts[o.name] ?? staged[o.name] ?? cur ?? o.default ?? "";
                 return (
                   <tr key={o.name}>

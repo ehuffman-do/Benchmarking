@@ -646,6 +646,13 @@ def test_pgbouncer_global_apply_and_verify(opsweb):
     run = _last_ops_run(client, "cr-apply")
     assert run["status"] == "complete", run
     assert run["headline"]["verified"] is True
+    # a fresh parameter snapshot shows the LIVE CR value, not the catalog default
+    client.post(f"/api/kube-targets/{tid}/pg-params", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    cat = client.get(f"/api/kube-targets/{tid}/pg-params",
+                     auth=("viewer", "vpw")).json()["catalog"]
+    assert cat["pgbouncer_global"]["max_client_conn"] == "500"
+    assert cat["pgbouncer_global"]["pool_mode"] == "transaction"
 
 
 # ── continuous intelligence ──

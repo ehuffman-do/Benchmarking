@@ -171,34 +171,75 @@ def verify_pgbackrest_config(kube: Kube, leader: str, expected: dict[str, Any],
         time.sleep(poll_s)
 
 
-def verify_pgbouncer_config(kube: Kube, cr_name: str, expected: dict[str, Any],
-                            timeout_s: float, poll_s: float = 2.0) -> tuple[dict[str, str], bool]:
-    """CR -> rendered pgBouncer ini in a pgbouncer pod: grep for the keys.
+def _parse_ini_pairs(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";", "[", "%")):
+            continue
+        if "=" in stripped:
+            k, v = stripped.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
 
-    The operators render config.global into the generated ini (key = value
-    lines); reload is a SIGHUP — no pod restart, so convergence is quick."""
+
+def verify_pgbouncer_config(kube: Kube, cr_name: str, expected: dict[str, Any],
+                            timeout_s: float,
+                            poll_s: float = 2.0) -> tuple[dict[str, str], bool, str]:
+    """CR -> operator-rendered pgBouncer config. Two sources, most reliable
+    first: (1) the pgBouncer ConfigMap — API-side, updated the moment the
+    operator reconciles, no kubelet volume-propagation lag; (2) grep of
+    /etc/pgbouncer inside a pgbouncer pod. Field lesson: the mounted file can
+    trail the ConfigMap by a minute or more, and an exec failure used to be
+    silently read as "no values" — the last error is now surfaced in the note.
+
+    Returns (rendered, matched, note)."""
     from pgbench_harness.ops.discover import classify_pods
     pattern = "|".join(expected)
     deadline = time.monotonic() + timeout_s
     rendered: dict[str, str] = {}
+    note = ""
     while True:
-        pods = classify_pods(kube.json(["get", "pods"]).get("items") or [], cr_name)
-        pod = next((p["name"] for p in pods["pgbouncer"]
-                    if p["phase"] == "Running"), None)
-        if pod is not None:
-            res = kube.exec(pod, "pgbouncer",
-                            ["grep", "-hrE", pattern, "/etc/pgbouncer/"],
-                            timeout_s=20)
-            rendered = {}
-            for line in res.stdout.splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    rendered[k.strip()] = v.strip()
-            ok = all(rendered.get(k) == str(v) for k, v in expected.items())
-            if ok:
-                return rendered, True
+        # 1) ConfigMap (source of truth for what the operator rendered)
+        try:
+            doc = kube.json(["get", "configmaps"])
+            for item in doc.get("items") or []:
+                name = str(item.get("metadata", {}).get("name", ""))
+                if cr_name not in name or "pgbouncer" not in name.lower():
+                    continue
+                for text in (item.get("data") or {}).values():
+                    rendered.update({k: v for k, v in _parse_ini_pairs(str(text)).items()
+                                     if k in expected})
+            if rendered and all(rendered.get(k) == str(v) for k, v in expected.items()):
+                return rendered, True, "confirmed in the operator-rendered ConfigMap"
+        except KubeError as exc:
+            note = f"configmap read failed: {str(exc)[:150]}"
+        # 2) the mounted file inside a pgbouncer pod
+        try:
+            pods = classify_pods(kube.json(["get", "pods"]).get("items") or [], cr_name)
+            pod = next((p["name"] for p in pods["pgbouncer"]
+                        if p["phase"] == "Running"), None)
+            if pod is None:
+                note = "no running pgbouncer pod to inspect"
+            else:
+                res = kube.exec(pod, "pgbouncer",
+                                ["grep", "-hrE", pattern, "/etc/pgbouncer/"],
+                                timeout_s=20)
+                if res.ok:
+                    for line in res.stdout.splitlines():
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            if k.strip() in expected:
+                                rendered[k.strip()] = v.strip()
+                    if all(rendered.get(k) == str(v) for k, v in expected.items()):
+                        return rendered, True, f"confirmed in /etc/pgbouncer on {pod}"
+                else:
+                    note = (f"pod grep failed on {pod}: "
+                            f"{(res.stderr or res.stdout).strip()[:150]}")
+        except KubeError as exc:
+            note = f"pod inspection failed: {str(exc)[:150]}"
         if time.monotonic() >= deadline:
-            return rendered, False
+            return rendered, False, note or "values not yet rendered anywhere visible"
         time.sleep(poll_s)
 
 
@@ -379,7 +420,8 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
         # Verify loop.
         instances, leader, view = resolve_leader(kube, t.cr_name)
         run.status_update(leader=leader, members=view.to_dict()["members"])
-        verify_timeout = float(params.get("verify_timeout_s", 60))
+        verify_timeout = float(params.get(
+            "verify_timeout_s", 180 if action == "pgbouncer_global" else 60))
         headline: dict[str, Any] = {"action": action, "changed": changes,
                                     "removed": removed, "applied": True}
         if action == "patroni_params":
@@ -421,20 +463,21 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             run.event("verify", "all values live in pg_settings on the leader", leader)
         elif action == "pgbouncer_global":
             expected = {k: v[1] for k, v in changes.items()}
-            rendered, ok = verify_pgbouncer_config(kube, t.cr_name, expected,
-                                                   verify_timeout)
+            rendered, ok, note = verify_pgbouncer_config(kube, t.cr_name, expected,
+                                                         verify_timeout)
             atomic_write_text(run.run_dir / "verify.json", json.dumps(
-                {"rendered": rendered, "matched": ok}, indent=2))
+                {"rendered": rendered, "matched": ok, "note": note}, indent=2))
             headline["verified"] = ok
             if not ok:
-                run.event("verify", "rendered pgbouncer ini did not converge",
-                          json.dumps(rendered)[:300])
-                run.finalize("failed", headline=headline,
-                             error="verify timeout: /etc/pgbouncer never rendered "
-                                   "the new values")
-                return EXIT_FAILED
-            run.event("verify", "values rendered in /etc/pgbouncer (SIGHUP reload; "
-                      "no pod restart)")
+                # The CR patch DID land — only the rendering wasn't observable
+                # within the window (ConfigMap propagation can lag, or the pod
+                # image lacks grep). Warning, not failure.
+                run.event("verify", "pgbouncer rendering not confirmed in time",
+                          f"{note}; the CR is patched — re-check the pgBouncer "
+                          "tab in a minute")
+                run.finalize("warning", headline=headline)
+                return EXIT_WARNING
+            run.event("verify", note + " (SIGHUP reload; no pod restart)")
         else:   # pgbackrest_global
             expected = {k: v[1] for k, v in changes.items()}
             rendered, ok = verify_pgbackrest_config(kube, leader, expected,

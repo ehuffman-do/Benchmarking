@@ -121,6 +121,7 @@ export interface PgParamsCatalog {
   params: PgParam[];
   cr_managed: Record<string, string>;
   pgbackrest_global: Record<string, string>;
+  pgbouncer_global?: Record<string, string>;
 }
 
 // ── diagnostics workbench ──

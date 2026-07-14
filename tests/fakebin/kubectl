@@ -739,6 +739,15 @@ def main():
                               "status": {"succeeded": 1}})
             out(json.dumps({"items": items}))
             return 0
+        if kind in ("cm", "configmap", "configmaps"):
+            gl = (st["cr"]["spec"].get("proxy", {}).get("pgBouncer", {})
+                  .get("config", {}).get("global", {}))
+            ini = "[pgbouncer]\n" + "".join(f"{k} = {v}\n"
+                                            for k, v in sorted(gl.items()))
+            out(json.dumps({"items": [{
+                "metadata": {"name": f"{st['cluster']}-pgbouncer"},
+                "data": {"pgbouncer.ini": ini}}]}))
+            return 0
         if kind == "events":
             if "-w" in rest or "--watch" in rest:
                 out("0s Normal Pulled pod/x image already present")

@@ -30,7 +30,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from pgbench_harness.ops.crconfig import PATRONI_PARAMS_PATH, PGBACKREST_GLOBAL_PATH, _dig
+from pgbench_harness.ops.crconfig import (PATRONI_PARAMS_PATH,
+                                          PGBACKREST_GLOBAL_PATH,
+                                          PGBOUNCER_GLOBAL_PATH, _dig)
 from pgbench_harness.ops.kube import Kube, KubeError
 from pgbench_harness.ops.opspec import OpsSpec
 from pgbench_harness.util import utc_now_iso
@@ -148,7 +150,8 @@ def run_pg_params(spec: OpsSpec) -> int:
     kube = Kube(context=t.context, namespace=t.namespace)
     payload: dict[str, Any] = {"collected_utc": utc_now_iso(), "leader": "",
                                "pg_version": "", "params": [],
-                               "cr_managed": {}, "pgbackrest_global": {}}
+                               "cr_managed": {}, "pgbackrest_global": {},
+                               "pgbouncer_global": {}}
 
     try:
         from pgbench_harness.ops.crconfig import resolve_leader
@@ -167,6 +170,8 @@ def run_pg_params(spec: OpsSpec) -> int:
         payload["cr_managed"] = {k: str(v) for k, v in cr_params.items()}
         payload["pgbackrest_global"] = {
             k: str(v) for k, v in _dig(cr, PGBACKREST_GLOBAL_PATH).items()}
+        payload["pgbouncer_global"] = {
+            k: str(v) for k, v in _dig(cr, PGBOUNCER_GLOBAL_PATH).items()}
         _check("cluster-cr", "ok",
                f"{len(cr_params)} parameter(s) managed via the CR")
     except KubeError as exc:
