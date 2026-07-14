@@ -117,6 +117,107 @@ footer.foot {
   border-top: 1px solid var(--line); text-align: center;
 }
 
+/* ── sidebar shell (enterprise IA: grouped left nav, full-width content) ── */
+.shell-side { flex-direction: row; }
+.sidenav {
+  width: 216px; flex: 0 0 216px;
+  display: flex; flex-direction: column;
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  border-right: 1px solid var(--line);
+  position: sticky; top: 0; height: 100vh; z-index: 30;
+  padding: 14px 10px 12px;
+}
+.sidenav .wordmark { padding: 2px 8px 12px; font-size: 16px; }
+.sidenav-groups { flex: 1; overflow-y: auto; }
+.nav-group { margin-bottom: 14px; }
+.nav-title {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted); padding: 0 10px 4px;
+}
+.nav-group a {
+  display: flex; align-items: center; gap: 9px;
+  color: var(--ink-dim); padding: 6px 10px; border-radius: var(--radius-sm);
+  font-weight: 500; font-size: 13.5px;
+}
+.nav-group a .ni { width: 16px; text-align: center; color: var(--muted); font-size: 12px; }
+.nav-group a:hover { color: var(--ink); background: var(--surface-3); text-decoration: none; }
+.nav-group a.active { color: var(--ink); background: var(--surface-3); box-shadow: inset 2px 0 0 var(--brand); }
+.nav-group a.active .ni { color: var(--brand); }
+.sidenav-foot { border-top: 1px solid var(--line); padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.sidenav-foot .who { justify-content: space-between; }
+.palette-hint {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; margin: 0 0 14px; padding: 6px 10px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  color: var(--muted); font-size: 12.5px; cursor: pointer;
+}
+.palette-hint:hover { border-color: var(--line-strong); color: var(--ink-dim); }
+.palette-hint kbd {
+  font-size: 10.5px; padding: 1px 5px; border: 1px solid var(--line-strong);
+  border-radius: 4px; background: var(--surface-2); color: var(--muted);
+}
+.shell-main { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 100vh; }
+.topbar.slim { height: 40px; gap: 10px; }
+.topbar.slim .wordmark.small { display: none; font-size: 14px; }
+.nav-burger { display: none; }
+.shell-main main.page { max-width: 1400px; }
+
+@media (max-width: 920px) {
+  .shell-side { flex-direction: column; }
+  .sidenav {
+    position: fixed; left: 0; top: 0; bottom: 0; height: 100vh;
+    transform: translateX(-100%); transition: transform 0.18s ease;
+    box-shadow: var(--shadow);
+  }
+  .sidenav.open { transform: translateX(0); }
+  .nav-burger { display: inline-block; }
+  .topbar.slim .wordmark.small { display: flex; }
+}
+
+/* ── command palette ── */
+.palette-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(4, 8, 14, 0.55); backdrop-filter: blur(2px);
+  display: flex; justify-content: center; padding-top: 12vh;
+}
+.palette {
+  width: 640px; max-width: calc(100vw - 32px); max-height: 60vh;
+  display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--line-strong);
+  border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+}
+.palette input {
+  border: 0; border-bottom: 1px solid var(--line); border-radius: 0;
+  padding: 14px 16px; font-size: 15px; background: transparent; color: var(--ink);
+}
+.palette input:focus { outline: none; }
+.palette-list { overflow-y: auto; padding: 6px; }
+.palette-group {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted); padding: 8px 10px 3px;
+}
+.palette-item {
+  display: flex; align-items: baseline; gap: 10px; width: 100%; text-align: left;
+  background: transparent; border: 0; border-radius: var(--radius-sm);
+  padding: 7px 10px; cursor: pointer; color: var(--ink-dim);
+}
+.palette-item.sel { background: var(--surface-3); color: var(--ink); }
+.palette-item .pl { font-family: var(--font-mono); font-size: 13px; white-space: nowrap; }
+.palette-item .ph { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.palette-empty { color: var(--muted); text-align: center; padding: 24px 0; }
+.palette-foot {
+  border-top: 1px solid var(--line); padding: 7px 14px;
+  color: var(--muted); font-size: 11.5px;
+}
+.palette-foot kbd {
+  font-size: 10px; padding: 0 4px; border: 1px solid var(--line-strong);
+  border-radius: 4px; background: var(--surface-2);
+}
+
+/* ── run-kind chips on the unified feed ── */
+.chip.kind-bench { color: var(--live); border-color: color-mix(in srgb, var(--live) 40%, transparent); }
+.chip.kind-ops { color: var(--brand); border-color: color-mix(in srgb, var(--brand) 40%, transparent); }
+
 /* ── cards ── */
 .card {
   background: var(--surface); border: 1px solid var(--line);
@@ -134,8 +235,22 @@ thead th {
   text-align: left; font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
   text-transform: uppercase; color: var(--muted);
   padding: 6px 12px; border-bottom: 1px solid var(--line);
+  white-space: nowrap;
 }
 tbody td { padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+/* Wide data tables scroll inside their card instead of overflowing the page. */
+.table-scroll { overflow-x: auto; }
+/* Long machine strings (CR paths, option names, URIs) wrap instead of
+   punching through their column. */
+.wrap-any { overflow-wrap: anywhere; word-break: break-word; white-space: normal; }
+td .cell-desc { color: var(--muted); font-size: 12px; line-height: 1.45; margin-top: 2px; }
+
+/* ── breadcrumbs ── */
+.crumbs { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+.crumbs a { color: var(--muted); }
+.crumbs a:hover { color: var(--brand); }
+.crumbs .sep { opacity: 0.55; }
+.crumbs .here { color: var(--ink-dim); }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: var(--surface-2); }
 td.num, th.num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }

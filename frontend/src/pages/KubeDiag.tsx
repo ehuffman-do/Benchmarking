@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import type { DiagCheckInfo, KubeTarget, Me } from "../types";
+import { Crumbs } from "../components/Crumbs";
 
 const CATEGORY_LABEL: Record<string, string> = {
   sessions: "Sessions & locks",
@@ -67,6 +68,7 @@ export function KubeDiag({ me }: { me: Me }) {
 
   return (
     <>
+      <Crumbs trail={[["Clusters", "/ops"], [kt.name, `/ops/targets/${targetId}`], ["Diagnostics"]]} />
       <div className="toolbar">
         <h1>Diagnostics — {kt.name}</h1>
         <span className="mono subtle">{kt.cr_kind}/{kt.cr_name || "?"} · ns {kt.namespace}</span>

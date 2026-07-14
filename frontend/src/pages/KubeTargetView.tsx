@@ -4,6 +4,7 @@ import { api } from "../api";
 import type { HealthDoc, HealthFinding, Job, KubeTarget, Me, OpsRun, Run, Topology } from "../types";
 import { openJobStream, CheckEvent } from "../lib/sse";
 import { CheckList } from "./ClusterOps";
+import { Crumbs } from "../components/Crumbs";
 
 const SEV_BADGE: Record<string, string> = {
   crit: "failed", warn: "failed", info: "running", ok: "ok",
@@ -130,6 +131,7 @@ export function KubeTargetView({ me }: { me: Me }) {
 
   return (
     <>
+      <Crumbs trail={[["Clusters", "/ops"], [kt.name]]} />
       <div className="toolbar">
         <h1>{kt.name}</h1>
         <span className="mono subtle">{kt.cr_kind}/{kt.cr_name || "?"} · ns {kt.namespace} · {kt.api_server || "API server unknown"}</span>

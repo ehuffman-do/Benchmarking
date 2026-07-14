@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — console redesign (single pane of glass)
+
+- **Sidebar shell** — grouped left navigation (Observe / Benchmarking /
+  Cluster Ops / Administration) with icons, active rail, user + theme +
+  logout in the footer; slim topbar; collapses to a slide-over on narrow
+  screens. Content area widens to 1400px.
+- **Unified Runs feed** — the Runs page now shows benchmark runs AND
+  cluster-ops runs in one sorted feed with kind chips, per-kind result
+  summaries (peak QPS vs downtime/checks/cycles), kind filter segs, and
+  correct per-kind links. Fixes the "no runs found" dead end when clicking
+  an ops run (e.g. a monitor) from the runs page — active ops jobs now link
+  to /ops/runs/… instead of /runs/….
+- **Command palette (⌘K / Ctrl-K)** — jump to any page, cluster (including
+  its parameter map / diagnostics), or recent run of either kind; arrow-key
+  navigation; also reachable from the sidebar search button.
+- **Breadcrumbs** on Cluster Ops subpages (Clusters / target / Parameter
+  map|Diagnostics).
+- **Table overflow fixes** — long CR paths, option names, and descriptions
+  now wrap inside their columns (sidecar catalogs use fixed column layout +
+  anywhere-wrapping); wide tables scroll inside their card instead of
+  punching through the page.
+
 ## Unreleased — Cluster Ops intelligence layer
 
 - **New: Parameter map** (`ops pg-params` + console page) — the full

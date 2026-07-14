@@ -4,6 +4,7 @@ import { api } from "../api";
 import type { KubeTarget, Me, PgParam, PgParamsCatalog } from "../types";
 import { openJobStream, CheckEvent } from "../lib/sse";
 import { CheckList } from "./ClusterOps";
+import { Crumbs } from "../components/Crumbs";
 
 interface SidecarOption {
   name: string;
@@ -263,6 +264,7 @@ export function KubeParams({ me }: { me: Me }) {
 
   return (
     <>
+      <Crumbs trail={[["Clusters", "/ops"], [kt.name, `/ops/targets/${targetId}`], ["Parameter map"]]} />
       <div className="toolbar">
         <h1>Parameter map — {kt.name}</h1>
         <span className="mono subtle">
@@ -515,40 +517,48 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
           <p className="subtle">Applied via <code>proxy.pgBouncer.config.global</code> in the CR —
             click-to-apply for these lands next phase; the exact path is shown per option.</p>
         )}
-        <table>
-          <thead><tr><th>Option</th><th>Current / default</th><th>Type</th><th>Allowed</th><th>Applies via</th><th /></tr></thead>
-          <tbody>
-            {visible.map((o) => {
-              const cur = kind === "pgbackrest" ? live[o.name] : undefined;
-              const draft = drafts[o.name] ?? staged[o.name] ?? cur ?? o.default ?? "";
-              return (
-                <tr key={o.name}>
-                  <td style={{ maxWidth: 380 }}>
-                    <span className="mono">{o.name}</span>
-                    {cur !== undefined && <span className="badge ok" style={{ marginLeft: 6 }}>CR</span>}
-                    <div className="subtle" style={{ fontSize: 12 }}>{o.description}</div>
-                  </td>
-                  <td className="mono">{cur ?? o.default ?? "—"}</td>
-                  <td className="mono">{o.type}</td>
-                  <td className="mono" style={{ fontSize: 11, maxWidth: 160 }}>
-                    {Array.isArray(o.allowed) ? o.allowed.join(" | ") : o.allowed ?? "—"}</td>
-                  <td className="mono" style={{ fontSize: 11, maxWidth: 220 }}>{pathFor(o)}</td>
-                  <td style={{ whiteSpace: "nowrap" }}>
-                    {stageable(o) && (
-                      <>
-                        <input className="mono" style={{ width: 90 }} value={draft}
-                               onChange={(e) => setDrafts((d) => ({ ...d, [o.name]: e.target.value }))} />{" "}
-                        <button className="btn-sm" disabled={!String(draft).trim()}
-                                onClick={() => setStaged((s) => ({ ...s, [o.name]: String(draft) }))}>
-                          stage</button>
-                      </>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        <div className="table-scroll">
+          <table style={{ tableLayout: "fixed", minWidth: 860 }}>
+            <colgroup>
+              <col style={{ width: "34%" }} /><col style={{ width: "12%" }} />
+              <col style={{ width: "10%" }} /><col style={{ width: "13%" }} />
+              <col style={{ width: "21%" }} /><col style={{ width: "10%" }} />
+            </colgroup>
+            <thead><tr><th>Option</th><th>Current / default</th><th>Type</th><th>Allowed</th><th>Applies via</th><th /></tr></thead>
+            <tbody>
+              {visible.map((o) => {
+                const cur = kind === "pgbackrest" ? live[o.name] : undefined;
+                const draft = drafts[o.name] ?? staged[o.name] ?? cur ?? o.default ?? "";
+                return (
+                  <tr key={o.name}>
+                    <td className="wrap-any">
+                      <span className="mono">{o.name}</span>
+                      {cur !== undefined && <span className="badge ok" style={{ marginLeft: 6 }}>CR</span>}
+                      <div className="cell-desc">{o.description}</div>
+                    </td>
+                    <td className="mono wrap-any">{cur ?? o.default ?? "—"}</td>
+                    <td className="mono wrap-any" style={{ fontSize: 12 }}>{o.type}</td>
+                    <td className="mono wrap-any" style={{ fontSize: 11 }}>
+                      {Array.isArray(o.allowed) ? o.allowed.join(" | ") : o.allowed ?? "—"}</td>
+                    <td className="mono wrap-any" style={{ fontSize: 11 }}>{pathFor(o)}</td>
+                    <td>
+                      {stageable(o) && (
+                        <>
+                          <input className="mono" style={{ width: "100%", maxWidth: 90 }} value={draft}
+                                 onChange={(e) => setDrafts((d) => ({ ...d, [o.name]: e.target.value }))} />
+                          <button className="btn-sm" disabled={!String(draft).trim()}
+                                  style={{ marginTop: 4 }}
+                                  onClick={() => setStaged((s) => ({ ...s, [o.name]: String(draft) }))}>
+                            stage</button>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     </>
   );
