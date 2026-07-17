@@ -98,6 +98,12 @@ def build_ops_spec_yaml(kt: sqlite3.Row, op: str, params: dict[str, Any],
     return yaml.safe_dump(doc, sort_keys=False)
 
 
+# One destructive operation per target at a time — every kind in this tuple
+# blocks (and is blocked by) every other while active on the same target.
+DESTRUCTIVE_KINDS = ("ops_cr_apply", "ops_scenario", "ops_backup",
+                     "ops_operate", "ops_pmm_enable", "ops_pmm_disable")
+
+
 def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
     # Imported here (not at module top) purely for the shared dependency
     # helpers; app.py imports this module inside create_app, at which point
@@ -411,7 +417,7 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         mutex: tuple[str, ...] = ()
         if not dry_run:
             _require_confirm(kt, payload)
-            mutex = ("ops_cr_apply", "ops_scenario", "ops_backup", "ops_operate")
+            mutex = DESTRUCTIVE_KINDS
         job_id = _enqueue_ops(conn, kt, "cr-apply", params,
                               payload.get("label") or "", user["username"], mutex)
         return JSONResponse({"job_id": job_id})
@@ -428,7 +434,7 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         params = _params(payload)
         job_id = _enqueue_ops(conn, kt, "backup", params,
                               payload.get("label") or "", user["username"],
-                              ("ops_backup", "ops_scenario", "ops_cr_apply", "ops_operate"))
+                              DESTRUCTIVE_KINDS)
         return JSONResponse({"job_id": job_id})
 
     @app.post("/api/kube-targets/{target_id}/scenario")
@@ -446,7 +452,7 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         params = _params(payload)
         job_id = _enqueue_ops(conn, kt, "scenario", params,
                               payload.get("label") or "", user["username"],
-                              ("ops_scenario", "ops_backup", "ops_cr_apply", "ops_operate"))
+                              DESTRUCTIVE_KINDS)
         return JSONResponse({"job_id": job_id})
 
     @app.post("/api/kube-targets/{target_id}/operate")
@@ -464,11 +470,103 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         mutex: tuple[str, ...] = ()
         if not dry_run:
             _require_confirm(kt, payload)
-            mutex = ("ops_operate", "ops_cr_apply", "ops_scenario", "ops_backup")
+            mutex = DESTRUCTIVE_KINDS
         job_id = _enqueue_ops(conn, kt, "operate", params,
                               payload.get("label") or
                               f"{params.get('operation', 'operate')}-{kt['name']}",
                               user["username"], mutex)
+        return JSONResponse({"job_id": job_id})
+
+    # ── PMM monitoring (enable = rolling restart, so destructive rules) ──
+
+    def _latest_pmm_enable_run(kt: sqlite3.Row) -> Optional[str]:
+        """Newest pmm-enable run for this target that still has its CR backup
+        — the default restore point for pmm-disable."""
+        ops_dir = cfg.results_dir / "ops"
+        if not ops_dir.exists():
+            return None
+        candidates = []
+        for d in ops_dir.iterdir():
+            if not d.name.startswith("pmm-enable-"):
+                continue
+            meta = read_meta(d)
+            if meta is None or (meta.get("target") or {}).get("name") != kt["name"]:
+                continue
+            if not (d / "backup" / f"cr-{kt['cr_name']}.yaml").exists():
+                continue
+            candidates.append((meta.get("created_utc") or "", d.name))
+        return max(candidates)[1] if candidates else None
+
+    @app.post("/api/kube-targets/{target_id}/pmm/enable")
+    def ops_pmm_enable(target_id: int, request: Request, payload: dict,
+                       conn: sqlite3.Connection = Depends(get_conn),
+                       user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        """Enable PMM 3.x monitoring end to end. Rolls every instance pod, so
+        it follows the destructive contract: typed confirmation + mutex (a
+        dry-run needs neither). The token never transits the web tier — the
+        worker reads $PGB_PMM_TOKEN from its own environment."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        params = _params(payload)
+        if not str(params.get("server_host") or "").strip():
+            raise HTTPException(400, "params.server_host is required "
+                                     "(the PMM server address)")
+        dry_run = bool(params.get("dry_run"))
+        mutex: tuple[str, ...] = ()
+        if not dry_run:
+            _require_confirm(kt, payload)
+            mutex = DESTRUCTIVE_KINDS
+        job_id = _enqueue_ops(conn, kt, "pmm-enable", params,
+                              payload.get("label") or f"pmm-enable-{kt['name']}",
+                              user["username"], mutex)
+        return JSONResponse({"job_id": job_id})
+
+    @app.post("/api/kube-targets/{target_id}/pmm/status")
+    def ops_pmm_status(target_id: int, request: Request, payload: dict,
+                       conn: sqlite3.Connection = Depends(get_conn),
+                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """PMM validation report only — zero cluster mutations, so operator
+        role and no confirmation/mutex (like diag)."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        params = _params(payload)
+        if not str(params.get("server_host") or "").strip():
+            raise HTTPException(400, "params.server_host is required "
+                                     "(the PMM server address)")
+        job_id = _enqueue_ops(conn, kt, "pmm-status", params,
+                              payload.get("label") or f"pmm-status-{kt['name']}",
+                              user["username"])
+        return JSONResponse({"job_id": job_id})
+
+    @app.post("/api/kube-targets/{target_id}/pmm/disable")
+    def ops_pmm_disable(target_id: int, request: Request, payload: dict,
+                        conn: sqlite3.Connection = Depends(get_conn),
+                        user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        """Restore the CR backed up by a pmm-enable run + delete the secret.
+        rollback_of defaults to the newest pmm-enable run with a backup."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        params = _params(payload)
+        rollback_of = str(params.get("rollback_of") or "").strip()
+        if rollback_of:
+            _safe_segment(rollback_of)          # raises 400 on traversal shapes
+        else:
+            src = _latest_pmm_enable_run(kt)
+            if not src:
+                raise HTTPException(400, "no pmm-enable run with a CR backup "
+                                         "found for this target — nothing to "
+                                         "restore")
+            params["rollback_of"] = src
+        _require_confirm(kt, payload)
+        job_id = _enqueue_ops(conn, kt, "pmm-disable", params,
+                              payload.get("label") or f"pmm-disable-{kt['name']}",
+                              user["username"], DESTRUCTIVE_KINDS)
         return JSONResponse({"job_id": job_id})
 
     @app.get("/api/kube-targets/{target_id}/health-history")

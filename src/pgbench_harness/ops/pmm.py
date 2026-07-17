@@ -61,7 +61,8 @@ def _cfg(params: dict[str, Any]) -> dict[str, Any]:
                             or "docker.io/percona/pmm-client:3.8.1"),
         "query_source": str(params.get("query_source") or "pgstatmonitor"),
         "extension": str(params.get("extension") or "pg_stat_monitor"),
-        "base_libs": str(params.get("base_libs") or "pgaudit"),
+        # empty = auto-detect the cluster's existing libraries and preserve them
+        "base_libs": str(params.get("base_libs") or ""),
         "database": str(params.get("database") or "postgres"),
         "secret_name": str(params.get("secret_name") or ""),
         "rollout_timeout_s": float(params.get("rollout_timeout_s") or 600),
@@ -72,7 +73,9 @@ def _cfg(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _token(run: OpsRun, required: bool) -> Optional[str]:
-    token = os.environ.get(TOKEN_ENV, "")
+    # strip: a pasted token with a trailing newline would otherwise corrupt
+    # the Bearer header AND the secret's stringData
+    token = os.environ.get(TOKEN_ENV, "").strip()
     if not token:
         if required:
             run.event("preflight", f"ABORT: {TOKEN_ENV} is not set",
@@ -84,6 +87,54 @@ def _token(run: OpsRun, required: bool) -> Optional[str]:
         run.event("preflight", "token does not start with 'glsa_'",
                   "PMM3 service-account tokens normally do — continuing anyway")
     return token
+
+
+def _merge_spl(existing: str, extension: str) -> str:
+    """Merge the PMM extension into the cluster's existing preload libraries:
+    keep every existing library in order, dedupe, append the extension if
+    missing. Never drops a library the cluster already loads."""
+    libs: list[str] = []
+    for part in (existing or "").split(","):
+        p = part.strip()
+        if p and p not in libs:
+            libs.append(p)
+    if not libs:
+        libs = ["pgaudit"]                # the operator's own baseline
+    if extension not in libs:
+        libs.append(extension)
+    return ",".join(libs)
+
+
+def _current_spl(kube: Kube, cr: dict[str, Any], leader: str,
+                 database: str) -> tuple[str, str]:
+    """(value, source) of the cluster's current shared_preload_libraries.
+    The CR spec is the declared intent and wins; live runtime on the leader is
+    the fallback for clusters that never declared it (operator default)."""
+    cr_spl = str((((((cr.get("spec") or {}).get("patroni") or {})
+                    .get("dynamicConfiguration") or {}).get("postgresql") or {})
+                  .get("parameters") or {}).get("shared_preload_libraries", ""))
+    if cr_spl.strip():
+        return cr_spl.strip(), "CR spec"
+    if leader:
+        rt = _psql(kube, leader, database, "SHOW shared_preload_libraries;")
+        if rt:
+            return rt, "runtime (leader)"
+    return "", "operator default"
+
+
+def _resolve_spl(kube: Kube, run: OpsRun, cfg: dict[str, Any],
+                 cr: dict[str, Any], leader: str) -> str:
+    """The shared_preload_libraries value the patch will set — existing
+    libraries auto-detected and preserved unless params.base_libs overrides."""
+    if cfg["base_libs"]:
+        cur, src = cfg["base_libs"], "params.base_libs (explicit override)"
+    else:
+        cur, src = _current_spl(kube, cr, leader, cfg["database"])
+    spl = _merge_spl(cur, cfg["extension"])
+    run.event("preflight", f"shared_preload_libraries -> {spl}",
+              f"existing libraries ({src}: '{cur or 'none declared'}') are "
+              f"preserved; {cfg['extension']} appended if missing")
+    return spl
 
 
 def _instance_pods(kube: Kube, cr_name: str) -> list[dict[str, Any]]:
@@ -177,6 +228,39 @@ def _wait_rollout(kube: Kube, run: OpsRun, cr_name: str, cfg: dict[str, Any],
             run.event("rollout", f"TIMEOUT waiting for rollout ({what})",
                       detail + " — continuing to verification (never leaving "
                       "the cluster half-configured silently)")
+            return False
+        time.sleep(cfg["poll_s"])
+
+
+def _wait_pod_recreated(kube: Kube, run: OpsRun, pod: str, old_uid: str,
+                        cfg: dict[str, Any], secret_name: str) -> bool:
+    """Bounce wait for ONE named pod: done only when the pod exists again,
+    carries a NEW uid (compared to just before the delete — not the stale
+    pre-patch snapshot), matches the patched spec, and is Ready. An absent
+    pod counts as pending, never as done."""
+    deadline = time.monotonic() + cfg["rollout_timeout_s"]
+    last = ""
+    while True:
+        raw = _pod_raw(kube, pod)
+        if raw is None:
+            state = "gone (operator recreating)"
+        else:
+            uid = str((raw.get("metadata") or {}).get("uid", ""))
+            if old_uid and uid == old_uid:
+                state = "old incarnation still terminating"
+            elif not _pod_spec_matches(raw, cfg, secret_name):
+                state = "recreated but old spec"
+            elif not _pod_ready(raw):
+                state = "recreated, not ready yet"
+            else:
+                run.event("bounce", f"{pod} recreated and Ready")
+                return True
+        if state != last:
+            run.status_update(phase=f"bounce ({pod})", detail=state)
+            last = state
+        if time.monotonic() >= deadline:
+            run.event("bounce", f"TIMEOUT waiting for {pod} to come back",
+                      state + " — continuing to validation")
             return False
         time.sleep(cfg["poll_s"])
 
@@ -288,6 +372,10 @@ def _inventory_check(run: OpsRun, cfg: dict[str, Any], token: Optional[str],
         run.event("inventory", "skipped: no token available")
         return out
     host = cfg["server_host"]
+    if "://" in host and not host.startswith(("http://", "https://")):
+        run.event("inventory", "skipped: server_host has a non-HTTP scheme",
+                  host.split("://", 1)[0] + ":// is not queryable")
+        return out
     base = host if "://" in host else f"https://{host}"
     url = f"{base.rstrip('/')}/v1/inventory/services?service_type=SERVICE_TYPE_POSTGRESQL_SERVICE"
     ctx = ssl.create_default_context()
@@ -323,14 +411,15 @@ def _validation(kube: Kube, run: OpsRun, t: Any, cfg: dict[str, Any],
     mode = _verify_pmm3_mode(kube, run, leader, cfg)
 
     qan_global = False
-    deadline = time.monotonic() + (cfg["qan_timeout_s"] if wait_for_qan else 1)
+    deadline = time.monotonic() + (cfg["qan_timeout_s"] if wait_for_qan else 0)
     while True:
         qan_global = any(_qan_seen(kube, p, cfg["query_source"]) for p in instances)
-        if qan_global or time.monotonic() >= deadline:
-            break
+        remaining = deadline - time.monotonic()
+        if qan_global or remaining <= 0:
+            break                       # status runs sample once — never sleep
         run.status_update(phase="waiting for QAN agents",
                           detail=f"up to {cfg['qan_timeout_s']:.0f}s")
-        time.sleep(min(10.0, cfg["poll_s"] * 2))
+        time.sleep(min(10.0, cfg["poll_s"] * 2, remaining))
 
     cr = kube.cluster_cr(t.cr_kind, t.cr_name)
     cr_spl = str((((((cr.get("spec") or {}).get("patroni") or {})
@@ -338,8 +427,10 @@ def _validation(kube: Kube, run: OpsRun, t: Any, cfg: dict[str, Any],
                   .get("parameters") or {}).get("shared_preload_libraries", ""))
     rt_spl = _psql(kube, leader, cfg["database"],
                    "SHOW shared_preload_libraries;") or ""
-    want = [x.strip() for x in f"{cfg['base_libs']},{cfg['extension']}".split(",")
-            if x.strip()]
+    # every library the CR declares must be loaded at runtime (after an
+    # enable, the CR carries the merged preserved+extension list)
+    want_src = cr_spl if cr_spl.strip() else cfg["extension"]
+    want = [x.strip() for x in want_src.split(",") if x.strip()]
     libs = {lib: lib in rt_spl for lib in want}
     if cr_spl and rt_spl and cr_spl != rt_spl:
         run.event("verify", "runtime shared_preload_libraries differs from the "
@@ -462,19 +553,23 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
                       f"query-source '{cfg['query_source']}' may not match",
                       "expected pairing: pgstatmonitor<->pg_stat_monitor, "
                       "pgstatements<->pg_stat_statements")
-        kube.cluster_cr(t.cr_kind, t.cr_name)        # raises if missing
+        cr = kube.cluster_cr(t.cr_kind, t.cr_name)   # raises if missing
         run.event("preflight", f"found {t.cr_kind}/{t.cr_name}")
 
-        spl = f"{cfg['base_libs']},{cfg['extension']}"
-        patch = {"spec": {
-            "pmm": {"enabled": True, "image": cfg["client_image"],
-                    "imagePullPolicy": "IfNotPresent",
-                    "querySource": cfg["query_source"],
-                    "secret": secret_name, "serverHost": cfg["server_host"]},
-            "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {
-                "shared_preload_libraries": spl}}}}}}
+        def build_patch(spl: str) -> dict[str, Any]:
+            return {"spec": {
+                "pmm": {"enabled": True, "image": cfg["client_image"],
+                        "imagePullPolicy": "IfNotPresent",
+                        "querySource": cfg["query_source"],
+                        "secret": secret_name, "serverHost": cfg["server_host"]},
+                "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {
+                    "shared_preload_libraries": spl}}}}}}
 
         if dry_run:
+            # no exec in a dry-run: detect from the CR (re-checked live,
+            # including the leader's runtime value, at apply time)
+            spl = _resolve_spl(kube, run, cfg, cr, leader="")
+            patch = build_patch(spl)
             run.event("dry-run", "secret", f"kubectl apply -f - <<< "
                       f"'{{\"kind\":\"Secret\",\"metadata\":{{\"name\":\"{secret_name}\"}},"
                       f"\"stringData\":{{\"PMM_SERVER_TOKEN\":\"<token>\"}}}}'")
@@ -493,6 +588,11 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
         # 2. pre-change topology (resilient)
         instances, leader, _view = _discover(kube, run, t.cr_name, cfg,
                                              "pre-change")
+
+        # existing preload libraries: auto-detected (CR, then live runtime on
+        # the leader) and PRESERVED — the patch appends, never replaces
+        spl = _resolve_spl(kube, run, cfg, cr, leader)
+        patch = build_patch(spl)
 
         # 3. state backup before any mutation
         _backup_state(kube, run, t, cfg, secret_name, leader, instances)
@@ -544,14 +644,17 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
         run.event("extension", f"{cfg['extension']} live on primary "
                   f"({cnt} rows)")
 
-        # 10. HA-preserving sidecar bounce so QAN re-registers
-        for pod in list(instances):
-            run.event("bounce", f"deleting pod {pod} (operator recreates)")
+        # 10. HA-preserving sidecar bounce so QAN re-registers: replicas
+        # first, the leader LAST (only after every replica is back and Ready)
+        bounce_order = [p for p in instances if p != leader] \
+            + ([leader] if leader in instances else [])
+        for pod in bounce_order:
+            raw = _pod_raw(kube, pod)
+            old_uid = str(((raw or {}).get("metadata") or {}).get("uid", ""))
+            run.event("bounce", f"deleting pod {pod} (operator recreates)",
+                      "leader — bounced last" if pod == leader else "replica")
             kube.run(["delete", "pod", pod, "--wait=false"])
-            time.sleep(min(5.0, cfg["poll_s"]))
-            _wait_rollout(kube, run, t.cr_name, cfg, secret_name,
-                          pre_uids={pod: pre_uids.get(pod, "gone")},
-                          pre_matched={pod: False}, what=f"after {pod}")
+            _wait_pod_recreated(kube, run, pod, old_uid, cfg, secret_name)
 
         # post-bounce re-discovery, then 11+12: validation + report
         results, healthy = _validation(kube, run, t, cfg, secret_name, token,
@@ -598,6 +701,32 @@ def run_pmm_status(spec: OpsSpec, results_dir: Path) -> int:
         run.event("error", "kubectl error", str(exc)[:300])
         run.finalize("failed", headline={"op": "pmm-status"}, error=str(exc)[:300])
         return EXIT_FAILED
+    except Exception as exc:  # noqa: BLE001 — the run must always finalize
+        run.event("error", "unexpected error", str(exc)[:300])
+        run.finalize("failed", headline={"op": "pmm-status"}, error=str(exc)[:200])
+        return EXIT_FAILED
+
+
+def _sanitize_cr_manifest(text: str) -> str:
+    """Prepare a backed-up CR dump for re-apply: strip the server-owned fields
+    (resourceVersion, uid, creationTimestamp, generation, managedFields) and
+    status — applying them back can be rejected as a conflict. Emitted as JSON
+    (valid YAML), so kubectl takes it on stdin unchanged."""
+    import yaml as _yaml
+    doc = _yaml.safe_load(text)
+    if not isinstance(doc, dict):
+        raise HarnessishError(f"CR backup is not a mapping (got {type(doc).__name__})")
+    meta = doc.get("metadata") or {}
+    for key in ("resourceVersion", "uid", "creationTimestamp", "generation",
+                "managedFields", "ownerReferences"):
+        meta.pop(key, None)
+    doc["metadata"] = meta
+    doc.pop("status", None)
+    return json.dumps(doc)
+
+
+class HarnessishError(Exception):
+    """Local, always-finalized failure inside the pmm runners."""
 
 
 def run_pmm_disable(spec: OpsSpec, results_dir: Path) -> int:
@@ -613,6 +742,14 @@ def run_pmm_disable(spec: OpsSpec, results_dir: Path) -> int:
     kube = Kube(context=t.context, namespace=t.namespace)
     try:
         src_id = str(params.get("rollback_of") or "")
+        # the run id becomes a path segment — refuse anything that could
+        # escape results/ops/ (defense in depth; the route validates too)
+        if "/" in src_id or "\\" in src_id or ".." in src_id:
+            run.event("preflight", "ABORT: rollback_of is not a valid run id",
+                      src_id[:120])
+            run.finalize("aborted", headline={"op": "pmm-disable",
+                                              "reason": "bad-rollback-id"})
+            return EXIT_FAILED
         src_dir = results_dir / "ops" / src_id
         cr_backup = src_dir / "backup" / f"cr-{t.cr_name}.yaml"
         if not src_id or read_meta(src_dir) is None or not cr_backup.exists():
@@ -624,24 +761,50 @@ def run_pmm_disable(spec: OpsSpec, results_dir: Path) -> int:
             return EXIT_FAILED
         if bool(params.get("dry_run")):
             run.event("dry-run", "restore CR",
-                      f"kubectl apply -f {cr_backup}")
+                      f"kubectl apply -f {cr_backup} (server-owned metadata "
+                      "+ status stripped)")
             run.event("dry-run", "delete secret",
                       f"kubectl delete secret {secret_name}")
             run.finalize("complete", headline={"op": "pmm-disable",
                                                "dry_run": True})
             return EXIT_OK
-        kube.run(["apply", "-f", "-"],
-                 input_text=cr_backup.read_text(encoding="utf-8"), check=True)
-        run.event("restore", f"CR restored from {src_id}/backup/")
+        manifest = _sanitize_cr_manifest(cr_backup.read_text(encoding="utf-8"))
+        kube.run(["apply", "-f", "-"], input_text=manifest, check=True)
+        run.event("restore", f"CR restored from {src_id}/backup/",
+                  "server-owned metadata + status stripped before apply")
         res = kube.run(["delete", "secret", secret_name])
         run.event("secret", f"secret {secret_name} "
                   + ("deleted" if res.ok else "not present"))
-        cfg["rollout_timeout_s"] = min(cfg["rollout_timeout_s"], 300)
-        run.status_update(phase="waiting for the operator to reconcile")
-        run.finalize("complete", headline={"op": "pmm-disable",
-                                           "restored_from": src_id})
-        return EXIT_OK
+        # best-effort: watch the operator shed the pmm-client sidecars so the
+        # run reports what actually happened (timeout is a warning, not a fail)
+        deadline = time.monotonic() + min(cfg["rollout_timeout_s"], 300)
+        shed = False
+        while time.monotonic() < deadline:
+            pods = _instance_pods(kube, t.cr_name)
+            carrying = [p["name"] for p in pods
+                        if "pmm-client" in (p.get("containers") or [])]
+            if pods and not carrying:
+                shed = True
+                run.event("rollout", f"all {len(pods)} instance pods are back "
+                          "on the pre-PMM spec")
+                break
+            run.status_update(phase="waiting for the operator to reconcile",
+                              detail=f"{len(carrying)} pod(s) still carry "
+                                     "the pmm-client sidecar")
+            time.sleep(cfg["poll_s"])
+        if not shed:
+            run.event("rollout", "pods still carried the sidecar at timeout",
+                      "the operator may still be rolling — re-check topology "
+                      "in a minute")
+        run.finalize("complete" if shed else "warning",
+                     headline={"op": "pmm-disable", "restored_from": src_id,
+                               "reconciled": shed})
+        return EXIT_OK if shed else EXIT_WARNING
     except KubeError as exc:
         run.event("error", "kubectl error", str(exc)[:300])
         run.finalize("failed", headline={"op": "pmm-disable"}, error=str(exc)[:300])
+        return EXIT_FAILED
+    except Exception as exc:  # noqa: BLE001 — the run must always finalize
+        run.event("error", "unexpected error", str(exc)[:300])
+        run.finalize("failed", headline={"op": "pmm-disable"}, error=str(exc)[:200])
         return EXIT_FAILED

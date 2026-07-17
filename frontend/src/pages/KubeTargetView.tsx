@@ -103,6 +103,9 @@ export function KubeTargetView({ me }: { me: Me }) {
   const [scBaseline, setScBaseline] = useState(30);
   const [scSettle, setScSettle] = useState(180);
   const [monInterval, setMonInterval] = useState(60);
+  const [pmmHost, setPmmHost] = useState(
+    () => localStorage.getItem(`pmm-host-${targetId}`) ?? "");
+  const [pmmSource, setPmmSource] = useState<"pgstatmonitor" | "pgstatements">("pgstatmonitor");
 
   const load = useCallback(() => {
     api.get<KubeTarget>(`/api/kube-targets/${targetId}`).then(setKt).catch((e) => setErr(e.message));
@@ -547,6 +550,74 @@ export function KubeTargetView({ me }: { me: Me }) {
         </div>
       )}
 
+      {canOp && (() => {
+        const pmmExt = pmmSource === "pgstatmonitor" ? "pg_stat_monitor" : "pg_stat_statements";
+        const instPods = topo?.pods?.instances ?? [];
+        const pmmPods = instPods.filter((p) => (p.containers ?? []).includes("pmm-client")).length;
+        const lastPmm = runs.find((r) => ["pmm-enable", "pmm-status", "pmm-disable"].includes(r.kind));
+        const pmmParams = { server_host: pmmHost.trim(), query_source: pmmSource, extension: pmmExt };
+        return (
+          <div className="card" style={{ marginTop: 16 }}>
+            <div className="card-head"><h2>PMM monitoring</h2>
+              {instPods.length > 0 && (
+                <span className={`badge ${pmmPods === instPods.length ? "ok" : pmmPods > 0 ? "running" : "failed"}`}>
+                  {pmmPods === instPods.length ? "✓ sidecar on all pods"
+                    : pmmPods > 0 ? `sidecar on ${pmmPods}/${instPods.length} pods` : "not enabled"}
+                </span>
+              )}
+              {lastPmm && (
+                <Link className="mono subtle" style={{ fontSize: 12, marginLeft: 8 }}
+                      to={`/ops/runs/${lastPmm.op_run_id}`}>
+                  last: {lastPmm.kind} · {lastPmm.status}</Link>
+              )}
+            </div>
+            <p className="subtle" style={{ marginTop: 0 }}>
+              One-click Percona Monitoring &amp; Management 3.x: state backup → PMM3 secret →
+              CR patch → rolling restart → <code>CREATE EXTENSION {pmmExt}</code> on the primary →
+              validation report + server-side inventory check. Existing{" "}
+              <code>shared_preload_libraries</code> are auto-detected and preserved — the extension
+              is appended, never a replacement. The API token is read from the worker&apos;s
+              environment (<code>PGB_PMM_TOKEN</code>, see OPERATIONS.md “Worker secrets”) — it is
+              never entered or stored here.
+            </p>
+            <div className="row">
+              <div className="field" style={{ minWidth: 260 }}><label>PMM server host</label>
+                <input className="mono" value={pmmHost} placeholder="pmm.example.com"
+                       onChange={(e) => {
+                         setPmmHost(e.target.value);
+                         localStorage.setItem(`pmm-host-${targetId}`, e.target.value);
+                       }} /></div>
+              <div className="field"><label>Query source (extension is paired automatically)</label>
+                <select value={pmmSource} onChange={(e) => setPmmSource(e.target.value as typeof pmmSource)}>
+                  <option value="pgstatmonitor">pg_stat_monitor (richer QAN — recommended)</option>
+                  <option value="pgstatements">pg_stat_statements (built-in)</option>
+                </select></div>
+            </div>
+            <button disabled={!pmmHost.trim()} onClick={() =>
+              launch("pmm/status", { params: pmmParams })}>
+              Check status (read-only)</button>{" "}
+            {isAdmin && <>
+              <button disabled={!pmmHost.trim()} onClick={() =>
+                launch("pmm/enable", { params: { ...pmmParams, dry_run: true } })}>
+                Dry-run (show plan)</button>{" "}
+              <button className="primary" disabled={!pmmHost.trim()} onClick={() =>
+                launch("pmm/enable", { confirm, params: pmmParams })}>
+                Enable PMM (rolls all pods)</button>{" "}
+              <button className="danger" onClick={() =>
+                launch("pmm/disable", { confirm, params: {} })}>
+                Disable (restore pre-PMM CR)</button>
+            </>}
+            {isAdmin && (
+              <p className="subtle" style={{ marginTop: 6 }}>
+                Enable/disable are destructive (every instance pod restarts, HA-preserving) —
+                type the cluster name in the Operations box above to confirm. Disable restores
+                the CR snapshot taken by the latest enable run.
+              </p>
+            )}
+          </div>
+        );
+      })()}
+
       <div className="card" style={{ marginTop: 16 }}>
         <div className="card-head"><h2>Op runs on this target</h2>
           <div className="spacer" /><Link className="btn" to="/ops/runs">all ops runs →</Link></div>
@@ -578,6 +649,14 @@ export function OpsRunsTable({ runs, selectable, selected, onToggle }: {
               (h.pending_restart?.length ?? 0) > 0 ? "⚠ pending_restart" : ""].filter(Boolean).join(" · ");
     }
     if (r.kind === "monitor") return h.cycles ? `${h.cycles} cycles` : "";
+    if (r.kind.startsWith("pmm-")) {
+      return [h.dry_run ? "dry-run" : "",
+              h.qan != null ? (h.qan ? "QAN ✓" : "QAN pending") : "",
+              h.inventory_nodes != null ? `${h.inventory_nodes} in inventory` : "",
+              h.healthy === false ? "⚠ see report" : "",
+              h.restored_from ? `restored from ${String(h.restored_from).slice(0, 28)}…` : "",
+              h.reason ? String(h.reason) : ""].filter(Boolean).join(" · ");
+    }
     return "";
   };
   return (

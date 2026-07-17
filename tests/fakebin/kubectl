@@ -60,7 +60,10 @@ def default_state():
         "cr": {
             "apiVersion": "pgv2.percona.com/v2", "kind": "PerconaPGCluster",
             "metadata": {"name": "cluster1", "namespace": "percona",
-                         "generation": 3},
+                         "generation": 3, "resourceVersion": "424242",
+                         "uid": "cr-uid-0001",
+                         "creationTimestamp": "2026-07-01T00:00:00Z"},
+            "status": {"state": "ready", "postgres": {"ready": 3, "size": 3}},
             "spec": {
                 "postgresVersion": 18,
                 "instances": [{"name": "instance1", "replicas": 3}],

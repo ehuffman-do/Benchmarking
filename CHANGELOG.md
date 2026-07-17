@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — PMM bug bash (round 3): seven fixes
+
+- **Bounce is now genuinely HA-preserving**: the sidecar bounce deletes
+  replicas first and the leader LAST (only after every replica is back),
+  and each pod's wait compares against the UID captured *just before its
+  delete* — the old wait compared against the stale pre-patch snapshot and
+  treated an absent (deleted) pod as done, so it could pass before the pod
+  was even recreated.
+- **pmm-disable restore is conflict-safe**: the backed-up CR is sanitized
+  before re-apply (server-owned metadata — resourceVersion, uid,
+  creationTimestamp, generation, managedFields — and status stripped), and
+  the run now actually watches the operator shed the pmm-client sidecars
+  (headline `reconciled`; timeout = warning) instead of printing a wait it
+  never performed.
+- **rollback_of path traversal closed** at both layers: the web route
+  rejects ids with separators/dots (400) and the runner independently
+  aborts (`bad-rollback-id`) — a crafted id can no longer point the restore
+  at arbitrary filesystem paths.
+- **Token hygiene**: `PGB_PMM_TOKEN` is stripped of surrounding whitespace
+  (a pasted trailing newline used to corrupt the Bearer header AND the
+  secret) ; the inventory check refuses non-HTTP(S) `server_host` schemes
+  (e.g. `file://`) instead of passing them to urlopen.
+- **pmm-status no longer sleeps**: the QAN wait loop slept up to 10 s even
+  in no-wait mode — every status run paid it; now capped by the actual
+  remaining deadline (zero for status).
+- **Crash-proof finalization**: pmm-status/pmm-disable now catch unexpected
+  exceptions like pmm-enable does — a stray error can no longer strand a
+  run in "running" forever.
+- **Operator UX**: the PMM Dry-run button is admin-only (the enable route
+  always was, so operators got a confusing 403). Regression tests for all
+  of the above, plus double-enable idempotence and the cross-op 409 mutex
+  (a queued PMM enable blocks a backup and vice versa). Suite: 284.
+
 ## Unreleased — PMM 3.x enablement as a first-class operation
 
 - **New: `ops pmm-enable`** — takes a Percona PostgreSQL cluster from
@@ -34,6 +67,21 @@
   section (`server_host`, optional `service_name`); sweep and soak reports
   then include PMM deep links (instances overview + Query Analytics) scoped
   to the run's exact time window. Specs without `pmm:` are byte-identical.
+- **PMM from the console** — new "PMM monitoring" panel on the cluster page:
+  server host + query source (extension paired automatically), dry-run,
+  one-click Enable (admin + typed cluster-name confirmation + the shared
+  one-destructive-op-per-target mutex), read-only Check status (operator),
+  and Disable (auto-restores the CR snapshot from the newest enable run).
+  The sidecar state badge comes from the last topology snapshot; the token
+  stays worker-side only (`PGB_PMM_TOKEN`) and never transits the browser.
+- **Preload libraries are preserved, not replaced**: `pmm-enable` now
+  auto-detects the cluster's existing `shared_preload_libraries` (CR spec
+  first, live runtime on the leader as fallback) and appends the PMM
+  extension with order-preserving dedupe — a cluster running
+  `pgaudit,pgvector,pg_cron` ends up with
+  `pgaudit,pgvector,pg_cron,pg_stat_monitor`, and the validation report now
+  verifies every preserved library, not just the extension.
+  `params.base_libs` remains as an explicit override.
 - **Deploy: worker secrets file** — `deploy.sh` now creates
   `/etc/pgbench-harness.secrets.env` (0600, root-only, created once and
   never overwritten on update) and the worker unit loads it via an optional

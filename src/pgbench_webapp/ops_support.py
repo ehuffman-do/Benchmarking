@@ -377,7 +377,8 @@ def maybe_enqueue_auto_health(cfg: Config, conn: sqlite3.Connection) -> int:
         # transition alerts. Wait for the destructive op to finish.
         if queries.active_ops_jobs(conn, kt["id"],
                                    ("ops_health", "ops_scenario", "ops_backup",
-                                    "ops_cr_apply", "ops_operate")):
+                                    "ops_cr_apply", "ops_operate",
+                                    "ops_pmm_enable", "ops_pmm_disable")):
             continue
         from pgbench_webapp.ops_routes import build_ops_spec_yaml
         spec_yaml = build_ops_spec_yaml(kt, "health", {},

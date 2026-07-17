@@ -189,6 +189,7 @@ export interface PodInfo {
   ready: string;
   node: string;
   pod_ip: string;
+  containers?: string[];
 }
 
 export interface OpsRun {
