@@ -500,3 +500,23 @@ def test_live_pg_sampler_writes_timeseries(fake_env, spec_file, tmp_path) -> Non
     assert float(cols["commits_s"]) > 0 and float(cols["tup_inserted_s"]) > 0
     assert float(cols["blks_read_s"]) >= 0 and float(cols["ckpt_write_ms_s"]) >= 0
     assert cols["repl_replay_lag_s"] == ""           # no replica -> blank, not 0
+
+
+def test_report_links_to_pmm_when_spec_has_pmm_section(
+        fake_env, results_dir, tmp_path) -> None:
+    """A run spec with a pmm: section gets PMM deep links in report.html,
+    scoped to the run's window (epoch-ms from/to on Grafana dashboard URLs)."""
+    import yaml
+
+    from conftest import make_spec_doc
+    doc = make_spec_doc()
+    doc["pmm"] = {"server_host": "pmm.example.com", "service_name": "cluster1-db"}
+    spec_path = tmp_path / "run-pmm.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("run", "--spec", str(spec_path),
+                   "--results-dir", str(results_dir)) == 0
+    html = (find_run_dir(results_dir) / "report.html").read_text()
+    assert "PMM — observation layer" in html
+    assert "https://pmm.example.com/graph/d/postgresql-instance-overview/" in html
+    assert "https://pmm.example.com/graph/d/pmm-qan/pmm-query-analytics?from=" in html
+    assert "var-service_name=cluster1-db" in html

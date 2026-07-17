@@ -101,6 +101,16 @@ class Soak:
 
 
 @dataclass(frozen=True)
+class Pmm:
+    """PMM linkage for a run: where the observation layer lives. Only the
+    server address — the report deep-links into PMM scoped to the run's time
+    window. No token here (tokens are env-only, ops-side)."""
+
+    server_host: str
+    service_name: str = ""            # optional: pre-scope QAN to one service
+
+
+@dataclass(frozen=True)
 class Spec:
     run: RunMeta
     target: Target
@@ -109,6 +119,7 @@ class Spec:
     capture: Capture
     report: ReportCfg
     soak: Optional[Soak] = None
+    pmm: Optional[Pmm] = None
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
     @property
@@ -370,7 +381,7 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
     """Validate a parsed YAML document and return a typed :class:`Spec`."""
     if not isinstance(doc, dict):
         raise SpecError(f"{source}: top level of the spec must be a mapping")
-    known = {"run", "target", "workload", "sweep", "capture", "report", "soak"}
+    known = {"run", "target", "workload", "sweep", "capture", "report", "soak", "pmm"}
     unknown = set(doc) - known
     if unknown:
         hint = ""
@@ -389,6 +400,15 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
                         "(resilience) section")
     sweep = _parse_sweep(_section(doc, "sweep")) if has_sweep else None
     soak = _parse_soak(_section(doc, "soak")) if has_soak else None
+    pmm = None
+    if "pmm" in doc:
+        psec = _section(doc, "pmm")
+        _check_keys(psec, "pmm", {"server_host"}, {"service_name"})
+        host = _typed(psec, "pmm", "server_host", str)
+        if not host.strip():
+            raise SpecError("'pmm.server_host' must be a non-empty string")
+        pmm = Pmm(server_host=host.strip(),
+                  service_name=_typed(psec, "pmm", "service_name", str, ""))
     return Spec(
         run=_parse_run(_section(doc, "run")),
         target=_parse_target(_section(doc, "target")),
@@ -397,6 +417,7 @@ def parse_spec(doc: Any, source: str = "<spec>") -> Spec:
         capture=_parse_capture(doc.get("capture") or {}),
         report=_parse_report(doc.get("report") or {}, sweep),
         soak=soak,
+        pmm=pmm,
         raw=doc,
     )
 

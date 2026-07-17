@@ -47,6 +47,12 @@ def add_ops_parser(sub: argparse._SubParsersAction) -> None:
                           help="day-2 operation: restart|switchover|failover|"
                                "scale|resize|schedules")
     spec_args(opr)
+    for verb, hlp in (("pmm-enable", "enable PMM 3.x monitoring end to end "
+                                     f"(token from $PGB_PMM_TOKEN)"),
+                      ("pmm-status", "PMM validation report only, no mutations"),
+                      ("pmm-disable", "restore the pre-enablement CR + delete "
+                                      "the PMM secret")):
+        spec_args(osub.add_parser(verb, help=hlp))
     st = osub.add_parser("stitch", help="(re)stitch a scenario run dir from raw captures")
     st.add_argument("--run-dir", required=True, type=Path)
     rp = osub.add_parser("report", help="(re)generate the report for an op run dir")
@@ -102,4 +108,13 @@ def cmd_ops(args: argparse.Namespace) -> int:
     if cmd == "operate":
         from pgbench_harness.ops.operate import run_operate
         return run_operate(spec, args.results_dir)
+    if cmd == "pmm-enable":
+        from pgbench_harness.ops.pmm import run_pmm_enable
+        return run_pmm_enable(spec, args.results_dir)
+    if cmd == "pmm-status":
+        from pgbench_harness.ops.pmm import run_pmm_status
+        return run_pmm_status(spec, args.results_dir)
+    if cmd == "pmm-disable":
+        from pgbench_harness.ops.pmm import run_pmm_disable
+        return run_pmm_disable(spec, args.results_dir)
     raise AssertionError(f"unhandled ops command {cmd}")

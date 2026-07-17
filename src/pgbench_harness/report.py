@@ -336,6 +336,36 @@ def _read_env(env_dir: Path, name: str) -> str:
     return p.read_text(encoding="utf-8").strip() if p.exists() else "n/a"
 
 
+def build_pmm_links(spec: Spec, start_iso: str, end_iso: str):
+    """PMM UI deep links scoped to the run's window. Grafana (PMM3's UI) takes
+    epoch-milliseconds ``from``/``to`` query params on /graph/d/... URLs."""
+    if spec.pmm is None:
+        return None
+    import time as _time
+    from datetime import datetime, timezone
+
+    def ms(iso: str, fallback: int) -> int:
+        try:
+            return int(datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")
+                       .replace(tzinfo=timezone.utc).timestamp() * 1000)
+        except (ValueError, TypeError):
+            return fallback
+    now_ms = int(_time.time() * 1000)
+    frm = ms(start_iso, now_ms - 3_600_000)
+    to = ms(end_iso, now_ms)
+    host = spec.pmm.server_host
+    base = host if "://" in host else f"https://{host}"
+    qan = f"{base}/graph/d/pmm-qan/pmm-query-analytics?from={frm}&to={to}"
+    if spec.pmm.service_name:
+        qan += f"&var-service_name={spec.pmm.service_name}"
+    return {
+        "server": host, "from_ms": frm, "to_ms": to,
+        "instances": f"{base}/graph/d/postgresql-instance-overview/"
+                     f"postgresql-instances-overview?from={frm}&to={to}",
+        "qan": qan,
+    }
+
+
 def generate_report(run_dir: Path) -> Path:
     """(Re)generate report.html for a run directory; returns the output path."""
     run_dir = run_dir.resolve()
@@ -388,6 +418,7 @@ def generate_report(run_dir: Path) -> Path:
             "harness_version": _read_env(env_dir, "harness_git_sha.txt"),
             "host_info": _read_env(env_dir, "host_info.txt"),
         },
+        pmm_links=build_pmm_links(spec, manifest.created_utc, manifest.finished_utc),
         wall_time=fmt_duration(manifest.wall_time_s) if manifest.wall_time_s else "n/a",
         steady_window=f"{spec.sweep.warmup_s}s – {spec.sweep.duration_s}s",
     )

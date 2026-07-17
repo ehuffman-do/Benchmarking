@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — PMM 3.x enablement as a first-class operation
+
+- **New: `ops pmm-enable`** — takes a Percona PostgreSQL cluster from
+  unmonitored to fully PMM-3.x-monitored in one run (a native port of the
+  field `enable-pmm.sh`, not a shell-out): preflight (token, query-source ↔
+  extension pairing, CR exists) → pre-change topology → full **state backup**
+  (CR, secret, patronictl config/list, per-pod PMM env, preload libs +
+  extensions, with a one-line restore command) → PMM3 secret
+  (`PMM_SERVER_TOKEN` key — the wrong key silently means PMM2 mode) → a
+  **single CR merge patch** (pmm block + `shared_preload_libraries`) →
+  rollout wait → re-discovery → `CREATE EXTENSION` on the primary →
+  HA-preserving sidecar bounce → per-node/cluster validation report →
+  **server-side confirmation** against the PMM inventory REST API
+  (unreachable server degrades to a warning). `ops pmm-status` re-runs just
+  the validation with zero mutations; `ops pmm-disable` restores the
+  backed-up CR and deletes the secret.
+- **Two reference-script bugs fixed in the port, not reproduced**:
+  the rollout wait is **spec-aware** (a pod only counts as rolled when it is
+  Running + Ready *and* carries the patched spec *and* was actually
+  recreated — pods merely Ready on the old spec no longer fool the wait;
+  timeouts continue to verification with a recorded warning), and leader
+  discovery is **retry-with-deadline resilient** (`discover.
+  resolve_leader_resilient`: operator role label first — no exec — then
+  patronictl against *every* running pod; election windows and dying exec
+  targets are retryable; the deadline error carries every attempt).
+- **Token hygiene**: the PMM service-account token comes ONLY from
+  `PGB_PMM_TOKEN`, is registered with the output redactor, travels to
+  kubectl via an `apply -f -` stdin manifest (never argv), renders as
+  `<token>` in dry-run, and a test greps every file the harness writes to
+  prove it never lands anywhere. Non-`glsa_` tokens warn, not fail.
+- **Benchmark ↔ observation linkage**: run specs accept an optional `pmm:`
+  section (`server_host`, optional `service_name`); sweep and soak reports
+  then include PMM deep links (instances overview + Query Analytics) scoped
+  to the run's exact time window. Specs without `pmm:` are byte-identical.
+
 ## Unreleased — day-2 operations catalog + continuous intelligence
 
 - **New: guided operations** (`ops operate` + console → target → Operations):

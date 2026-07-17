@@ -38,6 +38,11 @@ BACKUP_S = float(os.environ.get("FAKE_KUBE_BACKUP_S", "2"))
 BLIP_S = float(os.environ.get("FAKE_KUBE_SWITCH_BLIP_S", "1"))
 PGPASS = os.environ.get("FAKE_KUBE_PGPASS", "k8s-secret-pw-fake")
 CR_KIND = os.environ.get("FAKE_KUBE_CR_KIND", "perconapgcluster")
+# PMM enablement: after the CR gains spec.pmm, instance pods roll one at a
+# time — pod i is recreated (new UID + pmm-client sidecar) ROLL_S*(i+1)
+# seconds after the patch. A naive readiness poll passes instantly (old pods
+# stay Ready); the spec-aware wait must block until the stagger completes.
+ROLL_S = float(os.environ.get("FAKE_KUBE_ROLL_S", "0.5"))
 
 
 def default_state():
@@ -71,6 +76,7 @@ def default_state():
                         "incremental": "0 * * * *"}}]}},
             }},
         "pending_restart": [],
+        "extensions": ["pgaudit"], "pmm_roll": {}, "pmm_secret": "",
     }
 
 
@@ -152,29 +158,66 @@ def out(s=""):
     sys.stdout.write(s if s.endswith("\n") or not s else s + "\n")
 
 
+def pmm_rolled(st, name):
+    """Has this pod been recreated with the PMM sidecar yet? (time-staged)"""
+    pmm = st["cr"]["spec"].get("pmm") or {}
+    if not pmm.get("enabled"):
+        return False
+    return now() >= st.get("pmm_roll", {}).get(name, 0)
+
+
+def pmm_client_container(st):
+    """The sidecar the operator injects, with the env the verifier inspects
+    (PMM3 markers: --query-source in the prerun, non-/pmm2/ config path)."""
+    pmm = st["cr"]["spec"].get("pmm") or {}
+    qs = pmm.get("querySource", "pgstatmonitor")
+    return {"name": "pmm-client", "image": pmm.get("image", ""),
+            "envFrom": [{"secretRef": {"name": pmm.get("secret", "")}}],
+            "env": [
+                {"name": "PMM_AGENT_SERVER_ADDRESS",
+                 "value": str(pmm.get("serverHost", ""))},
+                {"name": "PMM_AGENT_CONFIG_FILE",
+                 "value": "/usr/local/percona/pmm/config/pmm-agent.yaml"},
+                {"name": "PMM_AGENT_PRERUN_SCRIPT",
+                 "value": "pmm-admin status --wait=10s; pmm-admin add postgresql "
+                          f"--skip-connection-check --query-source={qs} "
+                          "--tls-skip-verify $(hostname)"},
+            ]}
+
+
 def pod_json(st, name, kind):
     alive = pod_alive(st, name)
-    containers = ([{"name": "database"}, {"name": "replication-cert-copy"},
-                   {"name": "pgbackrest"}, {"name": "pgbackrest-config"}]
-                  if kind == "instance" else [{"name": "pgbouncer"},
-                                              {"name": "pgbouncer-config"}])
+    rolled = False
+    if kind == "instance":
+        containers = [{"name": "database"}, {"name": "replication-cert-copy"},
+                      {"name": "pgbackrest"}, {"name": "pgbackrest-config"}]
+        rolled = pmm_rolled(st, name)
+        if rolled:
+            containers.append(pmm_client_container(st))
+        labels = {"postgres-operator.crunchydata.com/cluster": st["cluster"],
+                  "postgres-operator.crunchydata.com/instance-set": "instance1"}
+        if not os.environ.get("FAKE_KUBE_NO_ROLE_LABEL"):
+            labels["postgres-operator.crunchydata.com/role"] = \
+                "master" if name == st["leader"] else "replica"
+    else:
+        containers = [{"name": "pgbouncer"}, {"name": "pgbouncer-config"}]
+        labels = {"postgres-operator.crunchydata.com/cluster": st["cluster"],
+                  "postgres-operator.crunchydata.com/role": "pgbouncer"}
     inst = next((i for i in st["instances"] if i["name"] == name), None)
     node = inst["node"] if inst else "node-9"
     ip = inst["ip"] if inst else "10.244.1.9"
     starting = (kind == "instance" and name == st["leader"]
                 and leader_state(st) == "starting")
     ready = alive and not starting
+    # UID changes when the pod is recreated: the PMM roll and every delete.
+    uid = f"uid-{name}-{'pmm' if rolled else 'base'}-{int(st['deleted'].get(name, 0))}"
     return {
-        "metadata": {"name": name, "namespace": "percona",
-                     "labels": ({"postgres-operator.crunchydata.com/cluster": st["cluster"],
-                                 "postgres-operator.crunchydata.com/instance-set": "instance1"}
-                                if kind == "instance" else
-                                {"postgres-operator.crunchydata.com/cluster": st["cluster"],
-                                 "postgres-operator.crunchydata.com/role": "pgbouncer"})},
-        "spec": {"nodeName": node,
-                 "containers": [{"name": c["name"]} for c in containers]},
+        "metadata": {"name": name, "namespace": "percona", "uid": uid,
+                     "labels": labels},
+        "spec": {"nodeName": node, "containers": containers},
         "status": {"phase": "Running" if alive else "Pending", "podIP": ip,
-                   "containerStatuses": [{"name": c["name"], "ready": ready}
+                   "containerStatuses": [{"name": c["name"], "ready": ready,
+                                          "restartCount": 0}
                                          for c in containers]},
     }
 
@@ -362,6 +405,14 @@ def run_sql(st, sql):
         return json.dumps(pg_catalog_rows(st))
     if "show server_version" in s:
         return "18.0"
+    if "show shared_preload_libraries" in s:
+        return str(params.get("shared_preload_libraries", "pgaudit"))
+    if "from pg_extension" in s and "extversion" in s:
+        return "\n".join(f"{e}|1.0"
+                         for e in sorted(st.get("extensions", ["pgaudit"])))
+    if "from pg_extension" in s:      # SELECT 1 FROM pg_extension WHERE extname='X'
+        return "1" if any(f"'{e}'" in s
+                          for e in st.get("extensions", ["pgaudit"])) else ""
     if "diag:connections" in s or "health:connections" in s:
         used, mx = 12, int(params.get("max_connections", 100))
         if "health:" in s:
@@ -539,6 +590,25 @@ def handle_exec(st, pod, argv):
             sys.stderr.write("psql: error: connection to server failed: "
                              "Connection refused\n")
             return 2
+        low = " ".join(sql.split()).lower()
+        if low.startswith("create extension"):
+            ext = low.replace(";", "").split()[-1]
+            exts = st.setdefault("extensions", ["pgaudit"])
+            if ext not in exts:
+                exts.append(ext)
+            save(st)
+            return 0
+        if "from pg_stat_monitor" in low or "from pg_stat_statements" in low:
+            view = "pg_stat_monitor" if "pg_stat_monitor" in low \
+                else "pg_stat_statements"
+            if view in st.get("extensions", []):
+                out("37")
+                return 0
+            sys.stderr.write(f'ERROR:  relation "{view}" does not exist\n')
+            return 1
+        if "pg_is_in_recovery" in low:
+            out("f" if pod == st["leader"] else "t")
+            return 0
         out(run_sql(st, sql))
         return 0
     if argv[0] == "bash" and "kill" in joined and "postmaster.pid" in joined:
@@ -575,6 +645,21 @@ def handle_exec(st, pod, argv):
         return 0
     sys.stderr.write(f"fake kubectl exec: unhandled command: {joined}\n")
     return 1
+
+
+def handle_pmm_logs(st, pod):
+    """pmm-client sidecar logs: the QAN agent line appears once the pod has
+    rolled AND the paired extension exists (FAKE_KUBE_NO_QAN suppresses it)."""
+    pmm = st["cr"]["spec"].get("pmm") or {}
+    qs = pmm.get("querySource", "pgstatmonitor")
+    ext = {"pgstatmonitor": "pg_stat_monitor",
+           "pgstatements": "pg_stat_statements"}.get(qs, "pg_stat_monitor")
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S") + ",000Z"
+    out(f"{ts} INFO pmm-agent: connected to {pmm.get('serverHost', '')}")
+    if (pmm_rolled(st, pod) and ext in st.get("extensions", [])
+            and not os.environ.get("FAKE_KUBE_NO_QAN")):
+        out(f"{ts} INFO qan_postgresql_{qs}_agent: sending 4 metrics buckets")
+    return 0
 
 
 def handle_logs(st, pod, follow):
@@ -702,6 +787,13 @@ def main():
             return 0
         if kind == "secret":
             name = args[2] if len(args) > 2 else ""
+            if name and name == st.get("pmm_secret"):
+                # never echo the token back — real kubectl would, the shim
+                # must not (the leak gate greps everything the harness writes)
+                out(json.dumps({"apiVersion": "v1", "kind": "Secret",
+                                "metadata": {"name": name},
+                                "data": {"PMM_SERVER_TOKEN": "PHJlZGFjdGVkPg=="}}))
+                return 0
             if "pguser" not in name:
                 sys.stderr.write(f'Error from server (NotFound): secrets "{name}" not found\n')
                 return 1
@@ -762,6 +854,33 @@ def main():
             else:
                 out("LAST SEEN TYPE REASON OBJECT MESSAGE")
             return 0
+    if cmd == "apply":
+        # kubectl apply -f - : stdin carries a Secret (PMM token — the shim
+        # stores only the NAME, never the stringData) or a CR restore.
+        try:
+            doc = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            sys.stderr.write("fake kubectl apply: stdin is not JSON\n")
+            return 1
+        akind = str(doc.get("kind", ""))
+        aname = str((doc.get("metadata") or {}).get("name", ""))
+        if akind == "Secret":
+            st["pmm_secret"] = aname
+            save(st)
+            out(f"secret/{aname} configured")
+            return 0
+        if akind.lower().endswith("cluster"):
+            doc.setdefault("metadata", {})["generation"] = \
+                st["cr"]["metadata"].get("generation", 1) + 1
+            st["cr"] = doc
+            if not ((doc.get("spec") or {}).get("pmm") or {}).get("enabled"):
+                st["pmm_roll"] = {}
+            sync_instances(st)
+            save(st)
+            out(f"{CR_KIND}.pgv2.percona.com/{aname} configured")
+            return 0
+        sys.stderr.write(f"fake kubectl apply: unhandled kind {akind}\n")
+        return 1
     if cmd == "patch":
         # kubectl patch <kind> <name> --type merge -p '<json>'
         try:
@@ -802,6 +921,10 @@ def main():
                 else:
                     dst[k] = v
         deep_merge(st["cr"], patch)
+        if ((patch.get("spec") or {}).get("pmm") or {}).get("enabled"):
+            # the operator rolls the instance pods one at a time
+            st["pmm_roll"] = {i["name"]: now() + ROLL_S * (k + 1)
+                              for k, i in enumerate(st["instances"])}
         pend = os.environ.get("FAKE_KUBE_PENDING_PARAMS", "")
         touched = (patch.get("spec", {}).get("patroni", {})
                    .get("dynamicConfiguration", {}).get("postgresql", {})
@@ -826,6 +949,15 @@ def main():
         out("annotated")
         return 0
     if cmd == "delete":
+        if args[1] in ("secret", "secrets"):
+            name = args[2]
+            if st.get("pmm_secret") == name:
+                st["pmm_secret"] = ""
+                save(st)
+                out(f'secret "{name}" deleted')
+                return 0
+            sys.stderr.write(f'Error from server (NotFound): secrets "{name}" not found\n')
+            return 1
         if args[1] in ("pod", "pods"):
             name = args[2]
             st["deleted"][name] = now()
@@ -853,7 +985,10 @@ def main():
     if cmd == "logs":
         follow = "-f" in args or "--follow" in args
         pod = next(a for a in args[1:] if not a.startswith("-")
-                   and a not in ("database", "pgbouncer", "pgbackrest"))
+                   and a not in ("database", "pgbouncer", "pgbackrest",
+                                 "pmm-client"))
+        if "pmm-client" in args:
+            return handle_pmm_logs(st, pod)
         return handle_logs(st, pod, follow)
     if cmd == "exec":
         try:

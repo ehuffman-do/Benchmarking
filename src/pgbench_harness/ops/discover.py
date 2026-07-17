@@ -59,6 +59,83 @@ def classify_pods(items: list[dict[str, Any]], cr_name: str) -> dict[str, list[d
     return out
 
 
+# The operator stamps the primary's pod with Patroni's role label. Patroni <4
+# writes "master", Patroni 4+ writes "primary" — accept both.
+ROLE_LABEL = "postgres-operator.crunchydata.com/role"
+LEADER_ROLES = ("master", "primary")
+
+
+def leader_by_label(pods: list[dict[str, Any]]) -> Optional[str]:
+    """Leader pod name from the operator's role label — no exec needed."""
+    for pod in pods:
+        if str((pod.get("labels") or {}).get(ROLE_LABEL, "")).lower() in LEADER_ROLES \
+                and pod.get("phase") == "Running":
+            return str(pod["name"])
+    return None
+
+
+def resolve_leader_resilient(kube: Any, cr_name: str, timeout_s: float = 120,
+                             poll_s: float = 5.0,
+                             notify=None) -> tuple[list[str], str, Any, list[str]]:
+    """Leader discovery that survives mid-roll elections and dying exec targets.
+
+    Strategy per attempt: (1) the operator's role label on pods (no exec at
+    all); (2) ``patronictl list`` tried against EVERY running instance pod,
+    not just the first (a terminating pod fails exec — that is retryable, not
+    fatal). "No leader right now" (election window) is also retryable. Only
+    the deadline fails, and the error carries what each attempt observed.
+
+    Returns (instance pod names, leader pod, PatroniView | None, attempts).
+    """
+    from pgbench_harness.ops import patroni as _patroni
+    from pgbench_harness.ops.kube import KubeError
+    import time as _time
+    attempts: list[str] = []
+    deadline = _time.monotonic() + timeout_s
+    while True:
+        stamp = f"t+{timeout_s - max(0, deadline - _time.monotonic()):.0f}s"
+        try:
+            items = kube.json(["get", "pods"]).get("items") or []
+        except KubeError as exc:
+            attempts.append(f"{stamp}: pod list failed: {str(exc)[:80]}")
+            items = []
+        buckets = classify_pods(items, cr_name)
+        instances = [p["name"] for p in buckets["instances"]]
+        running = [p["name"] for p in buckets["instances"] if p["phase"] == "Running"]
+        leader = leader_by_label(buckets["instances"])
+        view = None
+        if leader:
+            try:                       # members/TL are nice-to-have, not required
+                view = _patroni.fetch_view(kube, leader)
+            except KubeError:
+                view = None
+            attempts.append(f"{stamp}: leader '{leader}' via role label")
+            return instances, leader, view, attempts
+        for pod in running:            # every pod is a candidate exec target
+            try:
+                view = _patroni.fetch_view(kube, pod)
+            except KubeError as exc:
+                attempts.append(f"{stamp}: exec {pod}: {str(exc)[:80]}")
+                continue
+            if view.leader_name:
+                attempts.append(f"{stamp}: leader '{view.leader_name}' via "
+                                f"patronictl on {pod}")
+                return instances, view.leader_name, view, attempts
+            attempts.append(f"{stamp}: {pod}: patroni reports no leader "
+                            "(election window?)")
+            break                      # one good view without a leader is enough
+        if not running:
+            attempts.append(f"{stamp}: no running instance pods "
+                            f"({len(instances)} exist)")
+        if notify is not None:
+            notify(attempts[-1] if attempts else stamp)
+        if _time.monotonic() >= deadline:
+            from pgbench_harness.ops.kube import KubeError as _KE
+            raise _KE("leader discovery failed after "
+                      f"{timeout_s:.0f}s; attempts: " + " | ".join(attempts[-8:]))
+        _time.sleep(poll_s)
+
+
 def _first_running_instance(instances: list[dict[str, Any]]) -> Optional[str]:
     for pod in instances:
         if pod["phase"] == "Running":

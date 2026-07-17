@@ -36,9 +36,13 @@ OPS_KINDS: dict[str, str] = {
     "ops_diag": "diag",
     "ops_health": "health",
     "ops_operate": "operate",
+    "ops_pmm_enable": "pmm-enable",
+    "ops_pmm_status": "pmm-status",
+    "ops_pmm_disable": "pmm-disable",
 }
 RUN_DIR_KINDS = ("ops_cr_apply", "ops_backup", "ops_scenario", "ops_monitor",
-                 "ops_diag", "ops_operate")
+                 "ops_diag", "ops_operate", "ops_pmm_enable", "ops_pmm_status",
+                 "ops_pmm_disable")
 
 SUMMARY_MARKER = "OPS_SUMMARY_JSON"
 TOPOLOGY_MARKER = "OPS_TOPOLOGY_JSON"

@@ -15,7 +15,8 @@ from typing import Any
 from pgbench_harness.errors import SpecError
 
 OPS_KINDS = ("validate", "discover", "cr-apply", "backup", "scenario", "monitor",
-             "pg-params", "diag", "health", "operate")
+             "pg-params", "diag", "health", "operate",
+             "pmm-enable", "pmm-status", "pmm-disable")
 
 OPERATE_OPERATIONS = ("restart", "switchover", "failover", "scale", "resize",
                       "schedules")
@@ -129,5 +130,20 @@ def parse_ops_spec(doc: Any) -> OpsSpec:
                 raise SpecError("ops spec: resize needs non-empty params.resources "
                                 "{requests/limits: {cpu, memory}} — an empty patch "
                                 "would strip the pods' existing resources")
+    if op in ("pmm-enable", "pmm-status"):
+        if not str(params.get("server_host") or "").strip():
+            raise SpecError(f"ops spec: {op} needs params.server_host "
+                            "(the PMM server address)")
+        qs = str(params.get("query_source") or "pgstatmonitor")
+        if qs not in ("pgstatmonitor", "pgstatements"):
+            raise SpecError("ops spec: pmm query_source must be "
+                            f"pgstatmonitor|pgstatements (got '{qs}')")
+        ext = str(params.get("extension") or "pg_stat_monitor")
+        if ext not in ("pg_stat_monitor", "pg_stat_statements"):
+            raise SpecError("ops spec: pmm extension must be "
+                            f"pg_stat_monitor|pg_stat_statements (got '{ext}')")
+    if op == "pmm-disable" and not str(params.get("rollback_of") or "").strip():
+        raise SpecError("ops spec: pmm-disable needs params.rollback_of "
+                        "(the pmm-enable run id whose backup to restore)")
     label = str(doc.get("label") or f"{op}-{target.name}")
     return OpsSpec(op=op, target=target, label=label, params=dict(params), raw=dict(doc))

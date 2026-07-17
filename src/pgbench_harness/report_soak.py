@@ -339,10 +339,17 @@ def generate_soak_report(run_dir: Path) -> Path:
     run_dir = run_dir.resolve()
     spec_path = run_dir / "spec.yaml"
     summary_path = run_dir / "parsed" / "soak_summary.json"
+    pmm_links = None
     if spec_path.exists() and (run_dir / "manifest.json").exists():
         manifest = Manifest.load(run_dir)
         if manifest.soak:                       # refresh from raw logs + events.jsonl
             soak.analyze(run_dir, load_spec(spec_path), manifest.soak)
+        try:                                    # observation-layer links are optional
+            from pgbench_harness.report import build_pmm_links
+            pmm_links = build_pmm_links(load_spec(spec_path),
+                                        manifest.created_utc, manifest.finished_utc)
+        except Exception:
+            pmm_links = None
     if not summary_path.exists():
         raise ReportError(f"no parsed/soak_summary.json in {run_dir}",
                           hint="is this a soak run directory?")
@@ -359,6 +366,7 @@ def generate_soak_report(run_dir: Path) -> Path:
         summary=summary,
         charts=charts,
         interactive=interactive,
+        pmm_links=pmm_links,
         uplot_js=_read_text_asset("uplot.min.js") if interactive else "",
         uplot_css=_read_text_asset("uplot.min.css") if interactive else "",
         fmt_duration=fmt_duration,

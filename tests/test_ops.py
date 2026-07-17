@@ -1677,3 +1677,299 @@ def test_backup_replica_direct_aborts_with_clear_message(opsweb):
     run = _last_ops_run(client, "backup")
     assert run["status"] in ("complete", "failed")   # not aborted by the guard
     assert run["headline"].get("reason") != "replica-direct-unsupported"
+
+
+# ── PMM 3.x enablement (ops pmm-enable / pmm-status / pmm-disable) ──
+
+PMM_TOKEN = "glsa_pmm-token-SENTINEL-do-not-leak-77aa88bb"
+
+
+@pytest.fixture()
+def pmmops(tmp_path, monkeypatch):
+    """Fake cluster + PMM token env for direct ops-runner calls (no webapp:
+    the pmm verbs are exercised at the framework layer, like the CLI would)."""
+    for exe in ("psql", "kubectl"):
+        p = FAKEBIN / exe
+        p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    import sys
+    venv_bin = Path(sys.executable).parent
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{venv_bin}{os.pathsep}{os.environ['PATH']}")
+    state = tmp_path / "fakekube"; state.mkdir()
+    monkeypatch.setenv("FAKE_KUBE_STATE", str(state))
+    monkeypatch.setenv("FAKE_KUBE_RESTART_S", "0")   # no psql-outage windows
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "0")  # deleted pods return instantly
+    monkeypatch.setenv("FAKE_KUBE_ROLL_S", "0.2")    # staged PMM roll, fast
+    monkeypatch.setenv("PGB_PMM_TOKEN", PMM_TOKEN)
+    return tmp_path / "results"
+
+
+def _pmm_ops_spec(op, **params):
+    from pgbench_harness.ops.opspec import parse_ops_spec
+    # 127.0.0.1:9 fails fast (connection refused, proxy-exempt) so tests that
+    # don't stand up an inventory server hit the degrade-to-warning path quickly
+    base = {"server_host": "http://127.0.0.1:9", "poll_s": 0.2,
+            "rollout_timeout_s": 30, "discover_timeout_s": 10,
+            "qan_timeout_s": 10}
+    base.update(params)
+    return parse_ops_spec({"op": op, "label": f"{op}-test",
+                           "target": {"name": "doks-test", "namespace": "percona",
+                                      "cr_name": "cluster1"},
+                           "params": base})
+
+
+def _only_pmm_run_dir(results, op):
+    dirs = [d for d in (results / "ops").iterdir() if d.name.startswith(op + "-")]
+    assert len(dirs) == 1, dirs
+    return dirs[0]
+
+
+def _fake_state():
+    return json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+
+
+def _start_pmm_inventory(services):
+    """Minimal PMM3 inventory API: GET /v1/inventory/services with Bearer auth."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    seen = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["auth"] = self.headers.get("Authorization", "")
+            seen["path"] = self.path
+            body = json.dumps({"services":
+                               [{"service_name": s} for s in services]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_port, seen
+
+
+def test_pmm_enable_end_to_end_with_inventory_confirmation(pmmops):
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    pods = ["cluster1-instance1-abcd-0", "cluster1-instance1-efgh-0",
+            "cluster1-instance1-ijkl-0"]
+    srv, port, seen = _start_pmm_inventory(pods)
+    try:
+        rc = run_pmm_enable(
+            _pmm_ops_spec("pmm-enable", server_host=f"http://127.0.0.1:{port}"),
+            pmmops)
+    finally:
+        srv.shutdown()
+    assert rc == 0
+    run_dir = _only_pmm_run_dir(pmmops, "pmm-enable")
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["status"] == "complete", meta
+    h = meta["headline"]
+    assert h["qan"] is True and h["healthy"] is True and h["rolled"] is True
+    assert h["inventory_nodes"] == 3
+    # server-side confirmation hit the PMM3 inventory endpoint with Bearer auth
+    assert seen["auth"] == f"Bearer {PMM_TOKEN}"
+    assert "/v1/inventory/services" in seen["path"]
+    # validation artifacts: per-node rows + human report
+    val = json.loads((run_dir / "validation.json").read_text())
+    assert len(val["nodes"]) == 3
+    assert sum(1 for n in val["nodes"] if n["role"] == "LEADER") == 1
+    assert all(n["extension"] and n["sidecar_ready"] for n in val["nodes"])
+    assert val["pmm3_mode"]["prerun_query_source"] is True
+    assert val["pmm3_mode"]["legacy_pmm2_path"] is False
+    report = (run_dir / "validation-report.txt").read_text()
+    assert "VALIDATION REPORT" in report and "QAN observed" in report
+    # pre-mutation state backup exists (with the one-line restore path)
+    assert (run_dir / "backup" / "cr-cluster1.yaml").exists()
+    assert (run_dir / "backup" / "preload-and-extensions.txt").exists()
+    assert (run_dir / "backup" / "patroni-show-config.yaml").exists()
+    # cluster converged: pmm block, PMM3 secret, extension, SPL
+    st = _fake_state()
+    assert st["cr"]["spec"]["pmm"]["enabled"] is True
+    assert st["cr"]["spec"]["pmm"]["querySource"] == "pgstatmonitor"
+    assert st["pmm_secret"] == "cluster1-pmm-secret"
+    assert "pg_stat_monitor" in st["extensions"]
+    spl = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
+           ["parameters"]["shared_preload_libraries"])
+    assert spl == "pgaudit,pg_stat_monitor"
+    # DoD: the token never lands in anything the harness writes
+    for p in pmmops.rglob("*"):
+        if p.is_file():
+            assert PMM_TOKEN not in p.read_text(errors="replace"), p
+
+
+def test_pmm_enable_dry_run_redacts_token_and_mutates_nothing(pmmops):
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    rc = run_pmm_enable(_pmm_ops_spec("pmm-enable", dry_run=True), pmmops)
+    assert rc == 0
+    run_dir = _only_pmm_run_dir(pmmops, "pmm-enable")
+    events = (run_dir / "events.jsonl").read_text()
+    assert "<token>" in events                     # placeholder, like the script
+    assert PMM_TOKEN not in events
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["status"] == "complete" and meta["headline"]["dry_run"] is True
+    st = _fake_state()
+    assert "pmm" not in st["cr"]["spec"] and st["pmm_secret"] == ""
+    assert not (Path(os.environ["FAKE_KUBE_STATE"]) / "patches.log").exists()
+
+
+def test_pmm_rollout_wait_is_spec_aware_not_fooled_by_ready_old_pods(pmmops, monkeypatch):
+    """Reference-script bug #1, fixed: every pod stays Running+Ready on the OLD
+    spec the whole time (a naive readiness poll would sail through instantly).
+    With the operator's roll stalled the spec-aware wait must time out, record
+    why, and finish as a warning — never a silent success."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    monkeypatch.setenv("FAKE_KUBE_ROLL_S", "600")   # pods never pick up the spec
+    rc = run_pmm_enable(
+        _pmm_ops_spec("pmm-enable", rollout_timeout_s=1.2, poll_s=0.3,
+                      qan_timeout_s=0.5, discover_timeout_s=5), pmmops)
+    assert rc == 1                                   # warning, not success
+    run_dir = _only_pmm_run_dir(pmmops, "pmm-enable")
+    events = (run_dir / "events.jsonl").read_text()
+    assert "TIMEOUT waiting for rollout" in events
+    assert "old spec" in events                      # the recorded reason
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["status"] == "warning"
+    assert meta["headline"]["rolled"] is False
+    assert meta["headline"]["healthy"] is False
+
+
+def test_pmm_status_reports_without_mutating(pmmops):
+    from pgbench_harness.ops.pmm import run_pmm_enable, run_pmm_status
+    assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0
+    state_path = Path(os.environ["FAKE_KUBE_STATE"]) / "state.json"
+    patches_path = Path(os.environ["FAKE_KUBE_STATE"]) / "patches.log"
+    before_state, before_patches = state_path.read_text(), patches_path.read_text()
+    rc = run_pmm_status(_pmm_ops_spec("pmm-status"), pmmops)
+    assert rc == 0
+    assert state_path.read_text() == before_state       # zero mutations
+    assert patches_path.read_text() == before_patches   # no CR patches at all
+    run_dir = _only_pmm_run_dir(pmmops, "pmm-status")
+    val = json.loads((run_dir / "validation.json").read_text())
+    assert val["qan_observed"] is True and len(val["nodes"]) == 3
+
+
+def test_pmm_disable_restores_cr_and_deletes_secret(pmmops):
+    from pgbench_harness.ops.pmm import run_pmm_disable, run_pmm_enable
+    assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0
+    assert _fake_state()["cr"]["spec"].get("pmm", {}).get("enabled") is True
+    enable_id = _only_pmm_run_dir(pmmops, "pmm-enable").name
+    rc = run_pmm_disable(_pmm_ops_spec("pmm-disable", rollback_of=enable_id),
+                         pmmops)
+    assert rc == 0
+    st = _fake_state()
+    assert "pmm" not in st["cr"]["spec"]                # pre-enable CR restored
+    assert st["pmm_secret"] == ""                       # secret deleted
+    meta = json.loads((_only_pmm_run_dir(pmmops, "pmm-disable") / "meta.json")
+                      .read_text())
+    assert meta["status"] == "complete"
+    assert meta["headline"]["restored_from"] == enable_id
+
+
+def test_pmm_disable_requires_a_real_backup(pmmops):
+    from pgbench_harness.ops.pmm import run_pmm_disable
+    rc = run_pmm_disable(_pmm_ops_spec("pmm-disable", rollback_of="nope-123"),
+                         pmmops)
+    assert rc == 3
+    meta = json.loads((_only_pmm_run_dir(pmmops, "pmm-disable") / "meta.json")
+                      .read_text())
+    assert meta["status"] == "aborted"
+    assert meta["headline"]["reason"] == "no-backup"
+
+
+def test_pmm_enable_aborts_cleanly_without_token(pmmops, monkeypatch):
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    monkeypatch.delenv("PGB_PMM_TOKEN")
+    rc = run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops)
+    assert rc == 3
+    meta = json.loads((_only_pmm_run_dir(pmmops, "pmm-enable") / "meta.json")
+                      .read_text())
+    assert meta["status"] == "aborted"
+    assert meta["headline"]["reason"] == "no-token"
+    events = (_only_pmm_run_dir(pmmops, "pmm-enable") / "events.jsonl").read_text()
+    assert "PGB_PMM_TOKEN is not set" in events
+
+
+def test_pmm_token_prefix_warning_not_fatal(pmmops, monkeypatch):
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    monkeypatch.setenv("PGB_PMM_TOKEN", "not-a-glsa-token-SENTINEL-123")
+    rc = run_pmm_enable(_pmm_ops_spec("pmm-enable", dry_run=True), pmmops)
+    assert rc == 0                                       # warn, don't fail
+    events = (_only_pmm_run_dir(pmmops, "pmm-enable") / "events.jsonl").read_text()
+    assert "does not start with 'glsa_'" in events
+    assert "not-a-glsa-token-SENTINEL-123" not in events # still redacted
+
+
+def test_resolve_leader_via_role_label_and_patronictl_fallback(pmmops, monkeypatch):
+    """Reference-script bug #2, fixed: discovery prefers the operator's role
+    label (no exec at all) and falls back to patronictl against every pod."""
+    from pgbench_harness.ops.discover import resolve_leader_resilient
+    from pgbench_harness.ops.kube import Kube
+    kube = Kube(namespace="percona")
+    instances, leader, view, attempts = resolve_leader_resilient(
+        kube, "cluster1", timeout_s=5, poll_s=0.2)
+    assert leader == "cluster1-instance1-abcd-0"
+    assert len(instances) == 3
+    assert "role label" in attempts[-1]
+    # older operator without the label -> patronictl path finds the same leader
+    monkeypatch.setenv("FAKE_KUBE_NO_ROLE_LABEL", "1")
+    instances, leader, view, attempts = resolve_leader_resilient(
+        kube, "cluster1", timeout_s=5, poll_s=0.2)
+    assert leader == "cluster1-instance1-abcd-0"
+    assert "patronictl" in attempts[-1]
+    assert view is not None and view.leader_name == leader
+
+
+def test_resolve_leader_deadline_error_carries_attempts(pmmops, monkeypatch):
+    from pgbench_harness.ops.discover import resolve_leader_resilient
+    from pgbench_harness.ops.kube import Kube, KubeError
+    monkeypatch.setenv("FAKE_KUBE_AUTH_FAIL", "1")
+    with pytest.raises(KubeError) as exc:
+        resolve_leader_resilient(Kube(namespace="percona"), "cluster1",
+                                 timeout_s=0.7, poll_s=0.2)
+    msg = str(exc.value)
+    assert "leader discovery failed" in msg and "attempts" in msg
+
+
+def test_pmm_ops_spec_validation():
+    from pgbench_harness.errors import SpecError
+    from pgbench_harness.ops.opspec import parse_ops_spec
+    tgt = {"name": "t", "cr_name": "cluster1"}
+    with pytest.raises(SpecError, match="server_host"):
+        parse_ops_spec({"op": "pmm-enable", "target": tgt, "params": {}})
+    with pytest.raises(SpecError, match="query_source"):
+        parse_ops_spec({"op": "pmm-enable", "target": tgt,
+                        "params": {"server_host": "x", "query_source": "topsql"}})
+    with pytest.raises(SpecError, match="extension"):
+        parse_ops_spec({"op": "pmm-enable", "target": tgt,
+                        "params": {"server_host": "x",
+                                   "extension": "pg_buffercache"}})
+    with pytest.raises(SpecError, match="rollback_of"):
+        parse_ops_spec({"op": "pmm-disable", "target": tgt, "params": {}})
+    ok = parse_ops_spec({"op": "pmm-status", "target": tgt,
+                         "params": {"server_host": "pmm.example.com"}})
+    assert ok.op == "pmm-status"
+
+
+def test_build_pmm_links_scoped_to_run_window():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from pgbench_harness.report import build_pmm_links
+    from pgbench_harness.spec import Pmm
+    spec = SimpleNamespace(pmm=Pmm(server_host="pmm.example.com",
+                                   service_name="cluster1-instance1"))
+    links = build_pmm_links(spec, "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z")
+    frm = int(datetime(2026, 7, 17, 10, tzinfo=timezone.utc).timestamp() * 1000)
+    to = frm + 3_600_000
+    assert links["from_ms"] == frm and links["to_ms"] == to
+    assert links["instances"] == ("https://pmm.example.com/graph/d/"
+                                  "postgresql-instance-overview/"
+                                  f"postgresql-instances-overview?from={frm}&to={to}")
+    assert "pmm-qan" in links["qan"] and f"from={frm}&to={to}" in links["qan"]
+    assert "var-service_name=cluster1-instance1" in links["qan"]
+    assert build_pmm_links(SimpleNamespace(pmm=None), "x", "y") is None
