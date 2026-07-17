@@ -35,6 +35,7 @@ VERSION_MARKER="${DATA_DIR}/INSTALLED_VERSION"
 LOG_DIR="/var/log/pgbench-harness"
 INSTALL_LOG="${LOG_DIR}/install.log"
 ENV_FILE="/etc/pgbench-harness.env"
+SECRETS_ENV_FILE="/etc/pgbench-harness.secrets.env"
 SYSBENCH_TPCC_DIR="/opt/sysbench-tpcc"
 SYSBENCH_TPCC_REPO="https://github.com/Percona-Lab/sysbench-tpcc"
 
@@ -483,6 +484,42 @@ ensure_secret_key() {
 }
 
 # ----------------------------------------------------------------------------
+# Step: operator-managed secrets env file (worker only). Created empty if
+# missing, NEVER overwritten on update — this is where credentials like the
+# PMM service-account token live, so they must not be in the 0644 env file
+# that write_env_file regenerates on every deploy. The worker unit loads it
+# with EnvironmentFile=- (the '-' means "optional"), so an empty file is fine.
+# ----------------------------------------------------------------------------
+ensure_secrets_env() {
+  section "Secrets environment file (worker)"
+  if [[ -f "${SECRETS_ENV_FILE}" ]]; then
+    chmod 0600 "${SECRETS_ENV_FILE}" 2>/dev/null || true
+    chown root:root "${SECRETS_ENV_FILE}" 2>/dev/null || true
+    ok "Secrets env file already present (left untouched)."
+  else
+    info "Creating ${SECRETS_ENV_FILE} (0600, root-only)."
+    ( umask 077; cat >"${SECRETS_ENV_FILE}" <<'SECRETS'
+# pgbench-harness worker secrets — read by pgbench-worker.service only.
+# NOT managed by deploy.sh: this file is created once and never overwritten.
+# systemd (root) reads it before dropping privileges, so 0600 root:root is
+# correct even though the service runs as the pgbench user.
+#
+# PMM 3.x enablement (ops pmm-enable / pmm-status): uncomment and set the
+# service-account token (normally starts with glsa_). It is read from the
+# environment only — never put it in a spec, and the harness never writes it
+# to disk, logs, or reports.
+#PGB_PMM_TOKEN=glsa_replace_me
+#
+# After editing: sudo systemctl restart pgbench-worker
+SECRETS
+    )
+    chown root:root "${SECRETS_ENV_FILE}"
+    chmod 0600 "${SECRETS_ENV_FILE}"
+    ok "Secrets env file created — add PGB_PMM_TOKEN there to enable PMM ops."
+  fi
+}
+
+# ----------------------------------------------------------------------------
 # Step: write the environment file consumed by both systemd units + the app.
 # ----------------------------------------------------------------------------
 write_env_file() {
@@ -490,6 +527,8 @@ write_env_file() {
   cat >"${ENV_FILE}" <<EOF
 # Managed by deploy.sh — edits may be overwritten on the next run.
 # Consumed by ${WEB_UNIT}, ${WORKER_UNIT}, and the pgbench-harness web app.
+# Secrets (e.g. PGB_PMM_TOKEN) do NOT belong here: put them in
+# ${SECRETS_ENV_FILE} (0600, never touched by deploy.sh).
 PGBENCH_DATA_DIR=${DATA_DIR}
 PGBENCH_DB=${DB_PATH}
 PGBENCH_BIND=${BIND}
@@ -649,6 +688,7 @@ User=${SVC_USER}
 Group=${SVC_GROUP}
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=${ENV_FILE}
+EnvironmentFile=-${SECRETS_ENV_FILE}
 ExecStart=${BIN_WORKER}
 Restart=on-failure
 RestartSec=3
@@ -806,6 +846,7 @@ do_install() {
   setup_venv
   generate_certs
   ensure_secret_key
+  ensure_secrets_env
   write_env_file
   run_migrate
   create_admin
@@ -820,7 +861,7 @@ do_update() {
   section "Updating pgbench-harness web app"
   local prev=""; [[ -f "${VERSION_MARKER}" ]] && prev="$(cat "${VERSION_MARKER}")"
   info "Previously installed version: ${prev:-unknown}"
-  info "Update will NOT touch: results/, pgbench.db, secret.key, certs, admin creds."
+  info "Update will NOT touch: results/, pgbench.db, secret.key, certs, secrets env, admin creds."
 
   # Ensure prerequisites in case the droplet drifted, but never touch data.
   install_packages
@@ -831,6 +872,7 @@ do_update() {
   # Certs: only regenerate if explicitly requested.
   generate_certs
   ensure_secret_key          # only creates if missing; never overwrites
+  ensure_secrets_env         # only creates if missing; never overwrites
   write_env_file             # reflects any --port/--bind change
   run_migrate
   install_systemd_units      # daemon-reload + restart both services

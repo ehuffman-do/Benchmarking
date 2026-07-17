@@ -10,6 +10,11 @@ User=pgbench
 Group=pgbench
 WorkingDirectory=/opt/pgbench-harness
 EnvironmentFile=/etc/pgbench-harness.env
+# Operator-managed secrets (e.g. PGB_PMM_TOKEN for ops pmm-enable). Created
+# 0600 root:root by deploy.sh, never overwritten on update; systemd reads it
+# as root before dropping to the pgbench user. '-' = optional, so a missing
+# file never blocks the worker from starting.
+EnvironmentFile=-/etc/pgbench-harness.secrets.env
 ExecStart=/opt/pgbench-harness/venv/bin/pgbench-worker
 Restart=on-failure
 RestartSec=3

@@ -26,7 +26,8 @@ driven by a single script, **`deploy.sh`**, and two systemd services:
 | `…/certs/cert.pem`, `…/certs/key.pem` | TLS cert + private key (key `0600`). |
 | `…/INSTALLED_VERSION` | Install marker (the deployed version). |
 | `/var/log/pgbench-harness/` | `install.log` (+ `web.log`/`worker.log` if file logging is enabled). |
-| `/etc/pgbench-harness.env` | Environment file read by both services + the app. |
+| `/etc/pgbench-harness.env` | Environment file read by both services + the app. Rewritten by deploy.sh. |
+| `/etc/pgbench-harness.secrets.env` | **Operator-managed secrets for the worker** (mode `0600`, root-only). Created once, never overwritten on update. |
 | service user/group | `pgbench` (system user, no login shell), owns the data dir. |
 
 ### Environment contract (`/etc/pgbench-harness.env`)
@@ -45,6 +46,27 @@ PGBENCH_TLS_KEY=/var/lib/pgbench-harness/certs/key.pem
 To change the port or bind address, re-run the installer with `--port`/`--bind`
 (it rewrites the env file and restarts the services). Hand-editing the file also
 works, followed by `sudo systemctl restart pgbench-web pgbench-worker`.
+
+### Worker secrets (`/etc/pgbench-harness.secrets.env`)
+
+Credentials the worker needs at run time — today the PMM service-account
+token for `ops pmm-enable` / `pmm-status` — go in this file, **not** in
+`/etc/pgbench-harness.env` (that one is world-readable and rewritten on every
+deploy). The installer creates it empty with mode `0600 root:root` and never
+touches it again; only `pgbench-worker.service` loads it (via
+`EnvironmentFile=-`, so a missing/empty file is fine). systemd reads it as
+root before dropping privileges, which is why root-only permissions work even
+though the service runs as `pgbench`.
+
+```bash
+sudoedit /etc/pgbench-harness.secrets.env     # uncomment/set PGB_PMM_TOKEN=glsa_…
+sudo systemctl restart pgbench-worker
+```
+
+The token is environment-only by design: it never belongs in an ops spec, and
+the harness never writes it to specs, logs, reports, or run artifacts
+(dry-run renders it as `<token>`). If a PMM run aborts with
+"`PGB_PMM_TOKEN` is not set", this file is the place to fix.
 
 ---
 
@@ -116,7 +138,8 @@ The update path: pulls/copies new code into `/opt/pgbench-harness`, runs
 `pip install '.[web]'` into the existing venv, applies idempotent DB migrations,
 and restarts both services. It then updates `INSTALLED_VERSION`.
 
-**The update never touches** `results/`, `pgbench.db`, `secret.key`, the TLS
+**The update never touches** `results/`, `pgbench.db`, `secret.key`,
+`/etc/pgbench-harness.secrets.env`, the TLS
 certs, or admin credentials. Always [back up the data dir](#6-backup--restore)
 before a major upgrade anyway.
 

@@ -34,6 +34,12 @@
   section (`server_host`, optional `service_name`); sweep and soak reports
   then include PMM deep links (instances overview + Query Analytics) scoped
   to the run's exact time window. Specs without `pmm:` are byte-identical.
+- **Deploy: worker secrets file** — `deploy.sh` now creates
+  `/etc/pgbench-harness.secrets.env` (0600, root-only, created once and
+  never overwritten on update) and the worker unit loads it via an optional
+  `EnvironmentFile=-` line. Put `PGB_PMM_TOKEN` there — not in the 0644
+  `/etc/pgbench-harness.env`, which is world-readable and regenerated on
+  every deploy. Documented in OPERATIONS.md ("Worker secrets").
 
 ## Unreleased — day-2 operations catalog + continuous intelligence
 
