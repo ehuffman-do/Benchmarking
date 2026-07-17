@@ -151,7 +151,7 @@ def run_pg_params(spec: OpsSpec) -> int:
     payload: dict[str, Any] = {"collected_utc": utc_now_iso(), "leader": "",
                                "pg_version": "", "params": [],
                                "cr_managed": {}, "pgbackrest_global": {},
-                               "pgbouncer_global": {}}
+                               "pgbouncer_global": {}, "patroni_dcs": {}}
 
     try:
         from pgbench_harness.ops.crconfig import resolve_leader
@@ -172,6 +172,26 @@ def run_pg_params(spec: OpsSpec) -> int:
             k: str(v) for k, v in _dig(cr, PGBACKREST_GLOBAL_PATH).items()}
         payload["pgbouncer_global"] = {
             k: str(v) for k, v in _dig(cr, PGBOUNCER_GLOBAL_PATH).items()}
+        pat = (cr.get("spec") or {}).get("patroni") or {}
+        dcs: dict[str, Any] = {}
+        if pat.get("leaderLeaseDurationSeconds") is not None:
+            dcs["ttl"] = str(pat["leaderLeaseDurationSeconds"])
+        if pat.get("syncPeriodSeconds") is not None:
+            dcs["loop_wait"] = str(pat["syncPeriodSeconds"])
+
+        def _flatten(prefix: str, node: Any) -> None:
+            if not isinstance(node, dict):
+                dcs[prefix] = str(node)
+                return
+            for k2, v2 in node.items():
+                if prefix == "" and k2 == "postgresql" and isinstance(v2, dict):
+                    sub = {a: b for a, b in v2.items()
+                           if a not in ("parameters", "pg_hba", "pg_ident")}
+                    _flatten("postgresql", sub) if sub else None
+                    continue
+                _flatten(f"{prefix}.{k2}" if prefix else str(k2), v2)
+        _flatten("", pat.get("dynamicConfiguration") or {})
+        payload["patroni_dcs"] = dcs
         _check("cluster-cr", "ok",
                f"{len(cr_params)} parameter(s) managed via the CR")
     except KubeError as exc:

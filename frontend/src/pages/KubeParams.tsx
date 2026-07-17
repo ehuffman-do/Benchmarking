@@ -240,10 +240,13 @@ export function KubeParams({ me }: { me: Me }) {
 
   async function applyBk(dryRun: boolean) {
     setErr(null);
-    const action = tab === "pgbouncer" ? "pgbouncer_global" : "pgbackrest_global";
+    const action = tab === "pgbouncer" ? "pgbouncer_global"
+      : tab === "patroni" ? "patroni_dcs" : "pgbackrest_global";
     try {
       const body: Record<string, unknown> = {
-        params: { action, global: stagedBk,
+        params: { action,
+                  ...(action === "patroni_dcs" ? { settings: stagedBk }
+                      : { global: stagedBk }),
                   ...(dryRun ? { dry_run: true } : {}) },
         label: `${action}-${Object.keys(stagedBk).length}-changes`,
       };
@@ -305,7 +308,8 @@ export function KubeParams({ me }: { me: Me }) {
         <SidecarPanel kind={tab} options={sidecar?.[tab] ?? []} crKind={kt.cr_kind}
                       isAdmin={isAdmin}
                       live={tab === "pgbouncer" ? (cat?.pgbouncer_global ?? {})
-                            : tab === "pgbackrest" ? (cat?.pgbackrest_global ?? {}) : {}}
+                            : tab === "pgbackrest" ? (cat?.pgbackrest_global ?? {})
+                            : (cat?.patroni_dcs ?? {})}
                       staged={stagedBk} setStaged={setStagedBk}
                       confirm={confirm} setConfirm={setConfirm}
                       confirmName={kt.cr_name || kt.name} onApply={applyBk} />
@@ -470,7 +474,8 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
   // its CR path as guidance. Secure options never go into the CR.
   const stageable = (o: SidecarOption) =>
     ((kind === "pgbackrest" && /backups\.pgbackrest\.global/.test(pathFor(o))) ||
-     (kind === "pgbouncer" && /pgBouncer\.config\.global/.test(pathFor(o)))) &&
+     (kind === "pgbouncer" && /pgBouncer\.config\.global/.test(pathFor(o))) ||
+     (kind === "patroni" && /spec\.patroni\./.test(pathFor(o)))) &&
     !/secure/i.test(o.type);
   const needle = q.trim().toLowerCase();
   const visible = options.filter((o) =>
@@ -481,7 +486,7 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
 
   return (
     <>
-      {kind !== "patroni" && (
+      {(
         <p className="subtle" style={{ margin: "0 0 8px" }}>
           Current values come from the last parameter snapshot — hit <em>Refresh
           snapshot</em> after an apply to see them update.</p>
@@ -519,9 +524,11 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
           <span className="subtle mono">{visible.length} of {options.length}</span>
         </div>
         {kind === "patroni" && (
-          <p className="subtle">Percona v2 honors only <code>postgresql.parameters</code> and{" "}
-            <code>pg_hba</code> under dynamicConfiguration — DCS timing settings map to dedicated
-            CR fields (shown per option below).</p>
+          <p className="subtle">Stage values below — the harness routes each setting to its
+            correct CR channel per operator (on Percona, <code>ttl</code>/<code>loop_wait</code>{" "}
+            become <code>leaderLeaseDurationSeconds</code>/<code>syncPeriodSeconds</code>; the rest
+            merge into dynamicConfiguration) and verifies against the live DCS document via{" "}
+            <code>patronictl show-config</code>.</p>
         )}
         {kind === "pgbouncer" && (
           <p className="subtle">Applied via <code>proxy.pgBouncer.config.global</code> in the CR —

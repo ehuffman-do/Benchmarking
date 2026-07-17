@@ -122,6 +122,7 @@ export interface PgParamsCatalog {
   cr_managed: Record<string, string>;
   pgbackrest_global: Record<string, string>;
   pgbouncer_global?: Record<string, string>;
+  patroni_dcs?: Record<string, string>;
 }
 
 // ── diagnostics workbench ──

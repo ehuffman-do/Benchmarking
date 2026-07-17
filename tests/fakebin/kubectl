@@ -469,11 +469,12 @@ def handle_exec(st, pod, argv):
             out(patronictl_list(st))
             return 0
         if argv[1] == "show-config":
-            params = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]
-                      ["postgresql"]["parameters"])
-            out("loop_wait: 10\npostgresql:\n  parameters:\n" +
-                "".join(f"    {k}: {v}\n" for k, v in sorted(params.items())) +
-                "retry_timeout: 10\nttl: 30")
+            pat = st["cr"]["spec"].get("patroni", {})
+            dcs = json.loads(json.dumps(pat.get("dynamicConfiguration", {})))
+            dcs["ttl"] = pat.get("leaderLeaseDurationSeconds", 30)
+            dcs["loop_wait"] = pat.get("syncPeriodSeconds", 10)
+            dcs.setdefault("retry_timeout", 10)
+            out(json.dumps(dcs, indent=1))
             return 0
         if argv[1] in ("switchover", "failover"):
             cand = None

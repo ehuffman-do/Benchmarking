@@ -119,10 +119,15 @@ def parse_ops_spec(doc: Any) -> OpsSpec:
                 n = int(params.get("replicas"))
             except (TypeError, ValueError):
                 raise SpecError("ops spec: scale needs integer params.replicas")
-            if not 0 <= n <= 16:
-                raise SpecError(f"ops spec: scale replicas must be 0..16 (got {n})")
-        if operation == "resize" and not isinstance(params.get("resources"), dict):
-            raise SpecError("ops spec: resize needs params.resources "
-                            "{requests/limits: {cpu, memory}}")
+            if not 1 <= n <= 16:
+                raise SpecError(f"ops spec: scale replicas must be 1..16 (got {n}) — "
+                                "use pause for a full stop")
+        if operation == "resize":
+            res = params.get("resources")
+            if not isinstance(res, dict) or not any(
+                    (res.get(sec) or {}) for sec in ("requests", "limits")):
+                raise SpecError("ops spec: resize needs non-empty params.resources "
+                                "{requests/limits: {cpu, memory}} — an empty patch "
+                                "would strip the pods' existing resources")
     label = str(doc.get("label") or f"{op}-{target.name}")
     return OpsSpec(op=op, target=target, label=label, params=dict(params), raw=dict(doc))

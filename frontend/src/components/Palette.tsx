@@ -80,8 +80,11 @@ export function Palette({ me }: { me: Me }) {
   }, [open, openPalette]);
 
   const pages = useMemo(() =>
-    PAGES.filter((p) =>
-      (p.to !== "/users" && p.to !== "/settings" && p.to !== "/audit") || me.role === "admin"),
+    PAGES.filter((p) => {
+      if (["/users", "/settings", "/audit"].includes(p.to)) return me.role === "admin";
+      if (p.to === "/diagnostics" || p.to === "/new") return me.role !== "viewer";
+      return true;
+    }),
     [me.role]);
 
   const results = useMemo(() => {

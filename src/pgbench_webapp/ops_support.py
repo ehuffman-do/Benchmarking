@@ -368,7 +368,12 @@ def maybe_enqueue_auto_health(cfg: Config, conn: sqlite3.Connection) -> int:
                     continue
             except ValueError:
                 pass
-        if queries.active_ops_jobs(conn, kt["id"], ("ops_health",)):
+        # Never mid-operation: a health check exec'd into pods during a
+        # scenario/backup/restart produces garbage findings and false
+        # transition alerts. Wait for the destructive op to finish.
+        if queries.active_ops_jobs(conn, kt["id"],
+                                   ("ops_health", "ops_scenario", "ops_backup",
+                                    "ops_cr_apply", "ops_operate")):
             continue
         from pgbench_webapp.ops_routes import build_ops_spec_yaml
         spec_yaml = build_ops_spec_yaml(kt, "health", {},

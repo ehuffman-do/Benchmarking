@@ -291,6 +291,109 @@ def _prep_actions(kube: Kube, run: OpsRun, leader: str, db_name: str,
                   f"failed: {((r1.stderr or '') + (r2.stderr or ''))[:200]}")
 
 
+def _patroni_dcs_action(kube: Kube, run: OpsRun, spec: OpsSpec,
+                        cr: dict[str, Any], params: dict[str, Any]) -> int:
+    """Patroni DCS settings (ttl, loop_wait, synchronous_mode, postgresql.use_slots,
+    standby_cluster.*, ...). Routing is per-operator: Percona v2 exposes ttl and
+    loop_wait as dedicated CR fields (leaderLeaseDurationSeconds /
+    syncPeriodSeconds) and merges the rest of dynamicConfiguration; Crunchy
+    takes everything under dynamicConfiguration. Verified via
+    ``patronictl show-config`` — the DCS document Patroni actually runs on."""
+    t = spec.target
+    settings = {str(k): v for k, v in dict(params.get("settings") or {}).items()}
+    if not settings:
+        run.finalize("failed", error="patroni_dcs: params.settings is empty")
+        return EXIT_FAILED
+
+    def coerce(v: Any) -> Any:
+        sv = str(v)
+        if sv.lower() in ("true", "false"):
+            return sv.lower() == "true"
+        try:
+            return int(sv)
+        except ValueError:
+            return sv
+
+    percona = t.cr_kind == "perconapgcluster"
+    special = {"ttl": "leaderLeaseDurationSeconds",
+               "loop_wait": "syncPeriodSeconds"} if percona else {}
+    patch: dict[str, Any] = {}
+    current: dict[str, Any] = {}
+    spec_doc = cr.get("spec") or {}
+    for name, value in settings.items():
+        val = coerce(value)
+        if name in special:
+            patch.setdefault("spec", {}).setdefault("patroni", {})[special[name]] = val
+            current[name] = (spec_doc.get("patroni") or {}).get(special[name])
+        else:
+            node = patch.setdefault("spec", {}).setdefault("patroni", {}) \
+                .setdefault("dynamicConfiguration", {})
+            cur_node: Any = (spec_doc.get("patroni") or {}).get("dynamicConfiguration") or {}
+            parts = name.split(".")
+            for seg in parts[:-1]:
+                node = node.setdefault(seg, {})
+                cur_node = cur_node.get(seg) or {} if isinstance(cur_node, dict) else {}
+            node[parts[-1]] = val
+            current[name] = cur_node.get(parts[-1]) if isinstance(cur_node, dict) else None
+    changes = {k: [None if current.get(k) is None else str(current[k]), str(v)]
+               for k, v in settings.items() if str(current.get(k)) != str(v)}
+    atomic_write_text(run.run_dir / "patch.json", json.dumps(patch, indent=2))
+    atomic_write_text(run.run_dir / "diff.json", json.dumps(
+        {"action": "patroni_dcs", "current": {k: current.get(k) for k in settings},
+         "proposed": settings, "changed": changes}, indent=2))
+    headline: dict[str, Any] = {"action": "patroni_dcs", "changed": changes}
+    if params.get("dry_run"):
+        run.event("dry-run", "no changes applied", f"{len(changes)} value(s) would change")
+        headline["dry_run"] = True
+        run.finalize("complete", headline=headline)
+        return EXIT_OK
+    if not changes:
+        run.event("apply", "nothing to do", "all values already live in the CR")
+        run.finalize("complete", headline=headline)
+        return EXIT_OK
+    kube.run(["patch", t.cr_kind, t.cr_name, "--type", "merge",
+              "-p", json.dumps(patch)], check=True)
+    run.event("apply", "CR patched (patroni_dcs)",
+              ", ".join(f"{k}={v[1]}" for k, v in changes.items()))
+    # verify against the live DCS document (operator reconciles it into
+    # patronictl edit-config; propagation takes up to a reconcile + loop_wait)
+    import yaml as _yaml
+    _instances, leader, _view = resolve_leader(kube, t.cr_name)
+    deadline = time.monotonic() + float(params.get("verify_timeout_s", 120))
+    live: dict[str, Any] = {}
+    while True:
+        res = kube.exec(leader, "database",
+                        ["patronictl", "show-config"], timeout_s=20)
+        try:
+            doc = _yaml.safe_load(res.stdout) if res.ok else None
+        except _yaml.YAMLError:
+            doc = None
+        live = {}
+        if isinstance(doc, dict):
+            for name in settings:
+                node: Any = doc
+                for seg in name.split("."):
+                    node = node.get(seg) if isinstance(node, dict) else None
+                live[name] = node
+        ok = all(str(live.get(k)).lower() == str(coerce(v)).lower()
+                 for k, v in settings.items())
+        if ok or time.monotonic() >= deadline:
+            break
+        time.sleep(2)
+    atomic_write_text(run.run_dir / "verify.json",
+                      json.dumps({"live_dcs": live, "matched": ok}, indent=2))
+    headline["verified"] = ok
+    if not ok:
+        run.event("verify", "DCS not yet showing the new values",
+                  "the CR is patched — the operator rewrites DCS on its next "
+                  f"reconcile; live: {json.dumps({k: str(v) for k, v in live.items()})[:200]}")
+        run.finalize("warning", headline=headline)
+        return EXIT_WARNING
+    run.event("verify", "confirmed in the live DCS document (patronictl show-config)")
+    run.finalize("complete", headline=headline)
+    return EXIT_OK
+
+
 def _schedules_action(kube: Kube, run: OpsRun, spec: OpsSpec,
                       cr: dict[str, Any], action: str) -> int:
     """Pause (snapshot + remove) or restore the operator's backup schedules."""
@@ -353,6 +456,8 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
 
         if action in ("pause_schedules", "restore_schedules"):
             return _schedules_action(kube, run, spec, cr, action)
+        if action == "patroni_dcs":
+            return _patroni_dcs_action(kube, run, spec, cr, params)
 
         # Resolve what we're changing.
         if action == "rollback":
@@ -371,6 +476,20 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             action = src_action
             run.event("rollback", f"rolling back {len(proposed)} parameter(s)",
                       f"from run {params.get('rollback_of')}")
+            if action == "patroni_dcs":
+                # DCS settings have no removal semantics in a rollback — keys
+                # that didn't exist before are skipped with a note.
+                skipped = [k for k, v in proposed.items() if v is None]
+                if skipped:
+                    run.event("rollback", "skipping keys with no previous value",
+                              ", ".join(skipped))
+                settings = {k: v for k, v in proposed.items() if v is not None}
+                if not settings:
+                    run.finalize("failed", error="rollback: every rolled-back DCS "
+                                 "key was newly added — nothing to restore")
+                    return EXIT_FAILED
+                return _patroni_dcs_action(kube, run, spec, cr,
+                                           {**params, "settings": settings})
         elif action == "patroni_params":
             proposed = dict(params.get("parameters") or PATRONI_BUNDLE)
         elif action == "pgbackrest_global":
@@ -463,6 +582,12 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             run.event("verify", "all values live in pg_settings on the leader", leader)
         elif action == "pgbouncer_global":
             expected = {k: v[1] for k, v in changes.items()}
+            if not expected:
+                run.event("apply", "removal-only change applied",
+                          f"removed {', '.join(removed)}; no live value to verify")
+                headline["verified"] = None
+                run.finalize("complete", headline=headline)
+                return EXIT_OK
             rendered, ok, note = verify_pgbouncer_config(kube, t.cr_name, expected,
                                                          verify_timeout)
             atomic_write_text(run.run_dir / "verify.json", json.dumps(
@@ -480,6 +605,12 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             run.event("verify", note + " (SIGHUP reload; no pod restart)")
         else:   # pgbackrest_global
             expected = {k: v[1] for k, v in changes.items()}
+            if not expected:
+                run.event("apply", "removal-only change applied",
+                          f"removed {', '.join(removed)}; no live value to verify")
+                headline["verified"] = None
+                run.finalize("complete", headline=headline)
+                return EXIT_OK
             rendered, ok = verify_pgbackrest_config(kube, leader, expected,
                                                     verify_timeout)
             atomic_write_text(run.run_dir / "verify.json", json.dumps(

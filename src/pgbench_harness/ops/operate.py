@@ -108,10 +108,10 @@ def _op_restart(kube: Kube, run: OpsRun, spec: OpsSpec, params: dict[str, Any],
     instances, leader, view = resolve_leader(kube, t.cr_name)
     tl_before = view.timeline
 
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    patch = {"spec": {"metadata": {"annotations": {
+        "pgbench-harness/restartedAt": stamp}}}}
     if scope == "cluster":
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        patch = {"spec": {"metadata": {"annotations": {
-            "pgbench-harness/restartedAt": stamp}}}}
         plan = (f"kubectl patch {t.cr_kind} {t.cr_name} --type merge -p "
                 f"'{json.dumps(patch)}'")
     else:
@@ -134,9 +134,6 @@ def _op_restart(kube: Kube, run: OpsRun, spec: OpsSpec, params: dict[str, Any],
         return EXIT_OK
 
     if scope == "cluster":
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        patch = {"spec": {"metadata": {"annotations": {
-            "pgbench-harness/restartedAt": stamp}}}}
         kube.run(["patch", t.cr_kind, t.cr_name, "--type", "merge",
                   "-p", json.dumps(patch)], check=True)
         run.event("fire", "restart annotation stamped", stamp)
@@ -179,6 +176,14 @@ def _op_switchover(kube: Kube, run: OpsRun, spec: OpsSpec, params: dict[str, Any
     tl_before = view.timeline
     verb = "failover" if failover else "switchover"
 
+    if failover and not target:
+        # patronictl (3.x+) refuses a forced failover without a candidate;
+        # catch it in preflight instead of dying mid-run.
+        run.event("preflight", "ABORT: failover requires an explicit target member",
+                  "pick the replica to promote (switchover can auto-select)")
+        run.finalize("aborted", headline={"operation": verb,
+                                          "reason": "failover-needs-target"})
+        return EXIT_ABORTED
     if target and target == leader:
         run.event("preflight", "ABORT: target is already the leader", target)
         run.finalize("aborted", headline={"operation": verb, "reason": "target-is-leader"})
