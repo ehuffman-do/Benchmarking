@@ -39,6 +39,8 @@ export function RunDetail({ me }: { me: Me }) {
   const [activeJob, setActiveJob] = useState<Job | null>(null);
   const [budget, setBudget] = useState(0);   // planned wall-clock budget (from hello)
   const [mode, setMode] = useState("");      // sweep | soak (from hello)
+  const [verdict, setVerdict] = useState<{ finding: string; detail: string;
+    peak_sustained_iops: number } | null>(null);
   const seriesRef = useRef<Series>(emptySeries());
   const pgRef = useRef<PgSeries>(emptyPg());
   const canRun = me.role === "operator" || me.role === "admin";
@@ -49,6 +51,15 @@ export function RunDetail({ me }: { me: Me }) {
       .then((js) => setActiveJob(js.find((j) => j.run_id === runId) ?? null))
       .catch(() => {});
   }, [runId]);
+
+  useEffect(() => {
+    if (!run || !["complete", "partial", "failed"].includes(run.status || "")) return;
+    api.get<{ verdict: { finding: string; detail: string;
+                         peak_sustained_iops: number } | null }>(
+      `/api/runs/${runId}/evidence`)
+      .then((ev) => setVerdict(ev.verdict))
+      .catch(() => setVerdict(null));
+  }, [runId, run?.status]);
 
   useEffect(() => {
     const es = openStream(runId, {
@@ -170,6 +181,13 @@ export function RunDetail({ me }: { me: Me }) {
         <span className="chip live-chip"><i className={live ? "dot on" : "dot"} /> {streamState}</span>
       </div>
 
+      {verdict && (
+        <div className={`banner-${verdict.finding === "exceeds" ? "ok" : "err"}`}
+             style={{ marginBottom: 10 }}>
+          <b>IOPS verdict: {verdict.finding.toUpperCase()}</b>
+          {" — "}{verdict.detail}
+        </div>
+      )}
       <div className="actions">
         <Link className="btn primary" to={`/runs/${runId}/report`}>View report</Link>
         <a className="btn" href={`/runs/${runId}/report/download`}>Download</a>

@@ -1,0 +1,38 @@
+# Direct device probe — Percona's fileio methodology under harness control.
+# A pod is pinned to the primary's node, mounts the pgdata PVC (RWO allows a
+# same-node second mount), and runs sysbench fileio with deep async queues:
+# the definitive ceiling test that Postgres's synchronous path cannot show.
+# TEST CLUSTERS ONLY: it writes test files onto the pgdata volume and
+# saturates its IO. The harness refuses without allow_device_probe: true,
+# checks free space >= 2x file size, and cleans up files + pod on every exit.
+run:
+  label: device-probe
+  edition: advanced
+  tshirt_size: 8c32g
+target:                    # unused by the probe itself; kept for bundle metadata
+  host: db.example.com
+  port: 25060
+  database: defaultdb
+  user: doadmin
+  password_env: PGB_TARGET_PASSWORD
+workload:
+  type: oltp_read_only     # not executed; identifies the cluster's dataset
+  tables: 16
+  table_size: 1000000
+cluster:
+  cr_name: cluster1
+  namespace: percona
+device_probe:
+  allow_device_probe: true
+  file_num: 128
+  file_total_size_gb: 100
+  io_mode: async
+  async_backlog: 128
+  test_mode: rndrw
+  fsync_freq: 0
+  threads: 16
+  duration_s: 300
+limits:
+  standard_iops: 10000
+  burst_iops: 15000
+  target_iops: 40000

@@ -745,6 +745,8 @@ def peak_threads(spec: Spec) -> int:
     """Highest concurrency a run will reach (sweep or soak), for preflight sizing."""
     if spec.soak is not None:
         return spec.soak.threads
+    if spec.suite is not None:
+        return max(spec.suite.threads)
     assert spec.sweep is not None
     return max(spec.sweep.threads)
 

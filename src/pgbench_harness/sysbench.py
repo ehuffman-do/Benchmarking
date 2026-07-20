@@ -77,14 +77,19 @@ def _connection_args(spec: Spec) -> list[str]:
 
 def _workload_args(spec: Spec) -> tuple[str, list[str], Optional[str]]:
     """Return (script, workload args, cwd) for the configured workload."""
+    from pgbench_harness.spec import IO_STRESS_MIXES
     w = spec.workload
     if w.type == "tpcc":
         script = "./tpcc.lua"
         args = [f"--tables={w.tables}", f"--scale={w.scale}"]
         cwd: Optional[str] = w.tpcc_path
     else:
-        script = w.type
+        # io_stress is stock lua under the hood: mix picks the script, the
+        # oversized dataset + rand_type do the cache-defeating work
+        script = IO_STRESS_MIXES[w.mix] if w.type == "io_stress" else w.type
         args = [f"--tables={w.tables}", f"--table-size={w.table_size}"]
+        if w.rand_type:
+            args.append(f"--rand-type={w.rand_type}")
         cwd = None
     return script, args + list(w.extra_args), cwd
 
@@ -109,7 +114,8 @@ def build_run_command(spec: Spec, threads: int) -> SysbenchCommand:
     return SysbenchCommand(argv=tuple(argv), cwd=cwd)
 
 
-def build_soak_command(spec: Spec, threads: int, time_s: int) -> SysbenchCommand:
+def build_soak_command(spec: Spec, threads: int, time_s: int,
+                       rate: int = 0) -> SysbenchCommand:
     """Build a soak `run` command: fixed concurrency for *time_s* seconds.
 
     Note on outage survival: sysbench's `--ignore-errors` is MySQL-driver only;
@@ -130,6 +136,7 @@ def build_soak_command(spec: Spec, threads: int, time_s: int) -> SysbenchCommand
             f"--report-interval={spec.soak.report_interval_s}",
             "--percentile=99",
         ]
+        + ([f"--rate={rate}"] if rate else [])
         + (["--histogram"] if spec.capture.histogram else [])
         + ["run"]
     )
@@ -141,6 +148,8 @@ def build_prepare_command(spec: Spec) -> SysbenchCommand:
     script, wargs, cwd = _workload_args(spec)
     if spec.sweep is not None:
         peak = max(spec.sweep.threads)
+    elif spec.suite is not None:
+        peak = max(spec.suite.threads)
     else:
         assert spec.soak is not None
         peak = spec.soak.threads

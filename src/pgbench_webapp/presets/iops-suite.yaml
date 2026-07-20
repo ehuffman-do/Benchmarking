@@ -1,0 +1,37 @@
+# IOPS ceiling verification — the full evidentiary matrix (storage-team parity):
+# four stock sysbench OLTP workloads + pgbench TPC-B/SELECT-only, each across
+# the thread ladder, one consolidated evidence bundle. Dataset is sized via
+# dataset_gb to defeat caches (>= 2x instance RAM), fixing the weakness in the
+# storage team's own 250 MB-dataset report.
+run:
+  label: iops-suite
+  edition: advanced
+  tshirt_size: 8c32g
+  notes: "IOPS ceiling verification suite — read alongside PMM"
+target:
+  host: db.example.com
+  port: 25060
+  database: defaultdb
+  user: doadmin
+  password_env: PGB_TARGET_PASSWORD
+  sslmode: require
+workload:
+  type: io_stress          # sizes/loads sbtest tables; suite picks the mixes
+  tables: 16
+  dataset_gb: 64           # >= 2x RAM of the 32 GB instance
+  mix: mixed
+  rand_type: uniform
+suite:
+  duration_s: 300
+  threads: [1, 2, 4, 8, 16, 32]
+  warmup_s: 30
+  cooldown_s: 30
+  pgbench: true
+  pgbench_scale: 1000
+cluster:                    # makes the run cluster-aware: storage identity +
+  cr_name: cluster1         # 1s device IOPS series (KUBECONFIG env selects the
+  namespace: percona        # kubeconfig — never in the spec)
+limits:
+  standard_iops: 10000
+  burst_iops: 15000
+  target_iops: 40000

@@ -27,8 +27,19 @@ def validate_yaml(spec_yaml: str) -> dict[str, Any]:
         spec = parse_spec(doc)
     except SpecError as exc:
         return {"ok": False, "error": str(exc), "hint": getattr(exc, "hint", "")}
-    return {"ok": True, "mode": "soak" if spec.is_soak else "sweep",
-            "label": spec.run.label, "workload": spec.workload.type}
+    if spec.is_soak:
+        mode = "soak"
+    elif spec.is_suite:
+        mode = "suite"
+    elif spec.sweep is not None:
+        mode = "sweep"
+    else:
+        mode = "device-probe"
+    return {"ok": True, "mode": mode, "label": spec.run.label,
+            "workload": spec.workload.type,
+            "cluster_aware": spec.cluster is not None,
+            "probe_armed": bool(spec.device_probe
+                                and spec.device_probe.allow_device_probe)}
 
 
 def _spec_from_yaml(spec_yaml: str) -> Spec:
@@ -38,6 +49,28 @@ def _spec_from_yaml(spec_yaml: str) -> Spec:
 def dry_run(spec_yaml: str) -> dict[str, Any]:
     """Exact planned sysbench commands + wall-clock budget (mirrors `--dry-run`)."""
     spec = _spec_from_yaml(spec_yaml)
+    if spec.is_suite:
+        from pgbench_harness.runner import print_suite_dry_run
+        import contextlib, io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_suite_dry_run(spec)
+        lines = buf.getvalue().splitlines()
+        n = sum(1 for ln in lines if ln.startswith("["))
+        assert spec.suite is not None
+        return {"mode": "suite",
+                "budget_s": n * spec.suite.duration_s
+                            + max(0, n - 1) * spec.suite.cooldown_s,
+                "commands": lines}
+    if spec.device_probe is not None and spec.sweep is None and spec.soak is None:
+        from pgbench_harness.deviceprobe import run_device_probe
+        import contextlib, io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_device_probe(spec, Path("."), dry_run=True)
+        return {"mode": "device-probe",
+                "budget_s": spec.device_probe.duration_s,
+                "commands": buf.getvalue().splitlines()}
     if spec.is_soak:
         assert spec.soak is not None
         cmd = sysbench.build_soak_command(spec, spec.soak.threads, spec.soak.duration_s)

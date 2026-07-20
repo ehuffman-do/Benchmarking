@@ -2197,3 +2197,95 @@ def test_pmm_web_disable_rejects_traversal_rollback_id(opsweb):
                           "params": {"rollback_of": "../../secrets"}},
                     auth=("admin", "apw"))
     assert r.status_code == 400 and "invalid id" in r.text
+
+
+# ── IOPS framework through the web tier (cluster-aware runs from the UI) ──
+
+def _iops_suite_yaml():
+    import yaml as _yaml
+    from conftest import make_spec_doc
+    doc = make_spec_doc()
+    del doc["sweep"]
+    doc["suite"] = {"duration_s": 3, "threads": [1, 2], "warmup_s": 0,
+                    "cooldown_s": 0, "workloads": ["oltp_read_write"],
+                    "pgbench": False}
+    doc["cluster"] = {"cr_name": "cluster1", "namespace": "percona"}
+    return _yaml.safe_dump(doc)
+
+
+def test_web_suite_run_with_attached_cluster_yields_verdict(opsweb, monkeypatch):
+    """New Run -> attach cluster -> suite: the worker injects the target's
+    kubeconfig, the run captures storage identity + device series, and the
+    verdict is served to the run page via /api/runs/{id}/evidence."""
+    from conftest import TEST_PASSWORD
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    monkeypatch.setenv("FAKE_PSQL_STATE",
+                       str(cfg.data_dir.parent / "fake_psql"))
+    (cfg.data_dir.parent / "fake_psql").mkdir(exist_ok=True)
+    monkeypatch.setenv("PGB_PROBE_GRACE_S", "0.4")
+    monkeypatch.setenv("FAKE_KUBE_DEV_IOPS", "9900")
+    monkeypatch.setenv("FAKE_KUBE_DEV_UTIL", "99")
+    monkeypatch.setenv("FAKE_SYSBENCH_REALTIME", "1")   # real seconds -> device samples
+    r = client.post("/api/runs",
+                    json={"spec_yaml": _iops_suite_yaml(),
+                          "password": TEST_PASSWORD, "kube_target_id": tid},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "suite"
+    _drain_queue(cfg)
+    runs = client.get("/api/runs", auth=("viewer", "vpw")).json()
+    assert runs and runs[0]["status"] == "complete", runs[:1]
+    run_id = runs[0]["run_id"]
+    ev = client.get(f"/api/runs/{run_id}/evidence", auth=("viewer", "vpw"))
+    assert ev.status_code == 200, ev.text
+    doc = ev.json()
+    assert doc["verdict"]["finding"] == "capped"
+    assert doc["storage_identity"]["pvc"]["storage_class"] == "do-block-storage"
+    # the bundle download carries it all
+    art = client.get(f"/runs/{run_id}/artifact", auth=("viewer", "vpw"))
+    assert art.status_code == 200
+    import gzip, io, tarfile
+    names = tarfile.open(fileobj=io.BytesIO(art.content), mode="r:gz").getnames()
+    assert any(n.endswith("evidence.json") for n in names)
+    assert any(n.endswith("parsed/device_io.csv") for n in names)
+    # bad kube_target_id is a clean 400
+    r = client.post("/api/runs",
+                    json={"spec_yaml": _iops_suite_yaml(),
+                          "password": TEST_PASSWORD, "kube_target_id": 9999},
+                    auth=("op", "oppw"))
+    assert r.status_code == 400
+
+
+def test_web_device_probe_gating(opsweb):
+    import yaml as _yaml
+    from conftest import make_spec_doc
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    doc = make_spec_doc()
+    del doc["sweep"]                     # probe-only spec (no SQL load)
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "duration_s": 2,
+                           "file_total_size_gb": 1, "file_num": 8}
+    probe_yaml = _yaml.safe_dump(doc)
+    # operators cannot launch a probe
+    r = client.post("/api/runs", json={"spec_yaml": probe_yaml,
+                                       "kube_target_id": tid},
+                    auth=("op", "oppw"))
+    assert r.status_code == 403
+    # admin without a cluster attachment: clean 400 (probe needs kubeconfig)
+    r = client.post("/api/runs", json={"spec_yaml": probe_yaml},
+                    auth=("admin", "apw"))
+    assert r.status_code == 400 and "kube_target_id" in r.text
+    # armed + attached: enqueued as a device_probe job and completes
+    r = client.post("/api/runs", json={"spec_yaml": probe_yaml,
+                                       "kube_target_id": tid},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200 and r.json()["kind"] == "device_probe"
+    _drain_queue(cfg)
+    runs = client.get("/api/runs", auth=("viewer", "vpw")).json()
+    assert runs and runs[0]["status"] == "complete", runs[:1]
+    ev = client.get(f"/api/runs/{runs[0]['run_id']}/evidence",
+                    auth=("viewer", "vpw")).json()
+    assert ev["verdict"]["finding"] in ("capped", "exceeds", "inconclusive")
+    assert ev["fileio"]["iops"] > 0

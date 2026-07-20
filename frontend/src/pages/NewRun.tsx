@@ -30,24 +30,31 @@ function yamlScalar(v: unknown): string {
   return needsQuote ? JSON.stringify(s) : s;
 }
 
-const WORKLOADS = ["tpcc", "oltp_read_write", "oltp_read_only", "oltp_write_only"];
+const WORKLOADS = ["tpcc", "oltp_read_only", "oltp_read_write", "oltp_write_only", "oltp_point_select", "io_stress"];
 
 export function NewRun({ me }: { me: Me }) {
   const canRun = me.role === "operator" || me.role === "admin";
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const cloneFrom = params.get("from") || "";
+  const wantCluster = Number(params.get("cluster") || 0);
+  const wantMode = params.get("mode") || "";
 
   const [targets, setTargets] = useState<Target[]>([]);
   const [targetMode, setTargetMode] = useState<"saved" | "inline">("inline");
   const [targetId, setTargetId] = useState<number>(0);
   const [inline, setInline] = useState({ host: "", port: 5432, database: "defaultdb", user: "doadmin", sslmode: "require", password: "" });
   const [meta, setMeta] = useState({ label: "", edition: "advanced", tshirt_size: "8c32g", tags: "", ticket: "" });
-  const [wl, setWl] = useState({ type: "tpcc", tpcc_path: "/opt/sysbench-tpcc", tables: 10, scale: 30, table_size: 1000000 });
-  const [mode, setMode] = useState<"sweep" | "soak">("sweep");
+  const [wl, setWl] = useState({ type: "tpcc", tpcc_path: "/opt/sysbench-tpcc", tables: 10, scale: 30, table_size: 1000000, dataset_gb: 64, mix: "mixed", rand_type: "uniform" });
+  const [mode, setMode] = useState<"sweep" | "soak" | "suite">("sweep");
+  const [suite, setSuite] = useState({ duration_s: 300, threads: "1, 2, 4, 8, 16, 32", warmup_s: 30, cooldown_s: 30, pgbench: true, pgbench_scale: 1000 });
+  const [rateSteps, setRateSteps] = useState("");          // soak-only, optional
+  const [stepDur, setStepDur] = useState(180);
   const [sweep, setSweep] = useState({ threads: "1, 4, 16, 64", duration_s: 300, warmup_s: 60, cooldown_s: 30, repetitions: 1 });
   const [soak, setSoak] = useState({ threads: 64, duration_s: 3600, tolerate_errors: true });
   const [schedule, setSchedule] = useState("");
+  const [kubeTargets, setKubeTargets] = useState<{ id: number; name: string }[]>([]);
+  const [kubeTargetId, setKubeTargetId] = useState<number>(0);
   const [tplName, setTplName] = useState("");
   const [createDb, setCreateDb] = useState(false);
   const [recreateScope, setRecreateScope] = useState("");   // "" | "database" | "tables"
@@ -64,6 +71,15 @@ export function NewRun({ me }: { me: Me }) {
       setTargets(t);
       if (t.length) { setTargetMode("saved"); setTargetId(t[0].id); }
     }).catch(() => {});
+    api.get<{ id: number; name: string }[]>("/api/kube-targets")
+      .then(setKubeTargets).catch(() => {});
+    if (wantCluster) setKubeTargetId(wantCluster);
+    if (wantMode === "suite") { setMode("suite"); setWl((w) => ({ ...w, type: "io_stress" })); }
+    if (wantMode === "rate-steps") {
+      setMode("soak"); setRateSteps("500, 1000, 2000, 4000, 8000, 0");
+      setWl((w) => ({ ...w, type: "io_stress" }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Clone: load a prior run's spec into the editor (raw becomes authoritative).
@@ -85,15 +101,26 @@ export function NewRun({ me }: { me: Me }) {
     if (meta.ticket) run.ticket = meta.ticket;
     const workload = wl.type === "tpcc"
       ? { type: wl.type, tpcc_path: wl.tpcc_path, tables: wl.tables, scale: wl.scale }
-      : { type: wl.type, tables: 1, table_size: wl.table_size };
+      : wl.type === "io_stress"
+        ? { type: wl.type, tables: wl.tables, dataset_gb: wl.dataset_gb, mix: wl.mix, rand_type: wl.rand_type }
+        : { type: wl.type, tables: 1, table_size: wl.table_size };
     const d: Record<string, unknown> = { run, target, workload };
-    if (mode === "soak") d.soak = { threads: soak.threads, duration_s: soak.duration_s, tolerate_errors: soak.tolerate_errors };
-    else d.sweep = {
-      threads: sweep.threads.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !Number.isNaN(n)),
+    const ladder = (v: string) => v.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !Number.isNaN(n));
+    if (mode === "soak") {
+      const steps = ladder(rateSteps);
+      d.soak = steps.length
+        ? { threads: soak.threads, rate_steps: steps, step_duration_s: stepDur }
+        : { threads: soak.threads, duration_s: soak.duration_s, tolerate_errors: soak.tolerate_errors };
+    } else if (mode === "suite") {
+      d.suite = { duration_s: suite.duration_s, threads: ladder(suite.threads),
+                  warmup_s: suite.warmup_s, cooldown_s: suite.cooldown_s,
+                  pgbench: suite.pgbench, pgbench_scale: suite.pgbench_scale };
+    } else d.sweep = {
+      threads: ladder(sweep.threads),
       duration_s: sweep.duration_s, warmup_s: sweep.warmup_s, cooldown_s: sweep.cooldown_s, repetitions: sweep.repetitions,
     };
     return d;
-  }, [targetMode, targetId, targets, inline, meta, wl, mode, sweep, soak]);
+  }, [targetMode, targetId, targets, inline, meta, wl, mode, sweep, soak, suite, rateSteps, stepDur]);
 
   useEffect(() => {
     if (autoSync) setYaml(toYaml(doc) + "\n");
@@ -127,7 +154,9 @@ export function NewRun({ me }: { me: Me }) {
   async function start() {
     setErr(null);
     try {
-      await api.post("/api/runs", { spec_yaml: yaml, scheduled_utc: schedule.trim() || null, ...credBody() });
+      await api.post("/api/runs", { spec_yaml: yaml, scheduled_utc: schedule.trim() || null,
+                                    ...(kubeTargetId ? { kube_target_id: kubeTargetId } : {}),
+                                    ...credBody() });
       window.location.href = "/ui";
     } catch (e) { setErr("could not start: " + (e as Error).message); }
   }
@@ -216,13 +245,20 @@ export function NewRun({ me }: { me: Me }) {
           <hr />
           <div className="row">
             <div className="field"><label>Workload</label><select value={wl.type} onChange={(e) => setWl({ ...wl, type: e.target.value })}>{WORKLOADS.map((w) => <option key={w}>{w}</option>)}</select></div>
-            <div className="field"><label>Mode</label><select value={mode} onChange={(e) => setMode(e.target.value as "sweep" | "soak")}><option value="sweep">sweep</option><option value="soak">soak</option></select></div>
+            <div className="field"><label>Mode</label><select value={mode} onChange={(e) => setMode(e.target.value as "sweep" | "soak" | "suite")}><option value="sweep">sweep</option><option value="soak">soak</option><option value="suite">suite (IOPS evidence matrix)</option></select></div>
           </div>
           {wl.type === "tpcc" ? (
             <div className="row">
               <div className="field"><label>TPCC path</label><input value={wl.tpcc_path} onChange={(e) => setWl({ ...wl, tpcc_path: e.target.value })} /></div>
               <div className="field"><label>Tables</label><input type="number" value={wl.tables} onChange={(e) => setWl({ ...wl, tables: Number(e.target.value) })} /></div>
               <div className="field"><label>Scale (warehouses)</label><input type="number" value={wl.scale} onChange={(e) => setWl({ ...wl, scale: Number(e.target.value) })} /></div>
+            </div>
+          ) : wl.type === "io_stress" ? (
+            <div className="row">
+              <div className="field"><label>Dataset (GiB — size &ge; 2x RAM to defeat caches)</label><input type="number" value={wl.dataset_gb} onChange={(e) => setWl({ ...wl, dataset_gb: Number(e.target.value) })} /></div>
+              <div className="field"><label>Tables</label><input type="number" value={wl.tables} onChange={(e) => setWl({ ...wl, tables: Number(e.target.value) })} /></div>
+              <div className="field"><label>Mix</label><select value={wl.mix} onChange={(e) => setWl({ ...wl, mix: e.target.value })}><option value="read">read</option><option value="write">write</option><option value="mixed">mixed</option></select></div>
+              <div className="field"><label>Key distribution</label><select value={wl.rand_type} onChange={(e) => setWl({ ...wl, rand_type: e.target.value })}>{["uniform", "special", "gaussian", "pareto", "zipfian"].map((r) => <option key={r}>{r}</option>)}</select></div>
             </div>
           ) : (
             <div className="field"><label>Table size (rows)</label><input type="number" value={wl.table_size} onChange={(e) => setWl({ ...wl, table_size: Number(e.target.value) })} /></div>
@@ -236,15 +272,47 @@ export function NewRun({ me }: { me: Me }) {
                 <div className="field"><label>Reps</label><input type="number" value={sweep.repetitions} onChange={(e) => setSweep({ ...sweep, repetitions: Number(e.target.value) })} /></div>
               </div>
             </>
+          ) : mode === "suite" ? (
+            <>
+              <div className="field"><label>Thread ladder (comma)</label><input value={suite.threads} onChange={(e) => setSuite({ ...suite, threads: e.target.value })} /></div>
+              <div className="row">
+                <div className="field"><label>Duration per cell (s)</label><input type="number" value={suite.duration_s} onChange={(e) => setSuite({ ...suite, duration_s: Number(e.target.value) })} /></div>
+                <div className="field"><label>Warmup (s)</label><input type="number" value={suite.warmup_s} onChange={(e) => setSuite({ ...suite, warmup_s: Number(e.target.value) })} /></div>
+                <div className="field"><label>Stabilization (s)</label><input type="number" value={suite.cooldown_s} onChange={(e) => setSuite({ ...suite, cooldown_s: Number(e.target.value) })} /></div>
+              </div>
+              <div className="row">
+                <div className="field"><label><input type="checkbox" checked={suite.pgbench} onChange={(e) => setSuite({ ...suite, pgbench: e.target.checked })} />&nbsp;pgbench second driver (TPC-B + SELECT-only)</label></div>
+                {suite.pgbench && <div className="field"><label>pgbench scale</label><input type="number" value={suite.pgbench_scale} onChange={(e) => setSuite({ ...suite, pgbench_scale: Number(e.target.value) })} /></div>}
+              </div>
+              <p className="subtle" style={{ fontSize: 12 }}>Runs the storage team&apos;s
+                full matrix (4 sysbench OLTP workloads{suite.pgbench ? " + 2 pgbench workloads" : ""} x the
+                ladder) as one evidence bundle. Attach a cluster below for the
+                device-IOPS verdict.</p>
+            </>
           ) : (
-            <div className="row">
-              <div className="field"><label>Threads</label><input type="number" value={soak.threads} onChange={(e) => setSoak({ ...soak, threads: Number(e.target.value) })} /></div>
-              <div className="field"><label>Duration (s)</label><input type="number" value={soak.duration_s} onChange={(e) => setSoak({ ...soak, duration_s: Number(e.target.value) })} /></div>
-            </div>
+            <>
+              <div className="row">
+                <div className="field"><label>Threads</label><input type="number" value={soak.threads} onChange={(e) => setSoak({ ...soak, threads: Number(e.target.value) })} /></div>
+                <div className="field"><label>Duration (s)</label><input type="number" value={soak.duration_s} onChange={(e) => setSoak({ ...soak, duration_s: Number(e.target.value) })} disabled={!!rateSteps.trim()} /></div>
+              </div>
+              <div className="row">
+                <div className="field"><label>Rate steps (tps, comma; 0 = unthrottled; blank = plain soak)</label><input value={rateSteps} onChange={(e) => setRateSteps(e.target.value)} placeholder="500, 1000, 2000, 4000, 8000, 0" /></div>
+                {rateSteps.trim() && <div className="field"><label>Step duration (s)</label><input type="number" value={stepDur} onChange={(e) => setStepDur(Number(e.target.value))} /></div>}
+              </div>
+            </>
           )}
 
           <hr />
           <div className="field"><label>Start at (UTC, optional — blank = now)</label><input value={schedule} onChange={(e) => setSchedule(e.target.value)} placeholder="2026-06-28T02:00:00Z" /></div>
+          <div className="field"><label>Attach cluster (evidence capture, optional)</label>
+            <select value={kubeTargetId} onChange={(e) => setKubeTargetId(Number(e.target.value))}>
+              <option value={0}>none — plain SQL run</option>
+              {kubeTargets.map((k) => <option key={k.id} value={k.id}>{k.name}</option>)}
+            </select>
+            <span className="subtle" style={{ fontSize: 11 }}>injects the target&apos;s
+              kubeconfig into the worker so storage identity + the 1s device-IOPS
+              series are captured (pair with a <code>cluster:</code> section in the spec)</span>
+          </div>
           <div className="row">
             <div className="field"><label>Save current spec as template</label><input value={tplName} onChange={(e) => setTplName(e.target.value)} placeholder="template name" /></div>
             <button className="ghost" style={{ alignSelf: "end", marginBottom: 12 }} onClick={saveTemplate} disabled={!tplName}>Save template</button>

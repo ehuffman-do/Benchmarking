@@ -618,6 +618,28 @@ export function KubeTargetView({ me }: { me: Me }) {
         );
       })()}
 
+      {canOp && (
+        <div className="card" style={{ marginTop: 16 }}>
+          <div className="card-head"><h2>IOPS evidence</h2></div>
+          <p className="subtle" style={{ marginTop: 0 }}>
+            Can this cluster&apos;s pgdata volume exceed the standard 10K IOPS
+            throttle? Launch an evidence run with this cluster pre-attached —
+            storage identity (PVC/PV/StorageClass) and a 1s device-IOPS series
+            are captured automatically, and the run page shows the
+            capped / exceeds / inconclusive verdict with the full bundle
+            downloadable for independent review.
+          </p>
+          <Link className="btn primary" to={`/new?cluster=${targetId}&mode=suite`}>
+            Evidence suite (full matrix)</Link>{" "}
+          <Link className="btn" to={`/new?cluster=${targetId}&mode=rate-steps`}>
+            Rate-stepped knee finder</Link>{" "}
+          <span className="subtle" style={{ fontSize: 12 }}>
+            The direct device probe (sysbench fileio on the pgdata volume) is
+            spec-armed and admin-only: paste examples/device-probe.yaml into
+            New Run with this cluster attached — test clusters only.</span>
+        </div>
+      )}
+
       <div className="card" style={{ marginTop: 16 }}>
         <div className="card-head"><h2>Op runs on this target</h2>
           <div className="spacer" /><Link className="btn" to="/ops/runs">all ops runs →</Link></div>

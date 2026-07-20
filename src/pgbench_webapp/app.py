@@ -323,9 +323,43 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         v = harness_api.validate_yaml(clean_yaml)
         if not v.get("ok"):
             raise HTTPException(400, v.get("error", "invalid spec"))
-        kind = "soak" if v["mode"] == "soak" else "run"
+        if v["mode"] == "device-probe":
+            # destructive-adjacent: saturates the pgdata volume. Admin + the
+            # in-spec arming flag (the runner refuses without it anyway).
+            if user["role"] != "admin":
+                raise HTTPException(403, "device-probe runs are admin-only")
+            kind = "device_probe"
+        else:
+            kind = v["mode"] if v["mode"] in ("soak", "suite") else "run"
+        kube_target_id = payload.get("kube_target_id") or None
+        if kube_target_id is not None:
+            kt = queries.get_kube_target(conn, int(kube_target_id))
+            if kt is None:
+                raise HTTPException(400, "kube_target_id does not exist")
+            kube_target_id = int(kube_target_id)
+            # single pane of glass: attaching a registered cluster IS the
+            # cluster-awareness switch — synthesize the spec's cluster: section
+            # from the registry when the YAML doesn't carry one.
+            doc = yaml.safe_load(clean_yaml)
+            if "cluster" not in doc:
+                doc["cluster"] = {k: v for k, v in (
+                    ("cr_name", kt["cr_name"]), ("namespace", kt["namespace"]),
+                    ("cr_kind", kt["cr_kind"]), ("context", kt["context"]),
+                ) if v}
+                if not doc["cluster"].get("cr_name"):
+                    raise HTTPException(400, "attached kube target has no CR "
+                                             "name — run discover on it first")
+                clean_yaml = yaml.safe_dump(doc, sort_keys=False)
+                v = harness_api.validate_yaml(clean_yaml)
+                if not v.get("ok"):
+                    raise HTTPException(400, v.get("error", "invalid spec"))
+        elif kind == "device_probe":
+            raise HTTPException(400, "device-probe needs kube_target_id (the "
+                                     "cluster whose kubeconfig the worker "
+                                     "injects)")
         job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"],
-                                     scheduled_utc=payload.get("scheduled_utc") or None)
+                                     scheduled_utc=payload.get("scheduled_utc") or None,
+                                     kube_target_id=kube_target_id)
         password = payload.get("password")
         if password:
             store.set(job_password_ref(job_id), password)  # encrypted, off-DB
@@ -613,9 +647,24 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                              "pg": (run_dir / "parsed" / "pg_timeseries.csv").exists(),
                              "pg_settings": _read_pg_settings(run_dir)})
 
+    @app.get("/api/runs/{run_id}/evidence")
+    def run_evidence(run_id: str,
+                     user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        """evidence.json for the run (verdict, storage identity, caveats) —
+        404 when the run produced no evidence document."""
+        run_dir = _run_dir_safe(cfg, run_id)
+        path = run_dir / "evidence.json"
+        if not path.exists():
+            raise HTTPException(404, "no evidence document for this run")
+        try:
+            return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            raise HTTPException(500, "evidence.json unreadable")
+
     _CSV_FILES = {"samples": "parsed/samples.csv",
                   "timeseries": "parsed/soak_timeseries.csv",
-                  "pg": "parsed/pg_timeseries.csv"}
+                  "pg": "parsed/pg_timeseries.csv",
+                  "device": "parsed/device_io.csv"}
 
     @app.get("/runs/{run_id}/csv")
     def run_csv(run_id: str, which: str = "samples",

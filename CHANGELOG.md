@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased — IOPS ceiling verification framework
+
+- **Single pane of glass**: the whole framework runs from the console. New
+  Run gains a **suite mode** form (ladder/duration/pgbench toggle), an
+  **io_stress** workload form (dataset_gb / mix / key distribution), and
+  **rate steps** on soak; an "Attach cluster" selector lists the registered
+  Kube Targets — attaching one makes the worker inject that target's
+  kubeconfig AND auto-synthesizes the spec's `cluster:` section from the
+  registry, so storage identity + the device-IOPS series are captured with
+  zero YAML editing. The cluster page gains an **IOPS evidence** quick-launch
+  card (suite / rate-stepped, pre-attached). The run page shows the
+  **verdict banner** (capped / exceeds / inconclusive) served by the new
+  `/api/runs/{id}/evidence` endpoint, next to the existing bundle download.
+  Device-probe specs submit through New Run too (admin-only, requires an
+  attached cluster, plus the in-spec `allow_device_probe` arming the runner
+  enforces); web dry-run renders suite and probe plans.
+
+- **New run modes**: `suite` (the storage team's full evidentiary matrix —
+  oltp_point_select / read_only / read_write / write_only + pgbench TPC-B and
+  SELECT-only across a thread ladder, sequential segments, one consolidated
+  bundle), rate-stepped soak (`soak.rate_steps` + `step_duration_s` via
+  sysbench `--rate`, each step stamped as an event), and `device-probe`
+  (guardrailed sysbench fileio from a pod pinned to the primary's node,
+  mounting the pgdata PVC — refuses without `allow_device_probe: true`,
+  checks free space >= 2x file size, cleans up files + pod on all exit paths).
+- **`workload.type: io_stress`**: `dataset_gb` as the primary knob (table_size
+  derived; sized to defeat caches), `mix: read|write|mixed` picks the stock
+  lua, `rand_type` configurable (uniform default).
+- **pgbench as a second driver**: command builders + progress/summary parsers
+  mirroring the sysbench module; `doctor` checks the binary.
+- **Cluster-aware evidence** (spec `cluster:` section, KUBECONFIG env-only):
+  storage identity capture (PVC/PV/StorageClass/placement with high-IOPS
+  marker detection — "no marker" recorded as evidence) and a 1s device IOPS
+  series (single long-lived exec streaming /proc/diskstats; device resolved
+  from /proc/self/mountinfo; derivation to reads/writes/IOPS/MB/s/await/util/
+  queue in summarize). Both degrade to recorded warnings, never run failures.
+- **Verdict engine**: configurable `limits:` (recorded, not hardcoded);
+  10s-sustained peak + utilization -> **capped / exceeds / inconclusive**
+  with the numbers and, for inconclusive, what stopped scaling. Printed in
+  CLI output and the report.
+- **Evidence bundle**: report.html mirroring the storage team's structure
+  (verdict, storage identity, per-workload exact-SQL descriptions generated
+  from workload definitions, peak + per-concurrency tables, scaling charts,
+  device timeline with reference-limit lines + event marks, auto-populated
+  caveats), plus evidence.json and CSV series; the existing web "Artifacts"
+  download ships it as one self-interpreting archive.
+
+
 ## Unreleased — PMM bug bash (round 3): seven fixes
 
 - **Bounce is now genuinely HA-preserving**: the sidecar bounce deletes

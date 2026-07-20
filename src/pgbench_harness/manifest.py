@@ -27,6 +27,7 @@ class Level:
 
     rep: int
     threads: int
+    seg: str = ""                     # suite segment (workload name); "" = classic sweep
     status: str = STATUS_PENDING
     started_utc: str = ""
     finished_utc: str = ""
@@ -36,7 +37,8 @@ class Level:
 
     @property
     def key(self) -> str:
-        return f"rep{self.rep}_t{self.threads:03d}"
+        base = f"rep{self.rep}_t{self.threads:03d}"
+        return f"{self.seg}_{base}" if self.seg else base
 
 
 @dataclass
