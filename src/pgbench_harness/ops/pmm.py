@@ -83,6 +83,16 @@ def _token(run: OpsRun, required: bool) -> Optional[str]:
                       "environment — it never goes in the spec")
         return None
     get_redactor().register(token)
+    # a non-reversible fingerprint so operators can compare what the worker
+    # actually loaded against their shell without ever printing the token:
+    #   printf %s "$PGB_PMM_TOKEN" | sha256sum
+    import hashlib
+    fp = hashlib.sha256(token.encode()).hexdigest()[:12]
+    run.event("preflight", f"PMM token loaded (sha256 {fp}…, {len(token)} chars)",
+              'compare with: printf %s "$PGB_PMM_TOKEN" | sha256sum — a '
+              "mismatch means the worker's secrets file differs from your "
+              "shell (edit /etc/pgbench-harness.secrets.env, then restart "
+              "pgbench-worker)")
     if not token.startswith("glsa_"):
         run.event("preflight", "token does not start with 'glsa_'",
                   "PMM3 service-account tokens normally do — continuing anyway")
@@ -385,6 +395,22 @@ def _inventory_check(run: OpsRun, cfg: dict[str, Any], token: Optional[str],
     try:
         with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
             doc = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        # the server WAS reached — an HTTP status is an answer, not an outage
+        out["http_status"] = exc.code
+        if exc.code in (401, 403):
+            run.event("inventory", f"PMM API rejected the token (HTTP {exc.code}) "
+                      "— recorded as a warning",
+                      "the server is reachable; check the service-account token "
+                      "in PGB_PMM_TOKEN (PMM UI -> Administration -> Users and "
+                      "access -> Service accounts: token valid, account enabled, "
+                      "role Admin/Editor). The AGENT-side token in the secret is "
+                      "the same value — if agents also fail auth, QAN will stay "
+                      "empty until the token is fixed and pmm-enable re-run")
+        else:
+            run.event("inventory", f"PMM API answered HTTP {exc.code} — "
+                      "recorded as a warning", str(exc)[:150])
+        return out
     except (urllib.error.URLError, OSError, ValueError) as exc:
         run.event("inventory", "PMM server unreachable from the harness host — "
                   "recorded as a warning, not a failure", str(exc)[:150])
@@ -400,6 +426,12 @@ def _inventory_check(run: OpsRun, cfg: dict[str, Any], token: Optional[str],
               f"{len(names)} PostgreSQL service(s) registered; "
               f"{out['nodes_covered']}/{len(instances)} instance pods matched")
     return out
+
+
+def _norm_lib(x: str) -> str:
+    """Normalize one shared_preload_libraries token: real clusters render the
+    value with spaces, single quotes, or operator-doubled entries."""
+    return x.strip().strip("'\"").strip()
 
 
 def _validation(kube: Kube, run: OpsRun, t: Any, cfg: dict[str, Any],
@@ -425,13 +457,31 @@ def _validation(kube: Kube, run: OpsRun, t: Any, cfg: dict[str, Any],
     cr_spl = str((((((cr.get("spec") or {}).get("patroni") or {})
                     .get("dynamicConfiguration") or {}).get("postgresql") or {})
                   .get("parameters") or {}).get("shared_preload_libraries", ""))
-    rt_spl = _psql(kube, leader, cfg["database"],
-                   "SHOW shared_preload_libraries;") or ""
+    # freshly bounced/elected leaders can refuse connections for a bit —
+    # retry the runtime probe and surface the REAL error instead of letting
+    # an empty answer read as "libraries missing"
+    rt_spl, last_err = "", ""
+    probe_deadline = time.monotonic() + 60
+    while True:
+        res = kube.psql(leader, "SHOW shared_preload_libraries;",
+                        database=cfg["database"], timeout_s=30)
+        if res.ok and res.stdout.strip():
+            rt_spl = res.stdout.strip()
+            break
+        last_err = (res.stderr or res.stdout).strip()[:200]
+        if time.monotonic() >= probe_deadline:
+            run.event("verify", "could not read runtime "
+                      "shared_preload_libraries from the leader",
+                      last_err or "empty answer — library check will read "
+                      "as missing; re-run Check status in a minute")
+            break
+        time.sleep(cfg["poll_s"])
     # every library the CR declares must be loaded at runtime (after an
     # enable, the CR carries the merged preserved+extension list)
     want_src = cr_spl if cr_spl.strip() else cfg["extension"]
-    want = [x.strip() for x in want_src.split(",") if x.strip()]
-    libs = {lib: lib in rt_spl for lib in want}
+    want = [_norm_lib(x) for x in want_src.split(",") if _norm_lib(x)]
+    rt_tokens = {_norm_lib(x) for x in rt_spl.split(",")}
+    libs = {lib: lib in rt_tokens or lib in rt_spl for lib in want}
     if cr_spl and rt_spl and cr_spl != rt_spl:
         run.event("verify", "runtime shared_preload_libraries differs from the "
                   "CR spec value", "operator reconcile doubling — cosmetic only; "

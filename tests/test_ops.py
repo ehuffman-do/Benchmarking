@@ -2159,6 +2159,10 @@ def test_pmm_token_whitespace_is_stripped(pmmops, monkeypatch):
     events = (_only_pmm_run_dir(pmmops, "pmm-enable") / "events.jsonl").read_text()
     assert "does not start with 'glsa_'" not in events
     assert "glsa_padded_token_SENTINEL_42" not in events
+    # fingerprint of the STRIPPED token, for shell comparison — never the token
+    import hashlib
+    fp = hashlib.sha256(b"glsa_padded_token_SENTINEL_42").hexdigest()[:12]
+    assert f"sha256 {fp}" in events and "29 chars" in events
 
 
 def test_pmm_web_enable_mutex_blocks_second_destructive(opsweb, monkeypatch):
@@ -2289,3 +2293,49 @@ def test_web_device_probe_gating(opsweb):
                     auth=("viewer", "vpw")).json()
     assert ev["verdict"]["finding"] in ("capped", "exceeds", "inconclusive")
     assert ev["fileio"]["iops"] > 0
+
+
+def test_pmm_inventory_401_reports_token_rejection_not_unreachable(pmmops):
+    """Field bug: an HTTP 401 from the PMM API was reported as 'server
+    unreachable'. A status code IS an answer — say the token was rejected,
+    keep it a warning, and don't fail the run."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from pgbench_harness.ops.pmm import run_pmm_enable
+
+    class Deny(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b'{"message":"Unauthorized"}')
+
+        def log_message(self, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Deny)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        rc = run_pmm_enable(
+            _pmm_ops_spec("pmm-enable",
+                          server_host=f"http://127.0.0.1:{srv.server_port}"),
+            pmmops)
+    finally:
+        srv.shutdown()
+    assert rc == 0                                # enablement itself succeeded
+    events = (_only_pmm_run_dir(pmmops, "pmm-enable") / "events.jsonl").read_text()
+    assert "rejected the token (HTTP 401)" in events
+    assert "Service accounts" in events           # actionable pointer
+    assert "unreachable" not in events
+
+
+def test_pmm_spl_check_tolerates_real_cluster_renderings():
+    """Runtime SHOW shared_preload_libraries can come back quoted, spaced,
+    or operator-doubled — none of those mean a library is missing."""
+    from pgbench_harness.ops.pmm import _norm_lib
+    for rt in ("pgaudit,pg_stat_monitor",
+               "pgaudit, pg_stat_monitor",
+               "'pgaudit, pg_stat_monitor'",
+               "pgaudit,pgaudit, pg_stat_monitor"):
+        tokens = {_norm_lib(x) for x in rt.split(",")}
+        assert "pgaudit" in tokens and "pg_stat_monitor" in tokens, rt

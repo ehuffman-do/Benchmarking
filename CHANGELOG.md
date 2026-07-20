@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased — IOPS ceiling verification framework
+## Unreleased — field fixes from the first live PMM enablement
+
+- **HTTP 401 from the PMM inventory API is no longer reported as "server
+  unreachable"** — a status code is an answer. 401/403 now reads "PMM API
+  rejected the token" with an actionable pointer (check the service-account
+  token/role in the PMM UI; the agents use the same value). Still a
+  warning, never a run failure.
+- **`libs MISSING` false alarm hardened**: the runtime
+  `shared_preload_libraries` probe on a freshly bounced/elected leader now
+  retries for up to 60s and surfaces the real psql error when it ultimately
+  fails (an empty answer no longer silently reads as "libraries missing"),
+  and library matching normalizes quotes/spaces/operator-doubled entries the
+  way real clusters render the value.
+
 
 - **Single pane of glass**: the whole framework runs from the console. New
   Run gains a **suite mode** form (ladder/duration/pgbench toggle), an
