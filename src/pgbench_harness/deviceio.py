@@ -424,11 +424,20 @@ def compute_verdict(rows: list[dict[str, float]], limits: Limits) -> dict[str, A
                             f"{burst:,} burst allowance")
     else:
         v["finding"] = "inconclusive"
-        if util >= 95:
-            v["detail"] = (f"device fully utilized ({util:.0f}%) but only "
-                           f"{peak10:,.0f} IOPS sustained — plateau far below "
-                           f"the {std:,} limit; the volume itself looks "
-                           "smaller-provisioned than standard, re-check sizing")
+        if util >= 95 and queue >= 64:
+            v["detail"] = (f"device fully utilized ({util:.0f}%) with a deep "
+                           f"queue (QD~{queue:.0f}) but only {peak10:,.0f} IOPS "
+                           f"sustained — plateau far below the {std:,} limit; "
+                           "the volume itself looks smaller-provisioned than "
+                           "standard, re-check sizing")
+        elif util >= 95:
+            v["detail"] = (f"device busy ({util:.0f}% util) but the queue was "
+                           f"shallow (QD~{queue:.0f}) at only {peak10:,.0f} "
+                           "sustained IOPS — on network volumes utilization "
+                           "means time-busy, NOT saturation; this concurrency "
+                           "never actually tested the limit. Drive deeper "
+                           "queues: the device-probe (async backlog) or more "
+                           "client concurrency")
         else:
             v["detail"] = (f"only {peak10:,.0f} sustained IOPS with device util "
                            f"{util:.0f}% — the load never generated enough "

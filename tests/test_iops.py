@@ -373,3 +373,65 @@ def test_device_probe_e2e_capped_and_cleaned_up(iops_env, monkeypatch):
                     .read_text())
     assert not st.get("extra_pods")
     assert st.get("probe_files") is False
+
+
+def test_device_probe_keep_files_reuses_across_runs(iops_env, monkeypatch):
+    """Iterating probe parameters (threads/backlog) must not pay the multi-
+    minute file prepare each time: keep_files reuses the test files and skips
+    cleanup; a later run without it reclaims the space."""
+    monkeypatch.setenv("FAKE_KUBE_DEV_IOPS", "9950")
+    monkeypatch.setenv("FAKE_KUBE_DEV_UTIL", "99")
+    results = iops_env / "results"
+    doc = make_spec_doc()
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "duration_s": 2,
+                           "file_total_size_gb": 1, "file_num": 8,
+                           "threads": 4, "keep_files": True}
+    spec_path = iops_env / "probe.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("device-probe", "--spec", str(spec_path),
+                   "--results-dir", str(results)) == 0
+    st = json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    assert st.get("probe_files") is True                 # kept for next round
+    run1 = find_run_dir(results)
+    assert run_cli("device-probe", "--spec", str(spec_path),
+                   "--results-dir", str(results)) == 0
+    run2 = sorted(d for d in results.iterdir() if d != run1)[-1]
+    prep2 = (run2 / "raw" / "fileio_prepare.log").read_text()
+    assert "skipped: reusing existing test files" in prep2
+    log2 = (run2 / "harness.log").read_text()
+    assert "prepare skipped" in log2
+    # a final run WITHOUT keep_files reclaims the space
+    doc["device_probe"]["keep_files"] = False
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("device-probe", "--spec", str(spec_path),
+                   "--results-dir", str(results)) == 0
+    st = json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    assert st.get("probe_files") is False
+
+
+def test_probe_summary_falls_back_to_device_series(tmp_path):
+    """Field bug: an unrecognized sysbench summary printed 'fileio result: ?'
+    — the device counters are the ground truth, so the figures derive from
+    them over the fileio window."""
+    from pgbench_harness.deviceprobe import _fill_from_device, parse_fileio_result
+    assert parse_fileio_result("some unknown 0.5-era output") == {}
+    raw = tmp_path / "raw"
+    raw.mkdir(parents=True)
+    (raw / "diskstats_device.json").write_text(
+        json.dumps({"majmin": "259:4", "device": "nvme1n1"}))
+    lines = []
+    base_s = 1_760_000_000                              # epoch seconds
+    for i in range(8):
+        reads, writes = 6000 * i, 4000 * i
+        lines += [str((base_s + i) * 1000),
+                  f" 259       4 nvme1n1 {reads} 0 {reads * 32} {reads // 3} "
+                  f"{writes} 0 {writes * 32} {writes // 2} 2 {i * 980} "
+                  f"{i * 3900} 0 0", "==="]
+    (raw / "diskstats.log").write_text("\n".join(lines))
+    from datetime import datetime, timezone
+    iso = lambda s: datetime.fromtimestamp(s, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    out = _fill_from_device(tmp_path, iso(base_s), iso(base_s + 8))
+    assert out["iops"] == 10000.0
+    assert "derived from device counters" in out["source"]

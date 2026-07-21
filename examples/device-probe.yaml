@@ -32,6 +32,11 @@ device_probe:
   fsync_freq: 0
   threads: 16
   duration_s: 300
+  # keep_files: true       # reuse the prepared test files across probe
+  #                        # iterations (skips the multi-minute prepare AND
+  #                        # the end-of-run cleanup). Run once more with
+  #                        # keep_files false — or rm -rf
+  #                        # /pgdata/pgb-fileio-probe — to reclaim the space.
 limits:
   standard_iops: 10000
   burst_iops: 15000

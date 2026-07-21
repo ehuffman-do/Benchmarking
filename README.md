@@ -476,6 +476,9 @@ pgbench-harness soak --spec examples/iops-rate-steps.yaml
 
 # 3. The definitive ceiling test (TEST CLUSTERS ONLY): sysbench fileio from
 #    a pod pinned to the primary's node, mounting the pgdata PVC directly.
+#    Iterating on threads/backlog? Set device_probe.keep_files: true to reuse
+#    the prepared test files across runs (skips the multi-minute prepare);
+#    a final run without it cleans them up.
 pgbench-harness device-probe --spec examples/device-probe.yaml
 ```
 
