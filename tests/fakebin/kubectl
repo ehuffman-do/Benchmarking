@@ -587,6 +587,11 @@ def handle_exec(st, pod, argv):
         if joined.rstrip().endswith("cleanup"):
             out("Removing test files...")
             return 0
+        if os.environ.get("FAKE_KUBE_FILEIO_RUN_RC"):
+            # simulate the load-driving exec dying instantly (API blip,
+            # fd-limit fatal, etc.) — exercises the salvage path
+            sys.stderr.write("error: unable to upgrade connection\n")
+            return int(os.environ["FAKE_KUBE_FILEIO_RUN_RC"])
         run_t = min(int(t_arg or 1), 20)
         time.sleep(run_t)                      # let the device sampler collect
         r, w = DEV_IOPS * 0.6, DEV_IOPS * 0.4
@@ -641,6 +646,10 @@ def handle_exec(st, pod, argv):
             return 0
     if argv[0] == "pgbackrest" or (argv[0] == "bash" and "pgbackrest" in joined):
         if "info" in argv:
+            if os.environ.get("FAKE_KUBE_PGBACKREST_INFO_RC"):
+                # exec/pgbackrest failure — the lock check must fail CLOSED
+                sys.stderr.write("error: unable to upgrade connection\n")
+                return int(os.environ["FAKE_KUBE_PGBACKREST_INFO_RC"])
             out(pgbackrest_info_json(st) if "--output=json" in argv
                 else pgbackrest_info(st))
             return 0

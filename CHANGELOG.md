@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — hotfix: error paths crashed on KubeResult.rc
+
+- Field crash: the device probe's new exec-death salvage path (and the
+  backup/failover fail-closed lock checks) referenced `res.rc`, but the
+  field is `returncode` — the AttributeError only fired when the exec
+  actually FAILED, masking the real failure and discarding the run.
+  All sites fixed, `KubeResult.rc` added as an alias so the mistake
+  class is inert, and the fake cluster gained failure knobs
+  (FAKE_KUBE_FILEIO_RUN_RC, FAKE_KUBE_PGBACKREST_INFO_RC) so these
+  error paths are now exercised by tests: a dying probe exec produces a
+  partial run with a device-derived verdict, and a failing pgbackrest
+  info aborts the backup preflight.
+
 ## Unreleased — bug bash round 5 (whole-harness adversarial review)
 
 - **Knee-finder ladder accounting rewritten**: after a queue-full skip the

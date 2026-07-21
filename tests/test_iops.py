@@ -511,6 +511,56 @@ def test_device_probe_first_keep_files_run_requires_full_space(iops_env, monkeyp
     assert rc == 2
 
 
+def test_device_probe_salvages_a_dying_run_exec(iops_env, monkeypatch):
+    """Field crash: the salvage path itself had an AttributeError (res.rc vs
+    res.returncode) that only executed when the exec FAILED — masking the
+    real failure and discarding the run. The path must produce a partial
+    run with a device-derived summary and a verdict."""
+    monkeypatch.setenv("FAKE_KUBE_DEV_IOPS", "9950")
+    monkeypatch.setenv("FAKE_KUBE_DEV_UTIL", "99")
+    monkeypatch.setenv("FAKE_KUBE_FILEIO_RUN_RC", "1")
+    results = iops_env / "results"
+    doc = make_spec_doc()
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "duration_s": 2,
+                           "file_total_size_gb": 1, "file_num": 8,
+                           "threads": 4}
+    spec_path = iops_env / "probe.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    rc = run_cli("device-probe", "--spec", str(spec_path),
+                 "--results-dir", str(results))
+    assert rc in (0, 1)                    # a verdict, not a crash (exit 2)
+    run_dir = find_run_dir(results)
+    man = json.loads((run_dir / "manifest.json").read_text())
+    assert man["status"] == "partial"      # exec died -> partial, not failed
+    log = (run_dir / "harness.log").read_text()
+    assert "fileio run exec died" in log and "rc=1" in log
+    run_log = (run_dir / "raw" / "fileio_run.log").read_text()
+    assert "no output" in run_log          # the failure reason is preserved
+    assert (run_dir / "evidence.json").exists()
+
+
+def test_backup_lock_check_fails_closed_on_exec_failure(iops_env, monkeypatch):
+    """The pgBackRest lock check is a safety rail: an exec failure must read
+    as 'cannot verify -> abort', never as 'lock clear'."""
+    from pgbench_harness.ops.backup import preflight
+    from pgbench_harness.ops.kube import Kube
+    from pgbench_harness.ops.oprun import OpsRun
+    from pgbench_harness.ops.opspec import parse_ops_spec
+    monkeypatch.setenv("FAKE_KUBE_PGBACKREST_INFO_RC", "1")
+    kube = Kube(namespace="percona")
+    run = OpsRun(iops_env / "results", "backup", "cluster1",
+                 {"cr_name": "cluster1"}, {})
+    spec = parse_ops_spec({"op": "backup",
+                           "target": {"name": "cluster1",
+                                      "cr_name": "cluster1",
+                                      "namespace": "percona"}})
+    clear, _info, _cfg = preflight(kube, run, spec, "cluster1-instance1-abcd-0")
+    assert clear is False
+    events = (run.run_dir / "events.jsonl").read_text()
+    assert "cannot verify stanza lock" in events
+
+
 def test_fill_from_device_falls_back_to_whole_series_on_clock_skew(tmp_path):
     """Pod-stamped samples vs host-stamped window: NTP skew must not empty
     the summary when the series is complete."""

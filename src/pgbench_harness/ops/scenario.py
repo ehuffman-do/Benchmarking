@@ -332,7 +332,7 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
                          ["pgbackrest", "--stanza=db", "info"], timeout_s=30)
         if not info.ok or not info.stdout.strip():
             run.event("preflight", "ABORT: cannot verify pgBackRest lock",
-                      f"pgbackrest info failed (rc={info.rc}) — refusing to "
+                      f"pgbackrest info failed (rc={info.returncode}) — refusing to "
                       "fire a failover without proof no backup is in flight")
             run.finalize("aborted", headline={"case": case,
                                               "reason": "lock unverifiable"})
