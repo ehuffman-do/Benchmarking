@@ -17,9 +17,12 @@ from pgbench_harness.parser import IntervalSample
 from pgbench_harness.spec import Spec
 from pgbench_harness.sysbench import SysbenchCommand, _line_buffered  # noqa: F401
 
+# lat/stddev can BOTH be NaN on a zero-transaction interval (a stall — the
+# exact sample a contended suite cell must not lose)
 PROGRESS_RE = re.compile(
     r"progress:\s+(?P<t>[\d.]+)\s+s,\s+(?P<tps>[\d.]+)\s+tps,\s+"
-    r"lat\s+(?P<lat>[\d.]+)\s+ms\s+stddev\s+(?P<std>[\d.]+|NaN)"
+    r"lat\s+(?P<lat>[\d.]+|-?[Nn]a[Nn])\s+ms\s+stddev\s+"
+    r"(?P<std>[\d.]+|-?[Nn]a[Nn])"
     r"(?:,\s+(?P<failed>\d+)\s+failed)?")
 
 SUMMARY_TPS_RE = re.compile(r"^tps = (?P<tps>[\d.]+)", re.MULTILINE)
@@ -57,7 +60,7 @@ def parse_pgbench_progress(line: str) -> Optional[IntervalSample]:
     if not m:
         return None
     tps = float(m.group("tps"))
-    lat = 0.0 if m.group("lat") == "NaN" else float(m.group("lat"))
+    lat = 0.0 if "nan" in m.group("lat").lower() else float(m.group("lat"))
     failed = float(m.group("failed") or 0)
     return IntervalSample(
         t_offset=float(m.group("t")), threads=0, tps=tps, qps=tps,

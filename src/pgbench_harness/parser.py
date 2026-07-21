@@ -21,26 +21,26 @@ from typing import Optional
 # one. Tolerating ":?" everywhere makes the parser robust across builds.
 INTERVAL_RE = re.compile(
     r"\[\s*(?P<t>\d+)s\s*\]\s+thds:?\s*(?P<thds>\d+)"
-    r"\s+tps:?\s*(?P<tps>[\d.]+)"
-    r"\s+qps:?\s*(?P<qps>[\d.]+)"
-    r"\s+\(r/w/o:?\s*(?P<r>[\d.]+)/(?P<w>[\d.]+)/(?P<o>[\d.]+)\)"
-    r"\s+lat\s+\(ms,(?P<pct>\d+)%\):?\s*(?P<lat>[\d.]+)"
-    r"\s+err/s:?\s*(?P<err>[\d.]+)"
-    r"\s+reconn/s:?\s*(?P<reconn>[\d.]+)"
+    r"\s+tps:?\s*(?P<tps>\d+(?:\.\d+)?)"
+    r"\s+qps:?\s*(?P<qps>\d+(?:\.\d+)?)"
+    r"\s+\(r/w/o:?\s*(?P<r>\d+(?:\.\d+)?)/(?P<w>\d+(?:\.\d+)?)/(?P<o>\d+(?:\.\d+)?)\)"
+    r"\s+lat\s+\(ms,(?P<pct>\d+)%\):?\s*(?P<lat>\d+(?:\.\d+)?)"
+    r"\s+err/s:?\s*(?P<err>\d+(?:\.\d+)?)"
+    r"\s+reconn/s:?\s*(?P<reconn>\d+(?:\.\d+)?)"
 )
 
-_SUMMARY_NUM = r"([\d.]+)"
+_SUMMARY_NUM = r"(\d+(?:\.\d+)?)"
 TRANSACTIONS_RE = re.compile(rf"transactions:\s+(\d+)\s+\({_SUMMARY_NUM} per sec\.\)")
 QUERIES_RE = re.compile(rf"queries:\s+(\d+)\s+\({_SUMMARY_NUM} per sec\.\)")
 IGNORED_ERRORS_RE = re.compile(rf"ignored errors:\s+(\d+)\s+\({_SUMMARY_NUM} per sec\.\)")
 RECONNECTS_RE = re.compile(rf"reconnects:\s+(\d+)\s+\({_SUMMARY_NUM} per sec\.\)")
-TOTAL_TIME_RE = re.compile(r"total time:\s+([\d.]+)s")
+TOTAL_TIME_RE = re.compile(r"total time:\s+(\d+(?:\.\d+)?)s")
 LAT_MIN_RE = re.compile(rf"min:\s+{_SUMMARY_NUM}")
 LAT_AVG_RE = re.compile(rf"avg:\s+{_SUMMARY_NUM}")
 LAT_MAX_RE = re.compile(rf"max:\s+{_SUMMARY_NUM}")
 LAT_PCT_RE = re.compile(rf"(\d+)th percentile:\s+{_SUMMARY_NUM}")
 HISTOGRAM_HEADER_RE = re.compile(r"Latency histogram \(values are in milliseconds\)")
-HISTOGRAM_BUCKET_RE = re.compile(r"^\s*([\d.]+)\s+\|[* ]*\s*(\d+)\s*$")
+HISTOGRAM_BUCKET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s+\|[* ]*\s*(\d+)\s*$")
 ERROR_LINE_RE = re.compile(r"FATAL|PANIC|^ERROR|\bError\b|failed", re.IGNORECASE)
 
 

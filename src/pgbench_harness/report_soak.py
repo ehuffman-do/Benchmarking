@@ -32,6 +32,32 @@ ZOOM_MAX_S = 1800
 UPLOT_MAX_POINTS = 2000
 
 
+def _normalize_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Backfill schema defaults into a stored soak_summary.json.
+
+    The stored summary is a RECOVERY input (used verbatim when spec/manifest
+    are missing, or when written by an older harness version) — the charting
+    code indexes it with bare [] access, so a missing key from a pre-
+    'thresholds'/'restart_markers' era summary crashed exactly the report
+    regeneration meant to salvage the run."""
+    summary.setdefault("events", [])
+    summary.setdefault("restart_markers", [])
+    summary.setdefault("horizon_s", 0)
+    base = summary.setdefault("baseline", {})
+    if isinstance(base, dict):
+        base.setdefault("tps", None)
+        if "window_s" not in base:              # indexed as a [start, end] span
+            base["window_s"] = [0, 0]
+            base["ok"] = False                  # nothing real to shade
+    thr = summary.setdefault("thresholds", {})
+    if isinstance(thr, dict):
+        thr.setdefault("recovery_threshold_pct", 90)
+    for ev in summary.get("events") or []:
+        if isinstance(ev, dict):
+            ev.setdefault("metrics", {})
+    return summary
+
+
 def _load_timeseries(run_dir: Path) -> dict[int, dict[str, Any]]:
     path = run_dir / "parsed" / "soak_timeseries.csv"
     if not path.exists():
@@ -353,7 +379,7 @@ def generate_soak_report(run_dir: Path) -> Path:
     if not summary_path.exists():
         raise ReportError(f"no parsed/soak_summary.json in {run_dir}",
                           hint="is this a soak run directory?")
-    summary = read_json(summary_path)
+    summary = _normalize_summary(read_json(summary_path))
     tl = _load_timeseries(run_dir)
     env_dir = run_dir / "env"
     charts = {

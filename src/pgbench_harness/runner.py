@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import shutil
+import signal
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -449,8 +450,15 @@ def _level_watchdog_s(duration_s: int) -> float:
     must never freeze an hours-long run — the watchdog kills it, the level is
     marked failed, and the sweep continues. Grace is env-tunable for tests."""
     import os as _os
-    grace = float(_os.environ.get("PGB_LEVEL_WATCHDOG_GRACE_S", "0") or 0) \
-        or max(120.0, duration_s * 0.5)
+    try:
+        grace = float(_os.environ.get("PGB_LEVEL_WATCHDOG_GRACE_S", "0") or 0)
+    except ValueError:
+        grace = 0.0                    # a typo'd env var must not kill a run
+    if grace <= 0:
+        # proportional but CAPPED: half a 24h cell is not an acceptable
+        # tolerance for a hung child — 15 min covers connect/summary/
+        # histogram on any healthy cell
+        grace = max(120.0, min(duration_s * 0.5, 900.0))
     return duration_s + grace
 
 
@@ -548,7 +556,7 @@ def cmd_run(
     live = IncrementalCsvWriter(run_dir / "parsed" / "samples.csv", SAMPLE_COLUMNS)
     try:
         _sweep(spec, password, run_dir, manifest, logger, live=live)
-    except Exception:  # noqa: BLE001 — never leave the manifest at 'running' on an abort
+    except BaseException:  # noqa: BLE001 — never leave the manifest at 'running' on an abort
         manifest.status = "failed"
         manifest.wall_time_s = _wall_time_s(manifest)
         manifest.save(run_dir)
@@ -562,12 +570,19 @@ def cmd_run(
     status = manifest.finalize_status()
     manifest.wall_time_s = _wall_time_s(manifest)
     manifest.save(run_dir)
-    write_parsed(run_dir, spec, manifest)
-    _finish_evidence(run_dir, spec, logger)
-    if spec.capture.pg_stat_monitor != "false" and pf.pg_stat_monitor:
-        atomic_write_text(run_dir / "env" / "pg_stat_monitor.json",
-                          capture.snapshot_pg_stat_monitor(spec, password) + "\n")
-    report.generate_report(run_dir)
+    # post-processing is best-effort: a report/parse failure after a multi-
+    # day sweep completed must not flip a real result into a failed job —
+    # the raw logs and manifest are intact and `report` can re-run later
+    try:
+        write_parsed(run_dir, spec, manifest)
+        _finish_evidence(run_dir, spec, logger)
+        if spec.capture.pg_stat_monitor != "false" and pf.pg_stat_monitor:
+            atomic_write_text(run_dir / "env" / "pg_stat_monitor.json",
+                              capture.snapshot_pg_stat_monitor(spec, password) + "\n")
+        report.generate_report(run_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("post-processing degraded (%s) — raw logs and manifest "
+                     "are intact; re-run `report %s` later", exc, manifest.run_id)
     logger.info("run %s finished with status '%s'; report: %s",
                 manifest.run_id, status, run_dir / "report.html")
     # Exit code drives the worker's job state: complete->0 (done), partial->1
@@ -662,6 +677,15 @@ def _live_soak_callback(
     return _cb
 
 
+def _whole_log_tail(seg_log: Path, fallback: str) -> str:
+    """The full segment log, lowercased, for signature scans — the 5-line
+    error excerpt can bury 'event queue is full' under earlier FATALs."""
+    try:
+        return seg_log.read_text(encoding="utf-8", errors="replace").lower()
+    except OSError:
+        return fallback.lower()
+
+
 def _segment_error_excerpt(seg_log: Path, rc: int, n_intervals: int) -> str:
     """Best-effort human reason a soak segment failed, read from its raw log.
 
@@ -713,7 +737,15 @@ def _soak_supervisor(
     seg = relaunches = total_intervals = 0
     consecutive_short = consecutive_zero_sample = 0
     prev_rate_idx = -1
-    forced_step_idx = 0
+    # Ladder position runs on elapsed time until a queue-full skip; a skip
+    # REBASES the ladder (new step index anchored at the next segment's
+    # start) so the forced step gets its full window instead of being
+    # re-derived from wall-clock and re-run (which also booked a spurious
+    # relaunch per healthy re-run — the round-5 review finding).
+    ladder_base_idx = 0
+    ladder_base_elapsed = 0
+    ladder_rebase_to: Optional[int] = None
+    prev_seg_failed = False          # previous segment exited non-zero
     disk_warned: dict = {}
     last_excerpt = ""
 
@@ -750,25 +782,35 @@ def _soak_supervisor(
             rate, seg_time = 0, remaining
             if soak.rate_steps:
                 elapsed = soak.duration_s - remaining
-                idx = min(elapsed // soak.step_duration_s, len(soak.rate_steps) - 1)
-                idx = max(idx, forced_step_idx)      # steps proven unachievable are skipped
+                if ladder_rebase_to is not None:     # a skip anchors here
+                    ladder_base_idx = ladder_rebase_to
+                    ladder_base_elapsed = elapsed
+                    ladder_rebase_to = None
+                into = elapsed - ladder_base_elapsed
+                idx = min(ladder_base_idx + into // soak.step_duration_s,
+                          len(soak.rate_steps) - 1)
                 rate = soak.rate_steps[idx]
-                seg_time = max(1, min(remaining,
-                                      (idx + 1) * soak.step_duration_s - elapsed,
-                                      soak.step_duration_s))
+                seg_time = max(1, min(
+                    remaining,
+                    (idx - ladder_base_idx + 1) * soak.step_duration_s - into,
+                    soak.step_duration_s))
             seg += 1
             _disk_guard(run_dir, logger, disk_warned)
+            # Relaunch accounting keys on the PREVIOUS segment's outcome, not
+            # on whether the step index happens to advance: a crash landing
+            # past a step boundary is still a relaunch, and a healthy segment
+            # completing inside an already-stamped step is not.
+            if seg > 1 and prev_seg_failed:
+                relaunches += 1
+                _append_event(run_dir, "loadgen_restart", f"sysbench relaunch #{relaunches}",
+                              "supervisor relaunched the load generator after early exit", "auto")
             if soak.rate_steps and idx != prev_rate_idx:
-                # planned step transition, not a crash — stamp it for the report
+                # planned step transition — stamp it for the report
                 _append_event(run_dir, "note",
                               f"rate step {idx + 1}/{len(soak.rate_steps)}: "
                               f"{rate or 'unthrottled'} tps offered",
                               f"sysbench --rate={rate}", "auto")
                 prev_rate_idx = idx
-            elif seg > 1:
-                relaunches += 1
-                _append_event(run_dir, "loadgen_restart", f"sysbench relaunch #{relaunches}",
-                              "supervisor relaunched the load generator after early exit", "auto")
             cmd = sysbench.build_soak_command(spec, soak.threads, seg_time, rate=rate)
             seg_log = run_dir / "raw" / f"soak_seg{seg:02d}.log"
             seg_start = _iso_micros()
@@ -778,10 +820,36 @@ def _soak_supervisor(
             # that connects but hangs (no output, never exits) cannot block the loop
             # past the deadline — the watchdog SIGTERM/SIGKILLs it.
             seg_timeout = float(seg_time + soak.segment_kill_grace_s)
+            # Mid-segment disk guard: a healthy non-stepped soak is ONE
+            # segment covering the whole window, so the per-segment check
+            # alone would run once at t=0. Piggyback on the per-line tap:
+            # every ~60s re-check free space; when critically low, terminate
+            # the child so the clean-abort path runs instead of ENOSPC
+            # corrupting artifacts days in.
+            inner_cb = _live_soak_callback(live, base_dt, seen_offsets, seg_log.stem)
+            disk_state = {"next_check": time.monotonic() + 60.0}
+
+            def _cb(ts_iso: str, red_line: str,
+                    _inner=inner_cb, _ds=disk_state) -> None:
+                _inner(ts_iso, red_line)
+                if time.monotonic() >= _ds["next_check"]:
+                    _ds["next_check"] = time.monotonic() + 60.0
+                    try:
+                        _disk_guard(run_dir, logger, disk_warned)
+                    except RunError as exc:
+                        _ds["abort"] = str(exc)
+                        p = stop["procs"].get("proc") if stop else None
+                        if p is not None:
+                            try:
+                                p.terminate()
+                            except OSError:
+                                pass
+
             rc, n_intervals, timed_out = sysbench.run_streaming_timestamped(
                 cmd, env, seg_log, logger,
                 timeout_s=seg_timeout, kill_grace_s=float(soak.segment_kill_grace_s),
-                on_line=_live_soak_callback(live, base_dt, seen_offsets, seg_log.stem))
+                on_line=_cb,
+                proc_holder=stop["procs"] if stop is not None else None)
             seg_wall = time.monotonic() - seg_mono
             excerpt = ""
             if rc != 0 or n_intervals == 0:
@@ -801,8 +869,10 @@ def _soak_supervisor(
             # record it and ADVANCE the ladder instead of relaunching into
             # the same doomed step for its whole window (the failure mode
             # that burned max_relaunches in the field).
-            if soak.rate_steps and rc != 0 and excerpt \
-                    and "event queue is full" in excerpt.lower():
+            queue_full_skip = bool(
+                soak.rate_steps and rc != 0 and excerpt
+                and "event queue is full" in _whole_log_tail(seg_log, excerpt))
+            if queue_full_skip:
                 _append_event(run_dir, "note",
                               f"rate step {idx + 1}/{len(soak.rate_steps)} "
                               f"unachievable: offered {rate} tps exceeds worker "
@@ -812,13 +882,18 @@ def _soak_supervisor(
                               "an outage) — advancing to the next step", "auto")
                 logger.warning("soak: rate step %d (%s tps) unachievable — "
                                "advancing the ladder", idx + 1, rate)
-                forced_step_idx = idx + 1
-                if forced_step_idx >= len(soak.rate_steps):
+                ladder_rebase_to = idx + 1
+                if ladder_rebase_to >= len(soak.rate_steps):
                     logger.error("soak: every remaining rate step exceeds "
                                  "worker capacity; ending the ladder early.")
                     break
+            # a queue-full skip is a datum, not an outage — it never counts
+            # as a relaunch
+            prev_seg_failed = (rc != 0 or n_intervals == 0) and not queue_full_skip
             manifest.soak = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
             manifest.save(run_dir)
+            if disk_state.get("abort"):     # segment record persisted first
+                raise RunError(disk_state["abort"])
             total_intervals += n_intervals
             consecutive_zero_sample = consecutive_zero_sample + 1 if n_intervals == 0 else 0
             consecutive_short = consecutive_short + 1 if seg_wall < min(5, remaining) else 0
@@ -970,13 +1045,21 @@ def cmd_soak(
                        "(sysbench --ignore-errors is MySQL-only); on a hard error the load "
                        "generator exits and the supervisor relaunches it.")
     # Graceful stop: SIGINT/SIGTERM finalize a partial resilience report instead
-    # of discarding the run. The signal also reaches the child sysbench, which
-    # exits, unblocking the supervisor's read loop so it sees the flag.
+    # of discarding the run. A group-directed signal (Ctrl-C) also reaches the
+    # child; a PID-directed one does NOT — so the handler terminates the
+    # current child explicitly, or a single-segment soak would keep running
+    # for up to the whole remaining window (days) before seeing the flag.
     import signal
-    stop = {"flag": False}
+    stop = {"flag": False, "procs": {}}
 
     def _on_signal(_signum: int, _frame: object) -> None:
         stop["flag"] = True
+        p = stop["procs"].get("proc")
+        if p is not None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
 
     old_int = signal.signal(signal.SIGINT, _on_signal)
     old_term = signal.signal(signal.SIGTERM, _on_signal)
@@ -1148,7 +1231,9 @@ def _finish_evidence(run_dir: Path, spec: Spec, logger: logging.Logger) -> Optio
     from pgbench_harness import deviceio, evidence
     try:
         rows = deviceio.derive_device_series(run_dir)
-        verdict = deviceio.compute_verdict(rows, spec.limits) if spec.cluster else None
+        verdict = deviceio.compute_verdict(
+            rows, spec.limits,
+            deviceio.load_event_markers(run_dir)) if spec.cluster else None
         doc = evidence.build_evidence(run_dir, spec, verdict)
         if verdict:
             line = f"IOPS verdict: {verdict['finding'].upper()} — {verdict['detail']}"
@@ -1302,6 +1387,13 @@ def cmd_suite(spec_path: Path, results_dir: Path, dry_run: bool = False,
     dev_sampler = _start_observation(spec, run_dir, logger)
     live = IncrementalCsvWriter(run_dir / "parsed" / "samples.csv", SAMPLE_COLUMNS)
     pgbench_ready = False
+    # Graceful stop for a multi-hour matrix: SIGTERM (deploys, supervisors)
+    # must finalize a partial bundle like soak does, not die mid-cell with
+    # the manifest stuck 'running' and the child orphaned.
+    def _on_term(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+    old_term = signal.signal(signal.SIGTERM, _on_term)
+    abort_exc: Optional[BaseException] = None
     try:
         pending = manifest.pending_levels()
         disk_warned: dict = {}
@@ -1328,24 +1420,40 @@ def cmd_suite(spec_path: Path, results_dir: Path, dry_run: bool = False,
             if i < len(pending) - 1 and spec.suite.cooldown_s > 0:
                 logger.info("stabilization %ds ...", spec.suite.cooldown_s)
                 time.sleep(spec.suite.cooldown_s)
-    except Exception:  # noqa: BLE001
-        manifest.status = "failed"
-        manifest.wall_time_s = _wall_time_s(manifest)
-        manifest.save(run_dir)
-        raise
+    except BaseException as exc:  # noqa: BLE001 — incl. KeyboardInterrupt/SIGTERM
+        abort_exc = exc
+        logger.error("suite aborted mid-matrix: %s — finalizing the "
+                     "completed cells", exc)
     finally:
         live.close()
         if sampler:
             sampler.stop()
         if dev_sampler:
             dev_sampler.stop()
+        signal.signal(signal.SIGTERM, old_term)
+    # An abort mid-matrix must not discard the completed cells: finalize the
+    # real per-level status (partial beats failed-wholesale) and emit the
+    # bundle best-effort — same contract as _finalize_soak.
     status = manifest.finalize_status()
+    if abort_exc is not None and status == "complete":
+        status = "partial"                      # aborted between cells
+    manifest.status = status
     manifest.wall_time_s = _wall_time_s(manifest)
     manifest.finished_utc = utc_now_iso()
     manifest.save(run_dir)
-    write_parsed(run_dir, spec, manifest)
-    _finish_evidence(run_dir, spec, logger)
-    report_evidence.generate_evidence_report(run_dir)
+    try:
+        write_parsed(run_dir, spec, manifest)
+        _finish_evidence(run_dir, spec, logger)
+        report_evidence.generate_evidence_report(run_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("suite post-processing degraded (%s) — raw logs and "
+                     "manifest are intact; re-run `report` later", exc)
+    if abort_exc is not None:
+        if isinstance(abort_exc, KeyboardInterrupt):
+            raise RunError("suite interrupted — completed cells finalized "
+                           f"(status '{status}'); report: "
+                           f"{run_dir / 'report.html'}")
+        raise abort_exc
     logger.info("suite %s finished with status '%s'; report: %s",
                 manifest.run_id, status, run_dir / "report.html")
     return {"complete": 0, "partial": 1}.get(status, 2)

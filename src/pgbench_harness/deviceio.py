@@ -27,6 +27,7 @@ import json
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -178,21 +179,34 @@ class DeviceIoSampler:
             except Exception as exc:  # noqa: BLE001
                 if self._respawns <= self.MAX_RESPAWN_WARNINGS:
                     self._warn(f"respawn failed: {exc} — retrying")
+            # stop() may have run while _spawn() was blocked resolving the
+            # leader (up to ~45s) — it terminated the OLD dead proc and gave
+            # up joining; without this check the fresh stream would outlive
+            # the run and keep appending to raw/diskstats.log forever
+            if self._stopped.is_set():
+                self._kill_proc()
+                return
+
+    def _kill_proc(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        self._proc = None
 
     def stop(self) -> None:
         self._stopped.set()
-        if self._proc is not None:
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=10)
-            except Exception:  # noqa: BLE001
-                try:
-                    self._proc.kill()
-                except OSError:
-                    pass
-            self._proc = None
+        self._kill_proc()
         if self._watch is not None:
             self._watch.join(timeout=5)
+            self._kill_proc()          # a respawn may have landed mid-join
         if self._fh is not None:
             try:
                 self._fh.close()
@@ -328,6 +342,9 @@ def derive_device_series(run_dir: Path) -> list[dict[str, float]]:
     except (ValueError, KeyError, OSError):
         return []
     snaps = _parse_snapshots(log_path, majmin)
+    # a sampler respawn onto a clock-skewed node can regress timestamps;
+    # window math downstream assumes monotonic time
+    snaps.sort(key=lambda s: s[0])
     rows: list[dict[str, float]] = []
     for (t0, a), (t1, b) in zip(snaps, snaps[1:]):
         dt = t1 - t0
@@ -359,11 +376,15 @@ def derive_device_series(run_dir: Path) -> list[dict[str, float]]:
     return rows
 
 
-def _sustained_peak(rows: list[dict[str, float]], window_s: int) -> tuple[float, float, float]:
-    """(peak windowed-avg IOPS, util%, queue) over any window_s-long span."""
+def _sustained_peak(
+        rows: list[dict[str, float]], window_s: int,
+) -> tuple[float, float, float, float, float]:
+    """(peak windowed-avg IOPS, util%, queue, window start/end epoch-ms) over
+    any window_s-long span."""
     if not rows:
-        return 0.0, 0.0, 0.0
-    best = (0.0, 0.0, 0.0)
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+    best = (0.0, 0.0, 0.0, rows[0]["t_epoch_ms"], rows[-1]["t_epoch_ms"])
+    found_full_window = False
     for i in range(len(rows)):
         j = i
         t0 = rows[i]["t_epoch_ms"]
@@ -372,21 +393,59 @@ def _sustained_peak(rows: list[dict[str, float]], window_s: int) -> tuple[float,
         win = rows[i:j]
         if not win or (win[-1]["t_epoch_ms"] - t0) < (window_s - 2) * 1000:
             continue
+        found_full_window = True
         avg = sum(r["iops"] for r in win) / len(win)
         if avg > best[0]:
             best = (avg,
                     sum(r["util_pct"] for r in win) / len(win),
-                    sum(r["queue_depth"] for r in win) / len(win))
-    if best[0] == 0.0 and rows:                # series shorter than the window
+                    sum(r["queue_depth"] for r in win) / len(win),
+                    t0, win[-1]["t_epoch_ms"])
+    if not found_full_window and rows:         # series shorter than the window
         best = (sum(r["iops"] for r in rows) / len(rows),
                 sum(r["util_pct"] for r in rows) / len(rows),
-                sum(r["queue_depth"] for r in rows) / len(rows))
+                sum(r["queue_depth"] for r in rows) / len(rows),
+                rows[0]["t_epoch_ms"], rows[-1]["t_epoch_ms"])
     return best
 
 
-def compute_verdict(rows: list[dict[str, float]], limits: Limits) -> dict[str, Any]:
-    """capped / exceeds / inconclusive against the recorded reference limits."""
-    peak10, util, queue = _sustained_peak(rows, SUSTAIN_WINDOW_S)
+def load_event_markers(run_dir: Path) -> list[tuple[float, str]]:
+    """(epoch_ms, label) markers from events.jsonl, sorted — used to attribute
+    the verdict's peak window to the phase that produced it."""
+    path = run_dir / "events.jsonl"
+    if not path.exists():
+        return []
+    out: list[tuple[float, str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+            ts = str(ev["ts_utc"]).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            out.append((dt.timestamp() * 1000.0, str(ev.get("label", ""))))
+        except (ValueError, KeyError, TypeError):
+            continue
+    out.sort(key=lambda p: p[0])
+    return out
+
+
+def _hms(epoch_ms: float) -> str:
+    return datetime.fromtimestamp(epoch_ms / 1000.0,
+                                  tz=timezone.utc).strftime("%H:%M:%S")
+
+
+def compute_verdict(rows: list[dict[str, float]], limits: Limits,
+                    events: Optional[list[tuple[float, str]]] = None,
+                    ) -> dict[str, Any]:
+    """capped / exceeds / inconclusive against the recorded reference limits.
+
+    ``events`` ((epoch_ms, label) markers, see load_event_markers) attributes
+    the sustained-peak window to the phase that produced it — a peak inside
+    "fileio run" is ceiling evidence; the same number during a prepare or an
+    end-of-run flush is a different IO regime and must be read as such.
+    """
+    peak10, util, queue, w_start, w_end = _sustained_peak(rows, SUSTAIN_WINDOW_S)
     peak1 = max((r["iops"] for r in rows), default=0.0)
     tol = limits.tolerance_pct / 100.0
     std, burst = limits.standard_iops, limits.burst_iops
@@ -401,6 +460,38 @@ def compute_verdict(rows: list[dict[str, float]], limits: Limits) -> dict[str, A
         "queue_depth_at_peak": round(queue, 2),
         "samples": len(rows),
     }
+    peak_suffix = ""
+    if rows:
+        v["peak_window_start_utc"] = datetime.fromtimestamp(
+            w_start / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        v["peak_window_end_utc"] = datetime.fromtimestamp(
+            w_end / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        peak_suffix = f" [peak window {_hms(w_start)}–{_hms(w_end)} UTC"
+        # attribute by window MIDPOINT: event stamps have second precision
+        # and a window can straddle a phase boundary — majority wins
+        mid = (w_start + w_end) / 2
+        during, next_ts = "", None
+        for ts_ms, label in events or []:
+            if ts_ms <= mid:
+                if label:
+                    during = label
+            elif next_ts is None:
+                next_ts = ts_ms
+        if during:
+            v["peak_during"] = during
+            peak_suffix += f", during '{during}'"
+            # a peak butting against the phase's END is usually a transition
+            # artifact (for fileio: sysbench's exit fsync flush — large
+            # mergeable writes, a different regime than the steady load).
+            # Bounded on both sides: a marker long after the window is not
+            # "its tail", and next_ts < w_end means the window itself
+            # straddles the boundary (already softened by midpoint rule).
+            if next_ts is not None and 0 <= next_ts - w_end <= 15_000:
+                v["peak_at_phase_tail"] = True
+                peak_suffix += (", at its tail — check whether this is a "
+                                "flush/transition burst rather than the "
+                                "steady load")
+        peak_suffix += "]"
     if not rows:
         v["finding"] = "inconclusive"
         v["detail"] = ("no device series was captured — run was not "
@@ -445,4 +536,5 @@ def compute_verdict(rows: list[dict[str, float]], limits: Limits) -> dict[str, A
                            "upstream (driver concurrency, CPU, or Postgres's "
                            "synchronous read path). Redesign with more threads, "
                            "a larger dataset, or the device-probe mode")
+    v["detail"] += peak_suffix
     return v

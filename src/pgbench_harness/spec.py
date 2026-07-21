@@ -492,8 +492,13 @@ def _parse_soak(sec: dict[str, Any]) -> Soak:
     if duration < 1:
         raise SpecError("'soak.duration_s' must be >= 1")
     interval = _typed(sec, "soak", "report_interval_s", int, 1)
-    if interval < 1:
-        raise SpecError("'soak.report_interval_s' must be >= 1")
+    if interval != 1:
+        # the resilience analysis is strictly per-second dense: absent
+        # seconds ARE the outage signal, so a coarser interval would score
+        # ~(1 - 1/interval) of a flawless run as downtime
+        raise SpecError("'soak.report_interval_s' must be exactly 1 — the "
+                        "downtime/TTR analysis models a dense per-second "
+                        "timeline (missing seconds are counted as outage)")
     fast_fail = _typed(sec, "soak", "fast_fail_segments", int, 3)
     if fast_fail < 1:
         raise SpecError("'soak.fast_fail_segments' must be >= 1")

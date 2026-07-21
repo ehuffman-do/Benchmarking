@@ -632,11 +632,27 @@ export function KubeTargetView({ me }: { me: Me }) {
           <Link className="btn primary" to={`/new?cluster=${targetId}&mode=suite`}>
             Evidence suite (full matrix)</Link>{" "}
           <Link className="btn" to={`/new?cluster=${targetId}&mode=rate-steps`}>
-            Rate-stepped knee finder</Link>{" "}
-          <span className="subtle" style={{ fontSize: 12 }}>
-            The direct device probe (sysbench fileio on the pgdata volume) is
-            spec-armed and admin-only: paste examples/device-probe.yaml into
-            New Run with this cluster attached — test clusters only.</span>
+            Rate-stepped knee finder</Link>
+          {isAdmin ? (
+            <>
+              <div style={{ marginTop: 10 }}>
+                <span className="subtle" style={{ fontSize: 12, marginRight: 8 }}>
+                  Direct device probe (sysbench fileio on the pgdata volume —
+                  TEST CLUSTERS ONLY; keeps test files between probes for fast
+                  iteration):</span>
+              </div>
+              <Link className="btn" to={`/new?cluster=${targetId}&mode=device-probe&variant=rndrw`}>
+                Probe: mixed (rndrw)</Link>{" "}
+              <Link className="btn" to={`/new?cluster=${targetId}&mode=device-probe&variant=rndrd`}>
+                Probe: read ceiling (rndrd)</Link>{" "}
+              <Link className="btn" to={`/new?cluster=${targetId}&mode=device-probe&variant=rndwr`}>
+                Probe: write ceiling (rndwr)</Link>
+            </>
+          ) : (
+            <span className="subtle" style={{ fontSize: 12 }}>
+              {" "}The direct device probe (sysbench fileio on the pgdata
+              volume) is admin-only — test clusters only.</span>
+          )}
         </div>
       )}
 

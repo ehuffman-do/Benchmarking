@@ -1,6 +1,113 @@
 # Changelog
 
+## Unreleased — bug bash round 5 (whole-harness adversarial review)
+
+- **Knee-finder ladder accounting rewritten**: after a queue-full skip the
+  ladder REBASES (the forced step gets its full window anchored at the next
+  segment's start) instead of being re-derived from wall-clock — the old
+  math re-ran the forced step and booked a spurious relaunch per healthy
+  re-run, which burned max_relaunches, forced "partial" status and polluted
+  the report with fake restart events. Relaunch accounting now keys on the
+  previous segment's actual outcome: a crash landing past a step boundary
+  counts (it used to evade the budget), a healthy completion never does,
+  and queue-full skips are a datum, not an outage. Queue-full detection
+  scans the whole segment log (the 5-line excerpt could bury it).
+- **Soaks are stoppable**: a PID-directed SIGTERM only set a flag that was
+  checked between segments — a single-segment week-long soak would ignore
+  it for days. The handler now terminates the current load generator so
+  the partial-report finalize runs immediately.
+- **Disk guard now guards**: the free-space check ran once per segment —
+  once at t=0 for a healthy non-stepped soak. It now re-checks every ~60s
+  during the stream and cleanly aborts (results-so-far intact) instead of
+  hitting ENOSPC days in; and a harness-side tee failure (ENOSPC on the
+  log write) kills the child instead of orphaning a load generator that
+  keeps hammering the target for up to --time.
+- **Suite aborts keep the completed cells**: SIGTERM/Ctrl-C mid-matrix (and
+  a pgbench-init failure) finalize the real per-level status (partial, not
+  failed-wholesale), emit the bundle best-effort, and no longer leave the
+  manifest stuck 'running' with an orphaned child. run/suite post-
+  processing (parse + report) is best-effort after a completed run — a
+  report bug can no longer flip a multi-day result into a failed job.
+- **Parsers**: numeric regexes no longer accept malformed tokens ("12..3"
+  from a torn log splice crashed finalize); pgbench "lat NaN" progress
+  lines (a stalled interval — exactly the sample not to lose) parse as 0.
+- **Watchdog grace capped** at 15 min (was duration/2 — 12h tolerance for a
+  hung child in a 24h cell); a typo'd PGB_LEVEL_WATCHDOG_GRACE_S is ignored
+  instead of crashing at level start.
+- **soak.report_interval_s must be 1**: the downtime/TTR model is strictly
+  per-second dense; any coarser interval scored ~(1-1/N) of a flawless run
+  as outage. Explicitly rejected now.
+- **Worker: recycled PIDs can no longer be adopted** — orphan reattach and
+  Cancel now verify process identity via /proc start time, not just
+  os.kill(pid,0): after a droplet reboot a recycled pid used to become a
+  phantom "running" job that starved the queue, and Cancel could SIGKILL an
+  unrelated process group. A non-UTF-8 byte in child output no longer
+  abandons a live benchmark (errors=replace), and any worker-side failure
+  now terminates the benchmark process group instead of orphaning it with
+  the job marked failed.
+- **Worker: decrypted kubeconfig copies are swept** — a worker restart
+  mid-job skipped the normal cleanup, leaving the plaintext kubeconfig on
+  disk indefinitely; startup now sweeps copies whose job is no longer
+  running, and reattach convergence unlinks its own.
+- **Cockpit stream correctness**: the live-CSV tail detects the harness's
+  atomic finalize/resume rewrite by inode and tells the client to rebuild
+  (was: torn rows or thousands of duplicate points in the "final" chart);
+  CRLF row terminators are stripped; the task-output stream tails by byte
+  offset (was O(file) per second) and drains the final lines that land
+  with the terminal state flip (they used to vanish).
+- **Backup/failover safety rails fail CLOSED**: an exec failure during the
+  pgBackRest lock check used to read as "lock clear" — the harness could
+  fire a backup or failover into a running backup, the exact field bug the
+  check exists to prevent. "Cannot verify" now aborts with the reason.
+- **Report regeneration survives cross-version/partial data**: manifests
+  with unknown keys (newer harness, hand annotations) no longer TypeError
+  every report entry point; older soak summaries missing newer keys no
+  longer KeyError the recovery path; the webapp now routes suite/probe
+  runs to the evidence renderer (the sweep renderer 500'd on them) and
+  the sweep renderer raises a real error instead of an assert.
+- **Failover stitch is derived data**: a stitcher exception downgrades to
+  a warning event instead of flipping a successful scenario run to failed
+  (captures are intact on disk).
+- **Kubeconfig redaction parses the document**: JSON kubeconfigs (every
+  line quoted) and YAML block scalars evaded the line-regex — ZERO values
+  were registered with the redactor for those formats. The sensitive keys
+  are now found by structured walk, with the line scan as fallback; an
+  empty kubeconfig path is rejected instead of silently falling back to
+  ~/.kube/config (wrong-cluster risk).
+- **Small but real**: a "tps": null in a soak summary no longer makes the
+  whole run vanish from the index; string-valued tags no longer explode
+  into per-character tags; ops liveness treats EPERM as alive; an unknown
+  health severity no longer aborts postprocess; kubectl timeouts keep the
+  child's last output as the diagnosis; the connection-ceiling probe reaps
+  killed psql children (was: zombies for the process lifetime).
+- **Web tier**: run artifact downloads spool to disk instead of building
+  a potentially multi-GB tar.gz in RAM; /runs/{id}/provider-metrics gets
+  the same traversal guard as every other run route; SSE streams no longer
+  pin an unused SQLite connection for their lifetime; malformed
+  kube_target_id / scheduled_utc are clean 400s (a bad scheduled_utc used
+  to make the job silently permanently ineligible).
+
 ## Unreleased — device-probe iteration (field fixes from the first live probe)
+
+- **Device probe is now a first-class New Run mode** (admin-only): threads,
+  async backlog, IO pattern (rndrw/rndrd/rndwr), duration, file geometry and
+  keep-files are form fields — no more pasting YAML. Cluster pages
+  quick-launch all three patterns with the cluster pre-attached, and the
+  form refuses to submit without an attached cluster. The knee-finder's
+  seeded rate ladder now starts low (100…2000, 0) — unachievable steps skip
+  forward, but a ladder that opens far beyond capacity wastes its first
+  segments.
+
+- **Verdicts say WHEN and DURING WHAT**: the first live EXCEEDS verdict
+  (12,540 IOPS sustained) turned out to sit in sysbench's end-of-run fsync
+  flush — a large-write regime — while the steady random phase served
+  ~7.4K; only PMM could show that. The verdict now stamps the sustained-
+  peak window's UTC timestamps and attributes it to the phase event that
+  contains it ("[peak window 04:36:41–04:36:51 UTC, during 'fileio run']"),
+  and the device probe stamps its phases (prepare / run / done) into
+  events.jsonl like every other run mode already did. A peak that butts
+  against the next phase marker is additionally flagged as a possible
+  flush/transition burst.
 
 - **`device_probe.keep_files`**: preparing the fileio test set took ~5 min
   for 100 GB on the live cluster and was repeated on every probe run. With

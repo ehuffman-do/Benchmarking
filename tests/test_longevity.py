@@ -236,19 +236,64 @@ def test_sse_csv_tail_incremental_and_capped(tmp_path):
         for i in range(30):
             fh.write(f"{i},{100 + i}\n")
     tail = _CsvTail(cap=10)
-    first = tail.read_new(p)
+    first, was_reset = tail.read_new(p)
     assert len(first) == 10                       # capped backfill
+    assert not was_reset
     assert first[0] == "20,120"                   # ...of the most recent rows
     assert tail.header == "t,tps"
     assert tail.row_count == 20                   # rows skipped by the cap
     tail.row_count += len(first)
     with open(p, "a") as fh:                      # file grows: incremental
         fh.write("30,130\n31,13")                 # includes a partial line
-    assert tail.read_new(p) == ["30,130"]
+    assert tail.read_new(p) == (["30,130"], False)
     with open(p, "a") as fh:
         fh.write("1\n")                           # partial completes
-    assert tail.read_new(p) == ["31,131"]
-    assert tail.read_new(p) == []                 # nothing new -> no work
+    assert tail.read_new(p) == (["31,131"], False)
+    assert tail.read_new(p) == ([], False)        # nothing new -> no work
+    # CRLF rows (csv.writer's default terminator) must not carry \r through
+    with open(p, "a") as fh:
+        fh.write("32,132\r\n")
+    assert tail.read_new(p) == (["32,132"], False)
+
+
+def test_pid_identity_prevents_recycled_pid_adoption():
+    """os.kill(pid,0) alone mistakes a RECYCLED pid (reboot, pid_max wrap)
+    for the surviving benchmark — the /proc start-time identity must
+    disambiguate, or the phantom job starves the queue and Cancel signals
+    a stranger's process group."""
+    import subprocess as sp
+    from pgbench_webapp.worker import _pid_is_our_child, _proc_start_ticks
+    child = sp.Popen(["sleep", "30"])
+    try:
+        ticks = _proc_start_ticks(child.pid)
+        assert ticks.isdigit()
+        assert _pid_is_our_child(child.pid, ticks) is True
+        assert _pid_is_our_child(child.pid, "1") is False    # recycled pid
+        assert _pid_is_our_child(child.pid, "") is True      # legacy row
+    finally:
+        child.kill()
+        child.wait()
+    assert _pid_is_our_child(child.pid, ticks) is False      # gone
+
+
+def test_sse_csv_tail_detects_atomic_rewrite(tmp_path):
+    """The harness atomically REPLACES the live CSV at finalize/resume (new
+    inode, possibly same-or-larger size). The tail must reset and SAY so, or
+    the client double-appends thousands of rows / parses torn garbage."""
+    from pgbench_webapp.app import _CsvTail
+    import os as _os
+    p = tmp_path / "series.csv"
+    p.write_text("t,tps\n0,100\n1,101\n")
+    tail = _CsvTail(cap=100)
+    rows, was_reset = tail.read_new(p)
+    assert rows == ["0,100", "1,101"] and not was_reset
+    # atomic replace: bigger file, different content, new inode
+    tmp = tmp_path / ".series.tmp"
+    tmp.write_text("t,tps\n0,900\n1,901\n2,902\n3,903\n")
+    _os.replace(tmp, p)
+    rows, was_reset = tail.read_new(p)
+    assert was_reset is True
+    assert rows == ["0,900", "1,901", "2,902", "3,903"]   # full re-read
 
 
 def test_sse_stream_serves_running_run_incrementally(tmp_path):

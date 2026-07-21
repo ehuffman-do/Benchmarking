@@ -227,6 +227,16 @@ def run_streaming(
                 if lines_seen % heartbeat_every == 0:
                     logger.info("    %s", redact(line.rstrip()))
         rc = proc.wait()
+    except BaseException:
+        # a harness-side failure in the tee loop (ENOSPC on log.write being
+        # the realistic one) must never orphan the load generator — it would
+        # keep hammering the target for up to --time after the run "failed"
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+        raise
     finally:
         done.set()
     if watchdog is not None:
@@ -276,6 +286,7 @@ def run_streaming_timestamped(
     timeout_s: Optional[float] = None,
     kill_grace_s: float = 10.0,
     on_line: Optional[Callable[[str, str], None]] = None,
+    proc_holder: Optional[dict] = None,
 ) -> tuple[int, int, bool]:
     """Run *cmd*, teeing each line to *log_path* prefixed with the read-time UTC.
 
@@ -305,6 +316,10 @@ def run_streaming_timestamped(
             f"could not execute '{cmd.argv[0]}': {exc}",
             hint="install sysbench (see README) and re-run preflight.",
         ) from exc
+    if proc_holder is not None:
+        # graceful-stop hook: a signal handler can terminate the CURRENT
+        # child instead of waiting out a segment that may be days long
+        proc_holder["proc"] = proc
     intervals = 0
     seen = 0
     timed_out = {"flag": False}
@@ -336,10 +351,21 @@ def run_streaming_timestamped(
                 if seen % heartbeat_every == 0:
                     logger.info("    %s", redact(line.rstrip()))
         rc = proc.wait()
+    except BaseException:
+        # never orphan the load generator on a harness-side tee failure
+        # (ENOSPC writing the log): it would keep hammering the target
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+        raise
     finally:
         done.set()                              # release the watchdog (no-op if it already fired)
         if watchdog is not None:
             watchdog.join(timeout=1.0)
+        if proc_holder is not None:
+            proc_holder.pop("proc", None)
     return rc, intervals, timed_out["flag"]
 
 

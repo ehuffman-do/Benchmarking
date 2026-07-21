@@ -73,8 +73,12 @@ def kubeconfig_ref(name: str) -> str:
 
 
 _KUBECONFIG_SECRET_KEYS = re.compile(
-    r"^\s*(certificate-authority-data|client-certificate-data|client-key-data|"
-    r"token|password|refresh-token|access-token|id-token|client-secret)\s*:\s*(.+)$")
+    r"^\s*\"?(certificate-authority-data|client-certificate-data|client-key-data|"
+    r"token|password|refresh-token|access-token|id-token|client-secret)\"?\s*:\s*(.+?),?$")
+
+_SENSITIVE_KEYS = {"certificate-authority-data", "client-certificate-data",
+                   "client-key-data", "token", "password", "refresh-token",
+                   "access-token", "id-token", "client-secret"}
 
 
 def _register_kubeconfig_secrets(content: str) -> None:
@@ -85,8 +89,32 @@ def _register_kubeconfig_secrets(content: str) -> None:
     dangerous parts (certificate data, tokens, passwords) wherever they
     surface. Non-secret values (server URL, context names) stay readable —
     the validate op deliberately reports the API server URL to the UI.
+
+    PARSE, don't regex-only: kubectl accepts JSON kubeconfigs (every line
+    quoted — a bare-YAML line regex registered NOTHING) and YAML block
+    scalars put the value on the next line. The structured walk is the
+    source of truth; the line regex stays as a belt-and-braces fallback for
+    unparseable content.
     """
     red = get_redactor()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, str) and str(k) in _SENSITIVE_KEYS \
+                        and len(v.strip()) >= 8:
+                    red.register(v.strip())
+                else:
+                    _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    try:
+        import yaml as _yaml               # safe_load handles JSON too
+        _walk(_yaml.safe_load(content))
+    except Exception:  # noqa: BLE001 — fall back to the line scan below
+        pass
     for line in content.splitlines():
         m = _KUBECONFIG_SECRET_KEYS.match(line)
         if m:
@@ -117,6 +145,11 @@ def prepare_env(cfg: Config, store: SecretStore, env: dict[str, str],
         env["KUBECONFIG"] = str(tmp)
     else:
         path = kube_target["kubeconfig_path"]
+        if not str(path or "").strip():
+            # KUBECONFIG="" is treated by kubectl as UNSET — it would fall
+            # back to ~/.kube/config and silently target the wrong cluster
+            raise RuntimeError(f"kube target '{kube_target['name']}' has an "
+                               "empty kubeconfig path")
         env["KUBECONFIG"] = path
         try:
             _register_kubeconfig_secrets(Path(path).read_text(encoding="utf-8"))
@@ -220,6 +253,8 @@ def reconcile_stale_ops_jobs(cfg: Config, conn: sqlite3.Connection,
             try:
                 os.kill(pid, 0)
                 alive = True
+            except PermissionError:
+                alive = True                   # EPERM: exists, other uid
             except OSError:
                 alive = False
         if alive and not meta_terminal:
@@ -324,7 +359,8 @@ def _record_health(cfg: Config, conn: sqlite3.Connection, kt_id: int,
                     if f.get("id") != "disk_trend"]
         findings.insert(0, trend)
         health["findings"] = findings
-        worst = max((SEVERITY_ORDER.index(f.get("severity", "ok"))
+        worst = max((SEVERITY_ORDER.index(f["severity"])
+                     if f.get("severity") in SEVERITY_ORDER else 0
                      for f in findings), default=0)
         health["status"] = SEVERITY_ORDER[worst]
 

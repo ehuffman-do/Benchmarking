@@ -142,6 +142,11 @@ SQL-side throughput was measured (see caveats).</p>
       {{ fileio.write_mb_s | default(0) }} MiB/s</td></tr>
   <tr><th>window</th><td class="mono">{{ fileio.started_utc }} →
       {{ fileio.finished_utc }} (PMM cross-reference)</td></tr>
+{% if fileio.source %}
+  <tr><th>figure source</th><td><b>{{ fileio.source }}</b> — device counters
+      are node-wide (include WAL/checkpoint IO), not sysbench's own
+      accounting</td></tr>
+{% endif %}
 </table>
 {% endif %}
 

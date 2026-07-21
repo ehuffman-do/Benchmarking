@@ -16,6 +16,7 @@ every exit path including SIGTERM.
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import time
@@ -31,6 +32,18 @@ from pgbench_harness.util import (atomic_write_json, atomic_write_text,
 
 PROBE_DIR = "pgb-fileio-probe"          # all test files live under /pgdata/<this>
 
+
+def _mark(run_dir: Path, label: str, note: str = "") -> None:
+    """Stamp a probe phase into events.jsonl — the verdict attributes its
+    sustained-peak window to these markers (a peak during 'fileio run' is
+    ceiling evidence; during prepare or the end-of-run flush it is not)."""
+    ev = {"ts_utc": utc_now_iso(), "type": "phase", "label": label,
+          "note": note, "source": "device-probe"}
+    path = run_dir / "events.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(ev) + "\n")
+
 FILEIO_RESULT_RES = {
     "reads_s": re.compile(r"reads/s:\s+([\d.]+)"),
     "writes_s": re.compile(r"writes/s:\s+([\d.]+)"),
@@ -45,7 +58,9 @@ def _fileio_args(spec: Spec) -> list[str]:
     assert dp is not None
     return [
         f"--file-num={dp.file_num}",
-        f"--file-total-size={dp.file_total_size_gb:g}G",
+        # integer MB: sysbench's size parser is integer+suffix, so a
+        # fractional spec value like 0.5 (G) must not be emitted as "0.5G"
+        f"--file-total-size={int(dp.file_total_size_gb * 1024)}M",
         f"--file-test-mode={dp.test_mode}",
         f"--file-io-mode={dp.io_mode}",
         f"--file-async-backlog={dp.async_backlog}",
@@ -92,8 +107,16 @@ def _fill_from_device(run_dir: Path, start_iso: str,
         t0, t1 = ms(start_iso), ms(end_iso)
     except (ValueError, TypeError):
         return {}
-    rows = [r for r in derive_device_series(run_dir)
-            if t0 <= r["t_epoch_ms"] <= t1]
+    all_rows = derive_device_series(run_dir)
+    rows = [r for r in all_rows if t0 <= r["t_epoch_ms"] <= t1]
+    skew_note = ""
+    if not rows and all_rows:
+        # device samples are stamped by the pod's clock, the window by the
+        # harness host's — NTP skew can empty the intersection while the
+        # series itself is complete. The whole probe run IS the series.
+        rows, skew_note = all_rows, (" — clock skew between harness host and "
+                                     "pod suspected: window matched no "
+                                     "samples, averaged the whole series")
     if not rows:
         return {"source": "no summary and no device rows — see raw/fileio_run.log"}
     n = len(rows)
@@ -104,7 +127,8 @@ def _fill_from_device(run_dir: Path, start_iso: str,
         "read_mb_s": round(sum(r["read_mb_s"] for r in rows) / n, 2),
         "write_mb_s": round(sum(r["write_mb_s"] for r in rows) / n, 2),
         "source": "derived from device counters (sysbench summary format "
-                  "unrecognized — raw/fileio_run.log has the original)",
+                  "unrecognized — raw/fileio_run.log has the original)"
+                  + skew_note,
     }
 
 
@@ -149,7 +173,7 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
     n = 1
     while run_dir.exists():
         n += 1
-        run_id = f"{make_run_id(spec.run.label)}-{n}"
+        run_id = f"{make_run_id(spec.run.label or 'device-probe')}-{n}"
         run_dir = results_dir / run_id
     (run_dir / "raw").mkdir(parents=True, exist_ok=True)
     dump_spec_copy(spec, run_dir / "spec.yaml")
@@ -163,26 +187,35 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
     logger.info("device-probe %s -> %s", run_id, run_dir)
 
     kube = Kube(context=cl.context, namespace=cl.namespace)
-    pod_name = f"pgb-fileio-{int(time.time())}"
+    pod_name = f"pgb-fileio-{int(time.time())}-{os.getpid() % 10000}"
     created = {"pod": False}
     sampler: Optional[deviceio.DeviceIoSampler] = None
 
     def _cleanup() -> None:
         # files first (needs the pod), then the pod itself; both idempotent.
         # keep_files leaves the test files for the next probe iteration.
-        if created["pod"]:
-            if not dp.keep_files:
-                try:
-                    kube.exec(pod_name, "fileio",
-                              ["sh", "-c", f"rm -rf /pgdata/{PROBE_DIR}"],
-                              timeout_s=120)
-                except KubeError:
-                    pass
+        if created["pod"] and not dp.keep_files:
             try:
-                kube.run(["delete", "pod", pod_name, "--wait=false"])
-            except KubeError:
-                pass
-            created["pod"] = False
+                kube.exec(pod_name, "fileio",
+                          ["sh", "-c", f"rm -rf /pgdata/{PROBE_DIR}"],
+                          timeout_s=120)
+            except KubeError as exc:
+                logger.warning("could not remove /pgdata/%s (%s) — reclaim "
+                               "manually: kubectl exec into the primary and "
+                               "rm -rf /pgdata/%s", PROBE_DIR, exc, PROBE_DIR)
+        # ALWAYS attempt the pod delete, even if the apply looked like it
+        # failed: a timed-out apply may still have created the pod, and a
+        # leaked pod holds the RWO pgdata PVC — if the Postgres pod later
+        # reschedules to another node the volume cannot attach.
+        try:
+            kube.run(["delete", "pod", pod_name, "--wait=false",
+                      "--ignore-not-found"])
+        except KubeError as exc:
+            logger.warning("PROBE POD MAY BE LEAKED: could not delete pod %s "
+                           "(%s). It mounts the pgdata PVC (RWO) — delete it "
+                           "manually: kubectl -n %s delete pod %s",
+                           pod_name, exc, cl.namespace, pod_name)
+        created["pod"] = False
 
     def _on_signal(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
@@ -205,19 +238,53 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
         logger.info("primary %s on node %s, pgdata PVC %s", leader, node, pvc)
         deviceio.capture_storage_identity(spec, run_dir, logger)
 
-        # free-space guardrail: >= 2x file_total_size on /pgdata
+        # Existence + geometry of any kept test files, checked on the LEADER
+        # pod (same volume) BEFORE the guardrail: the relaxed space budget is
+        # only safe when the files are really there, and reusing files of a
+        # different geometry silently falsifies the evidence (sysbench accepts
+        # larger-than-expected files without complaint). check=True so an exec
+        # failure is a loud error, not a silent multi-minute re-prepare.
+        expected_file_bytes = (int(dp.file_total_size_gb * 1024) * 1048576
+                               ) // dp.file_num
+        res = kube.exec(
+            leader, "database",
+            ["sh", "-c",
+             f"stat -c %s /pgdata/{PROBE_DIR}/test_file.0 2>/dev/null "
+             f"|| echo MISSING; "
+             f"test -e /pgdata/{PROBE_DIR}/test_file.{dp.file_num - 1} "
+             f"&& echo LAST-YES || echo LAST-NO"],
+            timeout_s=20, check=True)
+        first_size, last_ok = (res.stdout.split() + ["", ""])[:2]
+        have_files = first_size != "MISSING"
+        reuse = bool(dp.keep_files and have_files)
+        if reuse and (last_ok != "LAST-YES"
+                      or first_size != str(expected_file_bytes)):
+            raise RunError(
+                f"keep_files: existing test files in /pgdata/{PROBE_DIR} do "
+                f"not match this spec's geometry (found test_file.0 of "
+                f"{first_size} bytes, last file "
+                f"{'present' if last_ok == 'LAST-YES' else 'missing'}; "
+                f"expected {dp.file_num} files of {expected_file_bytes} "
+                "bytes)",
+                hint="keep file_num and file_total_size_gb identical across "
+                     "kept-file iterations, or delete "
+                     f"/pgdata/{PROBE_DIR} (or set keep_files: false) to "
+                     "re-prepare with the new geometry.")
+
+        # free-space guardrail: >= 2x file_total_size on /pgdata when the
+        # files must be created; reused files are already allocated, so only
+        # headroom is needed
         res = kube.exec(leader, "database",
                         ["df", "-Pk", "/pgdata"], timeout_s=20, check=True)
         avail_kb = int(res.stdout.strip().splitlines()[-1].split()[3])
-        need_kb = int(dp.file_total_size_gb * 2 * 1048576)
-        if dp.keep_files:
-            # reused files are already allocated; only headroom is needed
-            need_kb = int(dp.file_total_size_gb * 0.2 * 1048576)
+        factor = 0.2 if reuse else 2.0
+        need_kb = int(dp.file_total_size_gb * factor * 1048576)
         if avail_kb < need_kb:
             raise RunError(
                 f"free space guardrail: {avail_kb / 1048576:.1f} GiB available on "
                 f"/pgdata, need >= {need_kb / 1048576:.0f} GiB "
-                f"(2x file_total_size_gb={dp.file_total_size_gb:g})",
+                f"({factor:g}x file_total_size_gb={dp.file_total_size_gb:g}"
+                f"{', reusing kept files' if reuse else ''})",
                 hint="shrink device_probe.file_total_size_gb or grow the volume.")
 
         kube.run(["apply", "-f", "-"],
@@ -241,11 +308,7 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
 
         sh = lambda phase_args: ["sh", "-c", "cd /pgdata/" + PROBE_DIR + " && "
                                  + " ".join(fileio + phase_args)]
-        have_files = kube.exec(
-            pod_name, "fileio",
-            ["sh", "-c", f"ls /pgdata/{PROBE_DIR}/test_file.0"],
-            timeout_s=20).ok
-        if dp.keep_files and have_files:
+        if reuse:
             logger.info("reusing existing test files in /pgdata/%s "
                         "(keep_files: true — prepare skipped)", PROBE_DIR)
             atomic_write_text(run_dir / "raw" / "fileio_prepare.log",
@@ -253,18 +316,47 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
         else:
             logger.info("fileio prepare (%.0fG in %d files) ...",
                         dp.file_total_size_gb, dp.file_num)
+            _mark(run_dir, "fileio prepare",
+                  f"{dp.file_total_size_gb:g}G in {dp.file_num} files "
+                  "(sequential writes — a different IO regime than the run)")
+            # a throttled/degraded volume can crawl: budget >= ~17 MB/s
             res = kube.exec(pod_name, "fileio", sh(["prepare"]),
-                            timeout_s=3600, check=True)
+                            timeout_s=max(3600.0,
+                                          dp.file_total_size_gb * 60.0),
+                            check=True)
             atomic_write_text(run_dir / "raw" / "fileio_prepare.log", res.stdout)
         t0 = utc_now_iso()
         logger.info("fileio run: %s for %ds x%d threads ...",
                     dp.test_mode, dp.duration_s, dp.threads)
-        res = kube.exec(pod_name, "fileio",
-                        sh([f"--time={dp.duration_s}", "--report-interval=1",
-                            "run"]),
-                        timeout_s=float(dp.duration_s + 300), check=True)
-        atomic_write_text(run_dir / "raw" / "fileio_run.log", res.stdout)
-        result = parse_fileio_result(res.stdout)
+        _mark(run_dir, "fileio run",
+              f"{dp.test_mode} x{dp.threads} threads, backlog "
+              f"{dp.async_backlog}, {dp.block_size_kb}K blocks; sysbench "
+              "fsyncs all files at exit, so the tail of this window is a "
+              "writeback flush, not steady-state random IO")
+        # The load-driving exec stream can die (API blip, token refresh)
+        # while sysbench completes fine in the pod — and the device series,
+        # the actual ground truth, is intact either way. Salvage instead of
+        # discarding the whole probe: keep partial output, let the summary
+        # fall back to device counters, and mark the run partial.
+        run_exec_failed = ""
+        try:
+            res = kube.exec(pod_name, "fileio",
+                            sh([f"--time={dp.duration_s}",
+                                "--report-interval=1", "run"]),
+                            timeout_s=float(dp.duration_s + 300))
+            run_out = res.stdout
+            if not res.ok:
+                run_exec_failed = f"exec exited rc={res.rc}: {res.stderr[:300]}"
+        except KubeError as exc:
+            run_out, run_exec_failed = "", str(exc)
+        atomic_write_text(run_dir / "raw" / "fileio_run.log",
+                          run_out or f"(no output — {run_exec_failed})\n")
+        _mark(run_dir, "fileio done", "load stopped; anything after is idle")
+        if run_exec_failed:
+            logger.warning("fileio run exec died (%s) — sysbench may have "
+                           "completed in the pod anyway; deriving figures "
+                           "from the device series", run_exec_failed)
+        result = parse_fileio_result(run_out)
         if "iops" not in result:
             # sysbench build printed an unrecognized summary format (field
             # report: "fileio result: ?") — the device counters are the
@@ -288,7 +380,7 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
             res = kube.exec(pod_name, "fileio", sh(["cleanup"]), timeout_s=600)
             atomic_write_text(run_dir / "raw" / "fileio_cleanup.log",
                               res.stdout if res.ok else res.stderr)
-        manifest.status = "complete"
+        manifest.status = "partial" if run_exec_failed else "complete"
     except (Exception, KeyboardInterrupt) as exc:
         manifest.status = "failed"
         manifest.finished_utc = utc_now_iso()
@@ -304,7 +396,8 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
     manifest.finished_utc = utc_now_iso()
     manifest.save(run_dir)
     rows = deviceio.derive_device_series(run_dir)
-    verdict = deviceio.compute_verdict(rows, spec.limits)
+    verdict = deviceio.compute_verdict(rows, spec.limits,
+                                       deviceio.load_event_markers(run_dir))
     evidence.build_evidence(run_dir, spec, verdict)
     report_evidence.generate_evidence_report(run_dir)
     line = f"IOPS verdict: {verdict['finding'].upper()} — {verdict['detail']}"

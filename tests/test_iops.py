@@ -182,6 +182,62 @@ def test_verdict_three_ways():
     assert v["finding"] == "inconclusive" and "no device series" in v["detail"]
 
 
+def test_verdict_peak_window_is_stamped_and_attributed():
+    """The verdict must say WHEN the sustained peak happened and which phase
+    produced it — a 12K burst during the end-of-run flush must not be read as
+    the random-IO ceiling (first live EXCEEDS was exactly this ambiguity)."""
+    from pgbench_harness.deviceio import compute_verdict
+    from pgbench_harness.spec import Limits
+    base = 1_770_000_000_000                        # some real epoch ms
+    rows = []
+    for i in range(60):                             # 0-29s quiet, 30-59s hot
+        iops = 3000.0 if i < 30 else 22000.0
+        rows.append({"t_epoch_ms": base + i * 1000, "reads_s": iops * 0.6,
+                     "writes_s": iops * 0.4, "iops": iops, "read_mb_s": 90.0,
+                     "write_mb_s": 60.0, "await_ms": 2.0, "util_pct": 99.0,
+                     "queue_depth": 80.0})
+    events = [(float(base), "fileio prepare"),
+              (float(base + 30_000), "fileio run")]
+    v = compute_verdict(rows, Limits(), events)
+    assert v["finding"] == "exceeds"
+    assert v["peak_during"] == "fileio run"
+    assert "during 'fileio run'" in v["detail"]
+    assert "peak window" in v["detail"]
+    # the stamped window must sit inside the hot phase
+    assert v["peak_window_start_utc"] >= "2026"     # ISO, sortable
+    from datetime import datetime, timezone
+    start = datetime.strptime(v["peak_window_start_utc"], "%Y-%m-%dT%H:%M:%SZ")
+    hot0 = datetime.fromtimestamp((base + 30_000) / 1000, tz=timezone.utc)
+    assert start.replace(tzinfo=timezone.utc) >= hot0
+    # without events the window is still stamped, just unattributed
+    v2 = compute_verdict(rows, Limits())
+    assert "peak window" in v2["detail"] and "peak_during" not in v2
+    # a peak butting against the next phase marker is flagged as a possible
+    # flush/transition burst (the live 12.5K end-of-run fsync case); a peak
+    # mid-phase is not
+    ev3 = events + [(float(base + 60_000), "fileio done")]
+    v3 = compute_verdict(rows, Limits(), ev3)
+    assert "peak_at_phase_tail" not in v3        # peak starts at 30s, mid-phase
+    tail_rows = []
+    for i in range(60):                          # hot only in the last 12s
+        iops = 3000.0 if i < 48 else 22000.0
+        tail_rows.append(dict(rows[i], iops=iops))
+    v4 = compute_verdict(tail_rows, Limits(), ev3)
+    assert v4.get("peak_at_phase_tail") is True
+    assert "at its tail" in v4["detail"]
+
+
+def test_probe_run_stamps_phase_events(tmp_path):
+    """load_event_markers round-trips what deviceprobe._mark writes."""
+    from pgbench_harness.deviceio import load_event_markers
+    from pgbench_harness.deviceprobe import _mark
+    _mark(tmp_path, "fileio prepare", "100G")
+    _mark(tmp_path, "fileio run", "rndrw x64")
+    marks = load_event_markers(tmp_path)
+    assert [m[1] for m in marks] == ["fileio prepare", "fileio run"]
+    assert marks[0][0] <= marks[1][0]
+
+
 def test_device_series_derivation_from_diskstats_stream(tmp_path):
     from pgbench_harness.deviceio import derive_device_series
     raw = tmp_path / "raw"
@@ -408,6 +464,76 @@ def test_device_probe_keep_files_reuses_across_runs(iops_env, monkeypatch):
                    "--results-dir", str(results)) == 0
     st = json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
     assert st.get("probe_files") is False
+
+
+def test_device_probe_keep_files_geometry_mismatch_refused(iops_env, monkeypatch):
+    """Reusing kept files under a DIFFERENT geometry silently falsifies the
+    evidence (sysbench accepts larger-than-expected files): the probe must
+    refuse with a clear message instead."""
+    monkeypatch.setenv("FAKE_KUBE_DEV_IOPS", "9950")
+    monkeypatch.setenv("FAKE_KUBE_DEV_UTIL", "99")
+    results = iops_env / "results"
+    doc = make_spec_doc()
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "duration_s": 2,
+                           "file_total_size_gb": 1, "file_num": 8,
+                           "threads": 4, "keep_files": True}
+    spec_path = iops_env / "probe.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    assert run_cli("device-probe", "--spec", str(spec_path),
+                   "--results-dir", str(results)) == 0
+    doc["device_probe"]["file_total_size_gb"] = 2        # changed geometry
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    rc = run_cli("device-probe", "--spec", str(spec_path),
+                 "--results-dir", str(results))
+    assert rc == 2
+    runs = sorted(results.iterdir())
+    log = (runs[-1] / "harness.log").read_text()
+    assert "do not match this spec's geometry" in log
+    st = json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    assert st.get("probe_files") is True                 # files left untouched
+
+
+def test_device_probe_first_keep_files_run_requires_full_space(iops_env, monkeypatch):
+    """The relaxed 0.2x space budget applies only when the files actually
+    exist — a FIRST run with keep_files: true still writes the full set and
+    must clear the 2x guardrail (else prepare ENOSPCs the live volume)."""
+    monkeypatch.setenv("FAKE_KUBE_DF_AVAIL_KB", str(10 * 1048576))  # 10 GiB
+    doc = make_spec_doc()
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "duration_s": 2,
+                           "file_total_size_gb": 8,      # needs 16 GiB
+                           "keep_files": True}
+    spec_path = iops_env / "probe.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    rc = run_cli("device-probe", "--spec", str(spec_path),
+                 "--results-dir", str(iops_env / "results"))
+    assert rc == 2
+
+
+def test_fill_from_device_falls_back_to_whole_series_on_clock_skew(tmp_path):
+    """Pod-stamped samples vs host-stamped window: NTP skew must not empty
+    the summary when the series is complete."""
+    from pgbench_harness.deviceprobe import _fill_from_device
+    raw = tmp_path / "raw"
+    raw.mkdir(parents=True)
+    (raw / "diskstats_device.json").write_text(
+        json.dumps({"majmin": "259:4", "device": "nvme1n1"}))
+    lines = []
+    base_s = 1_760_000_000
+    for i in range(8):
+        reads, writes = 6000 * i, 4000 * i
+        lines += [str((base_s + i) * 1000),
+                  f" 259       4 nvme1n1 {reads} 0 {reads * 32} {reads // 3} "
+                  f"{writes} 0 {writes * 32} {writes // 2} 2 {i * 980} "
+                  f"{i * 3900} 0 0", "==="]
+    (raw / "diskstats.log").write_text("\n".join(lines))
+    from datetime import datetime, timezone
+    iso = lambda s: datetime.fromtimestamp(s, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    out = _fill_from_device(tmp_path, iso(base_s + 900), iso(base_s + 1200))
+    assert out["iops"] == 10000.0
+    assert "clock skew" in out["source"]
 
 
 def test_probe_summary_falls_back_to_device_series(tmp_path):

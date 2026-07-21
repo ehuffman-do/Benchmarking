@@ -2295,6 +2295,32 @@ def test_web_device_probe_gating(opsweb):
     assert ev["fileio"]["iops"] > 0
 
 
+def test_web_probe_spec_without_cluster_gets_synthesized_section(opsweb):
+    """The New Run probe form emits a spec with NO cluster: section — the
+    server must synthesize it from the attached kube target's registry entry
+    (single pane of glass: attaching the cluster IS the switch)."""
+    import yaml as _yaml
+    from conftest import make_spec_doc
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    doc = make_spec_doc()
+    del doc["sweep"]
+    doc.pop("cluster", None)                 # exactly what the UI form sends
+    doc["device_probe"] = {"allow_device_probe": True, "duration_s": 2,
+                           "file_total_size_gb": 1, "file_num": 8,
+                           "keep_files": True}
+    r = client.post("/api/runs", json={"spec_yaml": _yaml.safe_dump(doc),
+                                       "kube_target_id": tid},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200 and r.json()["kind"] == "device_probe", r.text
+    import sqlite3
+    with sqlite3.connect(cfg.db_path) as db:   # API never exposes spec_yaml
+        row = db.execute("SELECT spec_yaml FROM jobs WHERE id=?",
+                         (r.json()["job_id"],)).fetchone()
+    stored = _yaml.safe_load(row[0])
+    assert stored["cluster"]["cr_name"], "cluster: not synthesized from registry"
+
+
 def test_pmm_inventory_401_reports_token_rejection_not_unreachable(pmmops):
     """Field bug: an HTTP 401 from the PMM API was reported as 'server
     unreachable'. A status code IS an answer — say the token was rejected,

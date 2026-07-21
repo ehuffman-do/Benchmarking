@@ -87,22 +87,28 @@ def dry_run(spec_yaml: str) -> dict[str, Any]:
 
 def generate_report(run_dir: Path) -> Path:
     """(Re)generate the report for a run dir (mode-aware), returning the file path."""
-    if (run_dir / "parsed" / "soak_summary.json").exists() or \
-            (run_dir / "manifest.json").exists() and _is_soak(run_dir):
+    mode = _run_mode(run_dir)
+    if mode == "soak" or (run_dir / "parsed" / "soak_summary.json").exists():
         return _report_soak.generate_soak_report(run_dir)
+    if mode in ("suite", "probe"):
+        # same dispatch as the CLI's cmd_report — the sweep renderer asserts
+        # spec.sweep and 500'd on suite/device-probe runs
+        from pgbench_harness import report_evidence
+        return report_evidence.generate_evidence_report(run_dir)
     return _report.generate_report(run_dir)
 
 
-def _is_soak(run_dir: Path) -> bool:
+def _run_mode(run_dir: Path) -> str:
     import json
     try:
-        return json.loads((run_dir / "manifest.json").read_text()).get("mode") == "soak"
+        return str(json.loads((run_dir / "manifest.json").read_text())
+                   .get("mode", ""))
     except (OSError, ValueError):
-        return False
+        return ""
 
 
 def report_filename(run_dir: Path) -> str:
-    return "soak_report.html" if _is_soak(run_dir) else "report.html"
+    return "soak_report.html" if _run_mode(run_dir) == "soak" else "report.html"
 
 
 def compare(run_dirs: list[Path], out_path: Path) -> Path:

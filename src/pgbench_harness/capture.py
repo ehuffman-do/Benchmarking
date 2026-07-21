@@ -244,7 +244,8 @@ def connection_ceiling_probe(
                 p.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 p.kill()
-            finally:
+                p.wait()   # reap: an unwaited kill leaves a zombie for the
+            finally:       # life of a possibly week-long harness process
                 if p.stderr and not p.stderr.closed:
                     p.stderr.close()  # avoid leaked-pipe ResourceWarnings
 

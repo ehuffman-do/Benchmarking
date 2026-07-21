@@ -11,19 +11,23 @@ import base64
 import difflib
 import io
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
 import tarfile
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 import yaml
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
-from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
-                               RedirectResponse, StreamingResponse)
+from fastapi import (BackgroundTasks, Depends, FastAPI, Form, HTTPException,
+                     Request, Response)
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               PlainTextResponse, RedirectResponse,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -184,6 +188,12 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
             raise HTTPException(429, "too many login attempts; wait a few minutes")
         row = queries.get_user(conn, username)
         if not row or row["disabled"] or not verify_password(password, row["pw_hash"]):
+            # bound the tracker: prune expired entries across ALL ips (a
+            # scanner rotating source addresses grew this dict without limit)
+            if len(_LOGIN_ATTEMPTS) > 1000:
+                for k in [k for k, v in _LOGIN_ATTEMPTS.items()
+                          if not any(now - t < LOGIN_WINDOW_S for t in v)]:
+                    _LOGIN_ATTEMPTS.pop(k, None)
             _LOGIN_ATTEMPTS[ip] = attempts + [now]
             queries.audit(conn, username, "login_failed", detail=f"ip={ip}")
             return page(request, "login.html", None, error="Invalid credentials")
@@ -320,28 +330,26 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
         _check_csrf(request, payload.get(CSRF_FIELD) or request.headers.get("x-csrf-token"))
         clean_yaml, target_id = _spec_with_target(conn, payload)
-        v = harness_api.validate_yaml(clean_yaml)
-        if not v.get("ok"):
-            raise HTTPException(400, v.get("error", "invalid spec"))
-        if v["mode"] == "device-probe":
-            # destructive-adjacent: saturates the pgdata volume. Admin + the
-            # in-spec arming flag (the runner refuses without it anyway).
-            if user["role"] != "admin":
-                raise HTTPException(403, "device-probe runs are admin-only")
-            kind = "device_probe"
-        else:
-            kind = v["mode"] if v["mode"] in ("soak", "suite") else "run"
         kube_target_id = payload.get("kube_target_id") or None
         if kube_target_id is not None:
-            kt = queries.get_kube_target(conn, int(kube_target_id))
+            try:
+                kube_target_id = int(kube_target_id)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "kube_target_id must be an integer")
+            kt = queries.get_kube_target(conn, kube_target_id)
             if kt is None:
                 raise HTTPException(400, "kube_target_id does not exist")
-            kube_target_id = int(kube_target_id)
             # single pane of glass: attaching a registered cluster IS the
             # cluster-awareness switch — synthesize the spec's cluster: section
-            # from the registry when the YAML doesn't carry one.
-            doc = yaml.safe_load(clean_yaml)
-            if "cluster" not in doc:
+            # from the registry when the YAML doesn't carry one. This must
+            # happen BEFORE validation: a probe-only spec is invalid without
+            # a cluster section, so validate-first rejected exactly the spec
+            # the New Run probe form produces.
+            try:
+                doc = yaml.safe_load(clean_yaml)
+            except yaml.YAMLError:
+                doc = None                    # let validate_yaml report it
+            if isinstance(doc, dict) and "cluster" not in doc:
                 doc["cluster"] = {k: v for k, v in (
                     ("cr_name", kt["cr_name"]), ("namespace", kt["namespace"]),
                     ("cr_kind", kt["cr_kind"]), ("context", kt["context"]),
@@ -350,15 +358,33 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                     raise HTTPException(400, "attached kube target has no CR "
                                              "name — run discover on it first")
                 clean_yaml = yaml.safe_dump(doc, sort_keys=False)
-                v = harness_api.validate_yaml(clean_yaml)
-                if not v.get("ok"):
-                    raise HTTPException(400, v.get("error", "invalid spec"))
-        elif kind == "device_probe":
-            raise HTTPException(400, "device-probe needs kube_target_id (the "
-                                     "cluster whose kubeconfig the worker "
-                                     "injects)")
+        v = harness_api.validate_yaml(clean_yaml)
+        if not v.get("ok"):
+            raise HTTPException(400, v.get("error", "invalid spec"))
+        if v["mode"] == "device-probe":
+            # destructive-adjacent: saturates the pgdata volume. Admin + the
+            # in-spec arming flag (the runner refuses without it anyway).
+            if user["role"] != "admin":
+                raise HTTPException(403, "device-probe runs are admin-only")
+            if kube_target_id is None:
+                raise HTTPException(400, "device-probe needs kube_target_id "
+                                         "(the cluster whose kubeconfig the "
+                                         "worker injects)")
+            kind = "device_probe"
+        else:
+            kind = v["mode"] if v["mode"] in ("soak", "suite") else "run"
+        scheduled = payload.get("scheduled_utc") or None
+        if scheduled:
+            # the claim query compares this as an ISO string — a malformed
+            # value would make the job permanently ineligible with no error
+            try:
+                datetime.strptime(str(scheduled), "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                raise HTTPException(400, "scheduled_utc must be UTC ISO like "
+                                         "2026-06-28T02:00:00Z")
+            scheduled = str(scheduled)
         job_id = queries.enqueue_job(conn, kind, clean_yaml, target_id, user["username"],
-                                     scheduled_utc=payload.get("scheduled_utc") or None,
+                                     scheduled_utc=scheduled,
                                      kube_target_id=kube_target_id)
         password = payload.get("password")
         if password:
@@ -686,20 +712,32 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         return PlainTextResponse(p.read_text(encoding="utf-8"))
 
     @app.get("/runs/{run_id}/artifact")
-    def run_artifact(run_id: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
+    def run_artifact(run_id: str, background_tasks: BackgroundTasks,
+                     user: sqlite3.Row = Depends(require("viewer"))) -> Response:
         run_dir = _run_dir_safe(cfg, run_id)
         if not (run_dir / "manifest.json").exists():
             raise HTTPException(404, "run not found")
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            tar.add(run_dir, arcname=run_id)
-        buf.seek(0)
-        return Response(buf.read(), media_type="application/gzip",
-                        headers={"Content-Disposition": f'attachment; filename="{run_id}.tar.gz"'})
+        # spool to disk, not RAM: a week-long soak's run dir is multiple GB
+        # and an in-memory tar (plus the .read() copy) could OOM the web tier
+        tmp = tempfile.NamedTemporaryFile(
+            prefix=f".artifact_{run_id}_", suffix=".tar.gz",
+            dir=cfg.data_dir, delete=False)
+        tmp.close()
+        try:
+            with tarfile.open(tmp.name, mode="w:gz") as tar:
+                tar.add(run_dir, arcname=run_id)
+        except BaseException:
+            os.unlink(tmp.name)
+            raise
+        background_tasks.add_task(lambda p=tmp.name: os.path.exists(p) and os.unlink(p))
+        return FileResponse(tmp.name, media_type="application/gzip",
+                            filename=f"{run_id}.tar.gz")
 
     @app.get("/runs/{run_id}/stream")
-    def run_stream(run_id: str, conn: sqlite3.Connection = Depends(get_conn),
+    def run_stream(run_id: str,
                    user: sqlite3.Row = Depends(require("viewer"))) -> StreamingResponse:
+        # NOTE: deliberately no DB dependency — an SSE generator holds its
+        # thread for hours and must not pin a SQLite connection with it
         run_dir = _run_dir_safe(cfg, run_id)
         return StreamingResponse(_sse(cfg, run_dir), media_type="text/event-stream")
 
@@ -959,7 +997,7 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     @app.get("/runs/{run_id}/provider-metrics")
     def run_provider_metrics(run_id: str, conn: sqlite3.Connection = Depends(get_conn),
                              user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
-        run_dir = cfg.results_dir / run_id
+        run_dir = _run_dir_safe(cfg, run_id)   # same traversal guard as every run route
         cached = run_dir / "env" / "provider_metrics.json"
         if cached.exists():
             try:
@@ -972,7 +1010,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         man = run_dir / "manifest.json"
         if not man.exists():
             raise HTTPException(404, "run not found")
-        m = json.loads(man.read_text())
+        try:
+            m = json.loads(man.read_text())
+        except (ValueError, OSError):
+            raise HTTPException(502, "run manifest is unreadable")
         start_epoch = _epoch(m.get("created_utc"))
         finished_epoch = _epoch(m.get("finished_utc"))
         # An in-progress run has no finished_utc yet (epoch 0), which would request
@@ -1045,22 +1086,23 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
             if rel != cur_file:              # first/swapped file -> fresh tail
                 cur_file, samples_tail = rel, _CsvTail()
                 sent_any["samples"] = False
-            rows = samples_tail.read_new(path)
+            rows, was_reset = samples_tail.read_new(path)
             if rows:
-                # `reset` marks the first batch of THIS stream so a
-                # reconnecting client rebuilds instead of double-appending
-                # (offset may be huge after a capped backfill of a long run)
+                # `reset` marks the first batch of THIS stream — or a file
+                # replaced under us (finalize/resume rewrite) — so the client
+                # rebuilds instead of double-appending
                 yield _event("samples", {"file": rel, "header": samples_tail.header,
                                          "offset": samples_tail.row_count,
-                                         "reset": not sent_any["samples"],
+                                         "reset": was_reset or not sent_any["samples"],
                                          "rows": rows})
                 samples_tail.row_count += len(rows)
                 sent_any["samples"] = True
-        rows = pg_tail.read_new(run_dir / "parsed" / "pg_timeseries.csv")
+        rows, was_reset = pg_tail.read_new(run_dir / "parsed" / "pg_timeseries.csv")
         if rows:
             yield _event("pg", {"header": pg_tail.header,
                                 "offset": pg_tail.row_count,
-                                "reset": not sent_any["pg"], "rows": rows})
+                                "reset": was_reset or not sent_any["pg"],
+                                "rows": rows})
             pg_tail.row_count += len(rows)
             sent_any["pg"] = True
 
@@ -1180,25 +1222,53 @@ def _job_sse(cfg: Config, job_id: int, max_ticks: int = 2 * 3600) -> Iterator[st
     """
     out = cfg.data_dir / "jobs" / f"job_{job_id}.out"
     conn = connect(cfg.db_path)
+    tail = {"pos": 0, "buf": ""}
+
+    def _drain(include_partial: bool = False) -> Iterator[str]:
+        # byte-offset incremental: re-reading the whole file every second
+        # was O(N^2) over a chatty multi-hour prepare job
+        try:
+            with open(out, "rb") as fh:
+                fh.seek(tail["pos"])
+                data = fh.read()
+        except OSError:
+            return
+        tail["pos"] += len(data)
+        text = tail["buf"] + data.decode("utf-8", "replace")
+        nl = text.rfind("\n")
+        if nl == -1:
+            complete, tail["buf"] = "", text
+        else:
+            complete, tail["buf"] = text[:nl], text[nl + 1:]
+        lines = complete.split("\n") if complete else []
+        if include_partial and tail["buf"]:
+            lines.append(tail["buf"])
+            tail["buf"] = ""
+        for line in lines:
+            if not line:
+                continue
+            obj = None
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                obj = None
+            if isinstance(obj, dict) and "status" in obj and "name" in obj:
+                yield _event("check", obj)
+            else:
+                yield _event("log", line + "\n")
+
     try:
-        lines_sent = 0
         for _ in range(max_ticks):
             if out.exists():
-                lines = out.read_text(encoding="utf-8", errors="replace").splitlines()
-                for line in lines[lines_sent:]:
-                    obj = None
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:
-                        obj = None
-                    if isinstance(obj, dict) and "status" in obj and "name" in obj:
-                        yield _event("check", obj)
-                    else:
-                        yield _event("log", line + "\n")
-                lines_sent = len(lines)
+                yield from _drain()
             job = queries.get_job(conn, job_id)
             state = job["state"] if job else "failed"
             if state in ("done", "failed", "canceled"):
+                if out.exists():
+                    # final drain AFTER the state flip: the worker's last
+                    # lines land in the same instant — without this the
+                    # terminal check results silently vanished from the UI
+                    yield from _drain(include_partial=True)
                 yield _event("done", {"status": state})
                 return
             time.sleep(1)
@@ -1319,40 +1389,53 @@ class _CsvTail:
         self.byte_off = 0
         self.row_count = 0               # rows emitted so far (file-absolute)
         self._partial = ""
+        self._ino: Optional[int] = None
 
-    def read_new(self, path: Path) -> list[str]:
+    def read_new(self, path: Path) -> tuple[list[str], bool]:
+        """(new complete rows, was_reset). was_reset is True when the file
+        was replaced or truncated under us — the harness atomically REPLACES
+        the live CSV at finalize/resume (new inode, possibly same-or-larger
+        size with a different prefix), so identity is tracked by inode, not
+        just size. The caller must surface was_reset to the client, or a
+        rewrite re-emits thousands of rows flagged as increments."""
         try:
-            size = path.stat().st_size
+            st = path.stat()
         except OSError:
-            return []
-        if size < self.byte_off:         # rewritten/truncated file -> restart
-            self.__init__(self.cap)
+            return [], False
+        was_reset = False
+        if self._ino is not None and (st.st_ino != self._ino
+                                      or st.st_size < self.byte_off):
+            self.__init__(self.cap)      # replaced or truncated -> restart
+            was_reset = True
+        self._ino = st.st_ino
         try:
             with open(path, "rb") as fh:
                 fh.seek(self.byte_off)
                 data = fh.read()
         except OSError:
-            return []
+            return [], was_reset
         if not data:
-            return []
+            return [], was_reset
         text = self._partial + data.decode("utf-8", "replace")
         nl = text.rfind("\n")
         if nl == -1:
             self._partial = text
             self.byte_off += len(data)
-            return []
+            return [], was_reset
         self._partial = text[nl + 1:]
-        lines = text[:nl].split("\n")
+        # the live writer's csv.writer terminates rows with \r\n; split on
+        # \n alone left a trailing \r on every row's last field
+        lines = [ln.rstrip("\r") for ln in text[:nl].split("\n")]
         self.byte_off += len(data)
         if not self.header:
             if not lines:
-                return []
+                return [], was_reset
             self.header = lines[0]
             lines = lines[1:]
             if len(lines) > self.cap:    # first read of a huge file: cap it
                 self.row_count = len(lines) - self.cap
                 lines = lines[-self.cap:]
-        return [ln for ln in lines if ln]
+        return [ln for ln in lines if ln], was_reset
 
 
 def _read_csv(path: Path) -> tuple[str, list[str]]:

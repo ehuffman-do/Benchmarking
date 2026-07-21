@@ -482,6 +482,13 @@ pgbench-harness soak --spec examples/iops-rate-steps.yaml
 pgbench-harness device-probe --spec examples/device-probe.yaml
 ```
 
+All three modes are launchable from the web console: a cluster page's "IOPS
+evidence" card quick-launches the suite, the knee finder, and (admin-only)
+the device probe in its three patterns — mixed `rndrw`, pure-read `rndrd`,
+pure-write `rndwr` — with the cluster pre-attached; New Run's
+`device probe` mode exposes threads / async backlog / pattern / duration /
+file geometry / keep-files as form fields.
+
 Every mode ends with a printed **verdict** judged against the spec's
 `limits:` (recorded, never hardcoded): **capped** (sustained plateau within
 tolerance of the standard limit), **exceeds** (sustained above it — the

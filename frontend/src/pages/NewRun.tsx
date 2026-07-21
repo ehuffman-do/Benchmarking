@@ -46,8 +46,9 @@ export function NewRun({ me }: { me: Me }) {
   const [inline, setInline] = useState({ host: "", port: 5432, database: "defaultdb", user: "doadmin", sslmode: "require", password: "" });
   const [meta, setMeta] = useState({ label: "", edition: "advanced", tshirt_size: "8c32g", tags: "", ticket: "" });
   const [wl, setWl] = useState({ type: "tpcc", tpcc_path: "/opt/sysbench-tpcc", tables: 10, scale: 30, table_size: 1000000, dataset_gb: 64, mix: "mixed", rand_type: "uniform" });
-  const [mode, setMode] = useState<"sweep" | "soak" | "suite">("sweep");
+  const [mode, setMode] = useState<"sweep" | "soak" | "suite" | "probe">("sweep");
   const [suite, setSuite] = useState({ duration_s: 300, threads: "1, 2, 4, 8, 16, 32", warmup_s: 30, cooldown_s: 30, pgbench: true, pgbench_scale: 1000 });
+  const [probe, setProbe] = useState({ threads: 64, async_backlog: 256, test_mode: "rndrw", duration_s: 600, file_num: 128, file_total_size_gb: 100, keep_files: true });
   const [rateSteps, setRateSteps] = useState("");          // soak-only, optional
   const [stepDur, setStepDur] = useState(180);
   const [sweep, setSweep] = useState({ threads: "1, 4, 16, 64", duration_s: 300, warmup_s: 60, cooldown_s: 30, repetitions: 1 });
@@ -76,8 +77,16 @@ export function NewRun({ me }: { me: Me }) {
     if (wantCluster) setKubeTargetId(wantCluster);
     if (wantMode === "suite") { setMode("suite"); setWl((w) => ({ ...w, type: "io_stress" })); }
     if (wantMode === "rate-steps") {
-      setMode("soak"); setRateSteps("500, 1000, 2000, 4000, 8000, 0");
+      // start LOW: unachievable steps are skipped with an event, but a ladder
+      // that opens far beyond capacity wastes its first segments
+      setMode("soak"); setRateSteps("100, 250, 500, 1000, 2000, 0");
       setWl((w) => ({ ...w, type: "io_stress" }));
+    }
+    if (wantMode === "device-probe") {
+      setMode("probe"); setWl((w) => ({ ...w, type: "io_stress" }));
+      const variant = params.get("variant") || "";
+      if (["rndrw", "rndrd", "rndwr"].includes(variant))
+        setProbe((p) => ({ ...p, test_mode: variant }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -115,12 +124,20 @@ export function NewRun({ me }: { me: Me }) {
       d.suite = { duration_s: suite.duration_s, threads: ladder(suite.threads),
                   warmup_s: suite.warmup_s, cooldown_s: suite.cooldown_s,
                   pgbench: suite.pgbench, pgbench_scale: suite.pgbench_scale };
+    } else if (mode === "probe") {
+      d.device_probe = {
+        allow_device_probe: true, file_num: probe.file_num,
+        file_total_size_gb: probe.file_total_size_gb, io_mode: "async",
+        async_backlog: probe.async_backlog, test_mode: probe.test_mode,
+        fsync_freq: 0, threads: probe.threads, duration_s: probe.duration_s,
+        ...(probe.keep_files ? { keep_files: true } : {}),
+      };
     } else d.sweep = {
       threads: ladder(sweep.threads),
       duration_s: sweep.duration_s, warmup_s: sweep.warmup_s, cooldown_s: sweep.cooldown_s, repetitions: sweep.repetitions,
     };
     return d;
-  }, [targetMode, targetId, targets, inline, meta, wl, mode, sweep, soak, suite, rateSteps, stepDur]);
+  }, [targetMode, targetId, targets, inline, meta, wl, mode, sweep, soak, suite, probe, rateSteps, stepDur]);
 
   useEffect(() => {
     if (autoSync) setYaml(toYaml(doc) + "\n");
@@ -153,6 +170,10 @@ export function NewRun({ me }: { me: Me }) {
   }
   async function start() {
     setErr(null);
+    if (mode === "probe" && !kubeTargetId) {
+      setErr("the device probe needs an attached cluster (it runs inside the cluster) — pick one under “Attach cluster”");
+      return;
+    }
     try {
       await api.post("/api/runs", { spec_yaml: yaml, scheduled_utc: schedule.trim() || null,
                                     ...(kubeTargetId ? { kube_target_id: kubeTargetId } : {}),
@@ -245,7 +266,7 @@ export function NewRun({ me }: { me: Me }) {
           <hr />
           <div className="row">
             <div className="field"><label>Workload</label><select value={wl.type} onChange={(e) => setWl({ ...wl, type: e.target.value })}>{WORKLOADS.map((w) => <option key={w}>{w}</option>)}</select></div>
-            <div className="field"><label>Mode</label><select value={mode} onChange={(e) => setMode(e.target.value as "sweep" | "soak" | "suite")}><option value="sweep">sweep</option><option value="soak">soak</option><option value="suite">suite (IOPS evidence matrix)</option></select></div>
+            <div className="field"><label>Mode</label><select value={mode} onChange={(e) => setMode(e.target.value as "sweep" | "soak" | "suite" | "probe")}><option value="sweep">sweep</option><option value="soak">soak</option><option value="suite">suite (IOPS evidence matrix)</option>{me.role === "admin" && <option value="probe">device probe (fileio — TEST CLUSTERS ONLY)</option>}</select></div>
           </div>
           {wl.type === "tpcc" ? (
             <div className="row">
@@ -289,6 +310,34 @@ export function NewRun({ me }: { me: Me }) {
                 ladder) as one evidence bundle. Attach a cluster below for the
                 device-IOPS verdict.</p>
             </>
+          ) : mode === "probe" ? (
+            <>
+              <div className="row">
+                <div className="field"><label>Threads</label><input type="number" value={probe.threads} onChange={(e) => setProbe({ ...probe, threads: Number(e.target.value) })} /></div>
+                <div className="field"><label>Async backlog (per-thread queue)</label><input type="number" value={probe.async_backlog} onChange={(e) => setProbe({ ...probe, async_backlog: Number(e.target.value) })} /></div>
+                <div className="field"><label>IO pattern</label>
+                  <select value={probe.test_mode} onChange={(e) => setProbe({ ...probe, test_mode: e.target.value })}>
+                    <option value="rndrw">rndrw — mixed random</option>
+                    <option value="rndrd">rndrd — pure random read</option>
+                    <option value="rndwr">rndwr — pure random write</option>
+                  </select></div>
+              </div>
+              <div className="row">
+                <div className="field"><label>Duration (s)</label><input type="number" value={probe.duration_s} onChange={(e) => setProbe({ ...probe, duration_s: Number(e.target.value) })} /></div>
+                <div className="field"><label>Test files total (GiB)</label><input type="number" value={probe.file_total_size_gb} onChange={(e) => setProbe({ ...probe, file_total_size_gb: Number(e.target.value) })} /></div>
+                <div className="field"><label>File count</label><input type="number" value={probe.file_num} onChange={(e) => setProbe({ ...probe, file_num: Number(e.target.value) })} /></div>
+              </div>
+              <div className="field"><label><input type="checkbox" checked={probe.keep_files} onChange={(e) => setProbe({ ...probe, keep_files: e.target.checked })} />&nbsp;Keep test files between probes (skip the multi-minute prepare when iterating; run once unchecked — or delete <code>/pgdata/pgb-fileio-probe</code> — to reclaim the space)</label></div>
+              <p className="subtle" style={{ fontSize: 12 }}>
+                Runs sysbench fileio from a pod pinned to the primary&apos;s node,
+                mounting the pgdata PVC directly — Postgres&apos;s synchronous read
+                path is out of the equation, so this is the definitive volume
+                ceiling test. It saturates pgdata IO and writes test files onto
+                the volume: <b>test clusters only</b>. Requires an attached
+                cluster below. 600s outlasts burst credits; use rndrd for the
+                clean read ceiling and rndwr for the write path.
+              </p>
+            </>
           ) : (
             <>
               <div className="row">
@@ -296,7 +345,7 @@ export function NewRun({ me }: { me: Me }) {
                 <div className="field"><label>Duration (s)</label><input type="number" value={soak.duration_s} onChange={(e) => setSoak({ ...soak, duration_s: Number(e.target.value) })} disabled={!!rateSteps.trim()} /></div>
               </div>
               <div className="row">
-                <div className="field"><label>Rate steps (tps, comma; 0 = unthrottled; blank = plain soak)</label><input value={rateSteps} onChange={(e) => setRateSteps(e.target.value)} placeholder="500, 1000, 2000, 4000, 8000, 0" /></div>
+                <div className="field"><label>Rate steps (tps, comma; 0 = unthrottled; blank = plain soak; start LOW — unachievable steps skip forward)</label><input value={rateSteps} onChange={(e) => setRateSteps(e.target.value)} placeholder="100, 250, 500, 1000, 2000, 0" /></div>
                 {rateSteps.trim() && <div className="field"><label>Step duration (s)</label><input type="number" value={stepDur} onChange={(e) => setStepDur(Number(e.target.value))} /></div>}
               </div>
             </>
@@ -327,8 +376,8 @@ export function NewRun({ me }: { me: Me }) {
           <div className="actions" style={{ marginTop: 10 }}>
             <button onClick={validate}>Validate</button>
             <button onClick={dryRun}>Dry-run</button>
-            {canRun && <button onClick={() => task("preflight")}>Preflight</button>}
-            {canRun && <button onClick={() => task("prepare")}>Prepare data</button>}
+            {canRun && mode !== "probe" && <button onClick={() => task("preflight")}>Preflight</button>}
+            {canRun && mode !== "probe" && <button onClick={() => task("prepare")}>Prepare data</button>}
             {canRun ? <button className="primary" onClick={start}>Start run</button>
               : <span className="subtle">viewer role: read-only</span>}
           </div>

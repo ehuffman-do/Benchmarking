@@ -105,7 +105,9 @@ def generate_evidence_report(run_dir: Path) -> Path:
     if not ev_path.exists():
         from pgbench_harness import deviceio
         rows = deviceio.derive_device_series(run_dir)
-        verdict = deviceio.compute_verdict(rows, spec.limits) if spec.cluster else None
+        verdict = deviceio.compute_verdict(
+            rows, spec.limits,
+            deviceio.load_event_markers(run_dir)) if spec.cluster else None
         evidence_mod.build_evidence(run_dir, spec, verdict)
     try:
         ev = read_json(ev_path)
