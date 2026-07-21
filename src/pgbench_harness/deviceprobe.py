@@ -52,6 +52,18 @@ FILEIO_RESULT_RES = {
     "write_mb_s": re.compile(r"written, MiB/s:\s+([\d.]+)"),
 }
 
+# Modern sysbench (>= 1.0.18-ish builds, incl. perconalab/sysbench) prints
+#   read:  IOPS=8849.33 138.27 MiB/s (144.99 MB/s)
+# instead of the "reads/s:" block — the field run that hit this fell back to
+# device-derived figures. Both formats parse now.
+FILEIO_RESULT_RES_MODERN = {
+    "reads_s": re.compile(r"read:\s+IOPS=([\d.]+)"),
+    "writes_s": re.compile(r"write:\s+IOPS=([\d.]+)"),
+    "fsyncs_s": re.compile(r"fsync:\s+IOPS=([\d.]+)"),
+    "read_mb_s": re.compile(r"read:\s+IOPS=[\d.]+\s+([\d.]+)\s+MiB/s"),
+    "write_mb_s": re.compile(r"write:\s+IOPS=[\d.]+\s+([\d.]+)\s+MiB/s"),
+}
+
 
 def _fileio_args(spec: Spec) -> list[str]:
     dp = spec.device_probe
@@ -67,7 +79,7 @@ def _fileio_args(spec: Spec) -> list[str]:
         f"--file-fsync-freq={dp.fsync_freq}",
         f"--file-block-size={dp.block_size_kb * 1024}",
         f"--threads={dp.threads}",
-    ]
+    ] + (["--file-extra-flags=direct"] if dp.direct_io else [])
 
 
 def _pod_manifest(spec: Spec, pod_name: str, node: str, pvc: str) -> str:
@@ -134,12 +146,18 @@ def _fill_from_device(run_dir: Path, start_iso: str,
 
 def parse_fileio_result(text: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    for key, rx in FILEIO_RESULT_RES.items():
-        m = rx.search(text)
-        if m:
-            out[key] = float(m.group(1))
+    for res_set in (FILEIO_RESULT_RES, FILEIO_RESULT_RES_MODERN):
+        for key, rx in res_set.items():
+            m = rx.search(text)
+            if m and key not in out:
+                out[key] = float(m.group(1))
+        if out:
+            break
     if "reads_s" in out or "writes_s" in out:
         out["iops"] = round(out.get("reads_s", 0.0) + out.get("writes_s", 0.0), 1)
+        out["source"] = ("sysbench summary — NOTE: without direct IO "
+                         "(device_probe.direct_io) sysbench counts page-cache "
+                         "hits too; parsed/device_io.csv is the device truth")
     return out
 
 

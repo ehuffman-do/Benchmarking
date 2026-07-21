@@ -586,6 +586,47 @@ def test_fill_from_device_falls_back_to_whole_series_on_clock_skew(tmp_path):
     assert "clock skew" in out["source"]
 
 
+def test_parse_fileio_result_modern_iops_format():
+    """Field gap: modern sysbench prints 'read:  IOPS=...' — the old
+    'reads/s:' regexes matched nothing and every probe fell back to
+    device-derived figures. Exact text from the live rndrd run."""
+    from pgbench_harness.deviceprobe import parse_fileio_result
+    text = """Throughput:
+         read:  IOPS=8849.33 138.27 MiB/s (144.99 MB/s)
+         write: IOPS=0.00 0.00 MiB/s (0.00 MB/s)
+         fsync: IOPS=0.00
+
+Latency (ms):
+         min:                                  0.00
+         avg:                                 14.46
+         max:                                374.07
+         95th percentile:                     34.33
+"""
+    out = parse_fileio_result(text)
+    assert out["reads_s"] == 8849.33
+    assert out["writes_s"] == 0.0
+    assert out["iops"] == 8849.3
+    assert out["read_mb_s"] == 138.27
+    assert "page-cache" in out["source"]    # cache caveat travels with it
+    # the old format must still parse (and win when both absent/present)
+    legacy = parse_fileio_result("reads/s: 100.00\nwrites/s: 50.00\n")
+    assert legacy["iops"] == 150.0
+
+
+def test_device_probe_direct_io_flag():
+    from conftest import make_spec_doc
+    from pgbench_harness.deviceprobe import _fileio_args
+    from pgbench_harness.spec import parse_spec
+    doc = make_spec_doc()
+    del doc["sweep"]
+    doc["cluster"] = {"cr_name": "cluster1"}
+    doc["device_probe"] = {"allow_device_probe": True, "direct_io": True}
+    args = _fileio_args(parse_spec(doc))
+    assert "--file-extra-flags=direct" in args
+    doc["device_probe"] = {"allow_device_probe": True}
+    assert "--file-extra-flags=direct" not in _fileio_args(parse_spec(doc))
+
+
 def test_probe_summary_falls_back_to_device_series(tmp_path):
     """Field bug: an unrecognized sysbench summary printed 'fileio result: ?'
     — the device counters are the ground truth, so the figures derive from

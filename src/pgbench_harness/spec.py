@@ -177,6 +177,9 @@ class DeviceProbe:
     image: str = "perconalab/sysbench:latest"
     block_size_kb: int = 16             # Postgres-ish random IO block
     keep_files: bool = False            # reuse test files across probe runs
+    direct_io: bool = False             # O_DIRECT: bypass the node page cache
+    #   (without it sysbench's own IOPS include cache hits — the device
+    #   series is the ground truth either way, but direct makes them agree)
 
 
 @dataclass(frozen=True)
@@ -579,7 +582,7 @@ def _parse_device_probe(sec: dict[str, Any]) -> DeviceProbe:
     _check_keys(sec, "device_probe", set(),
                 {"allow_device_probe", "file_num", "file_total_size_gb", "io_mode",
                  "async_backlog", "test_mode", "fsync_freq", "threads", "duration_s",
-                 "image", "block_size_kb", "keep_files"})
+                 "image", "block_size_kb", "keep_files", "direct_io"})
     dp = DeviceProbe(
         allow_device_probe=_typed(sec, "device_probe", "allow_device_probe", bool, False),
         file_num=_typed(sec, "device_probe", "file_num", int, 128),
@@ -593,6 +596,7 @@ def _parse_device_probe(sec: dict[str, Any]) -> DeviceProbe:
         image=_typed(sec, "device_probe", "image", str, "perconalab/sysbench:latest"),
         block_size_kb=_typed(sec, "device_probe", "block_size_kb", int, 16),
         keep_files=_typed(sec, "device_probe", "keep_files", bool, False),
+        direct_io=_typed(sec, "device_probe", "direct_io", bool, False),
     )
     if dp.io_mode not in ("async", "sync"):
         raise SpecError("'device_probe.io_mode' must be async|sync")
