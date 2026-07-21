@@ -327,8 +327,16 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
                   f"{len(instances)} instances")
 
         # Safety rail: never fire while a backup holds the stanza lock.
+        # Fails CLOSED — an exec failure means "cannot verify", not "clear".
         info = kube.exec(leader, "database",
                          ["pgbackrest", "--stanza=db", "info"], timeout_s=30)
+        if not info.ok or not info.stdout.strip():
+            run.event("preflight", "ABORT: cannot verify pgBackRest lock",
+                      f"pgbackrest info failed (rc={info.returncode}) — refusing to "
+                      "fire a failover without proof no backup is in flight")
+            run.finalize("aborted", headline={"case": case,
+                                              "reason": "lock unverifiable"})
+            return EXIT_ABORTED
         if lock_held(info.stdout):
             run.event("preflight", "ABORT: pgBackRest lock held",
                       "a backup/expire is in flight on this target — firing a "
@@ -433,27 +441,36 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
         run.event("capture", "capture streams stopped", "")
 
         # ── stitch + report ──
-        from pgbench_harness.ops.stitch import stitch_run_dir
-        stitched = stitch_run_dir(run.run_dir)
-        cls = stitched.classification
-        headline: dict[str, Any] = {
-            "case": case,
-            "downtime_ms": stitched.probe.get("client_downtime_ms"),
-            "detection_ms": stitched.probe.get("detection_ms"),
-            "flip": cls.get("flip"), "kind": cls.get("kind"),
-            "leader_before": stitched.patroni.get("leader_before"),
-            "leader_after": stitched.patroni.get("leader_after"),
-            "tl_before": stitched.patroni.get("tl_before"),
-            "tl_after": stitched.patroni.get("tl_after"),
-            "backoff_tail_ms": stitched.pgbouncer.get("backoff_tail_ms"),
-            "full_ha_recovery_s": stitched.recovery.get("full_ha_recovery_s"),
-            "fire_epoch_ms": marker["ts_epoch_ms"],
-        }
+        # Stitching is DERIVED data over captures already safe on disk: a
+        # stitcher bug must downgrade to a warning, never flip a successful
+        # failover run to 'failed' (same contract as report generation).
+        headline: dict[str, Any] = {"case": case,
+                                    "fire_epoch_ms": marker["ts_epoch_ms"]}
+        try:
+            from pgbench_harness.ops.stitch import stitch_run_dir
+            stitched = stitch_run_dir(run.run_dir)
+            cls = stitched.classification
+            headline.update({
+                "downtime_ms": stitched.probe.get("client_downtime_ms"),
+                "detection_ms": stitched.probe.get("detection_ms"),
+                "flip": cls.get("flip"), "kind": cls.get("kind"),
+                "leader_before": stitched.patroni.get("leader_before"),
+                "leader_after": stitched.patroni.get("leader_after"),
+                "tl_before": stitched.patroni.get("tl_before"),
+                "tl_after": stitched.patroni.get("tl_after"),
+                "backoff_tail_ms": stitched.pgbouncer.get("backoff_tail_ms"),
+                "full_ha_recovery_s": stitched.recovery.get("full_ha_recovery_s"),
+            })
+            run.event("stitch", "timeline stitched",
+                      f"downtime {headline['downtime_ms']} ms, "
+                      f"flip={headline['flip']} ({headline['kind']})")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("stitch failed: %s — captures are intact on disk", exc)
+            run.event("stitch", "stitch failed (derived data)",
+                      f"{str(exc)[:300]} — raw captures are intact; re-run "
+                      "stitching after a harness update")
         if params.get("linked_run_id"):
             headline["linked_run_id"] = params["linked_run_id"]
-        run.event("stitch", "timeline stitched",
-                  f"downtime {headline['downtime_ms']} ms, "
-                  f"flip={headline['flip']} ({headline['kind']})")
         # Finalize BEFORE rendering: the report reads meta.json from disk, so
         # the headline/status must be terminal or the KPI tiles render empty.
         run.finalize("complete", headline=headline)

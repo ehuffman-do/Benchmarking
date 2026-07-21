@@ -55,9 +55,9 @@ def _peak_qps(run_dir: Path, mode: str) -> Optional[float]:
         if p.exists():
             try:
                 return float(json.loads(p.read_text())["baseline"]["tps"]) or None
-            except (ValueError, KeyError, OSError):
-                return None
-        return None
+            except (ValueError, KeyError, OSError, TypeError):
+                return None                 # TypeError: "tps": null — a missing
+        return None                        # KPI must not sink the whole row
     p = run_dir / "parsed" / "summary.json"
     if not p.exists():
         return None
@@ -65,7 +65,7 @@ def _peak_qps(run_dir: Path, mode: str) -> Optional[float]:
         levels = json.loads(p.read_text())["levels"]
         vals = [l["qps_avg"] for l in levels if l.get("qps_avg") is not None]
         return max(vals) if vals else None
-    except (ValueError, KeyError, OSError):
+    except (ValueError, KeyError, OSError, TypeError):
         return None
 
 
@@ -101,7 +101,10 @@ def _run_row(run_dir: Path) -> Optional[dict[str, Any]]:
         "label": m.get("label", ""), "edition": m.get("edition", ""),
         "tshirt_size": m.get("tshirt_size", ""), "mode": mode,
         "workload_type": workload, "status": m.get("status", ""),
-        "tags": ",".join(run_meta.get("tags", []) or []),
+        "tags": ",".join(t for t in (run_meta.get("tags") or [])
+                         if isinstance(t, str))
+                if isinstance(run_meta.get("tags"), list)
+                else str(run_meta.get("tags") or ""),
         "ticket": run_meta.get("ticket", ""), "owner": run_meta.get("owner", ""),
         "environment": run_meta.get("environment", ""),
         "peak_qps": _peak_qps(run_dir, mode),

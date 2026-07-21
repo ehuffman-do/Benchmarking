@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Fake pgbench: instant realistic output for tests and demos.
+
+`-i` writes a `pgbench_prepared` marker into $FAKE_PSQL_STATE. `run` emits
+per-second `progress:` lines then the standard summary block. Knobs:
+FAKE_PGBENCH_TPS (base rate, default 5000), FAKE_PGBENCH_FAIL_CLIENTS
+(exit 1 with a connection error at that client count).
+"""
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+
+
+def opt(flag, default=None):
+    if flag in args:
+        return args[args.index(flag) + 1]
+    return default
+
+
+if "--version" in args:
+    print("pgbench (PostgreSQL) 18.0")
+    sys.exit(0)
+
+state = os.environ.get("FAKE_PSQL_STATE", "")
+
+if "-i" in args:
+    scale = int(opt("-s", "1"))
+    if state:
+        (Path(state) / "pgbench_prepared").write_text(str(scale))
+    print(f"creating tables...\ngenerating data (client-side)...\n"
+          f"{scale * 100000} of {scale * 100000} tuples done")
+    print("done in 1.23 s (drop tables 0.01 s, create tables 0.02 s, "
+          "client-side generate 1.10 s, primary keys 0.10 s).")
+    sys.exit(0)
+
+clients = int(opt("-c", "1"))
+duration = int(opt("-T", "5"))
+select_only = "-S" in args
+
+fail_at = os.environ.get("FAKE_PGBENCH_FAIL_CLIENTS")
+if fail_at and int(fail_at) == clients:
+    sys.stderr.write('pgbench: error: connection to server failed: '
+                     'FATAL:  sorry, too many clients already\n')
+    sys.exit(1)
+
+base = float(os.environ.get("FAKE_PGBENCH_TPS", "5000"))
+tps = base * min(clients, 16) / (1 + 0.02 * clients) * (2.0 if select_only else 1.0)
+lat = clients / tps * 1000 if tps else 0.0
+
+print(f"pgbench (18.0)")
+print(f"starting vacuum...end.")
+total = 0
+for t in range(1, duration + 1):
+    sec_tps = tps * (0.97 + 0.06 * ((t * 7919) % 100) / 100)
+    total += int(sec_tps)
+    print(f"progress: {t}.0 s, {sec_tps:.1f} tps, lat {lat:.3f} ms "
+          f"stddev {lat / 4:.3f}, 0 failed")
+print("transaction type: " + ("<builtin: select only>" if select_only
+                              else "<builtin: TPC-B (sort of)>"))
+print(f"scaling factor: 1000\nquery mode: simple")
+print(f"number of clients: {clients}\nnumber of threads: {min(clients, 8)}")
+print(f"maximum number of tries: 1\nduration: {duration} s")
+print(f"number of transactions actually processed: {total}")
+print("number of failed transactions: 0 (0.000%)")
+print(f"latency average = {lat:.3f} ms")
+print(f"initial connection time = 12.3 ms")
+print(f"tps = {tps:.6f} (without initial connection time)")
+sys.exit(0)

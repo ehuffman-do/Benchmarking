@@ -40,6 +40,13 @@ class KubeResult:
     def ok(self) -> bool:
         return self.returncode == 0
 
+    @property
+    def rc(self) -> int:
+        """Alias for returncode. A field-crash lesson: error-formatting code
+        wrote `.rc`, which only executes on the rare failure path — the
+        AttributeError then masked the real failure. Support both names."""
+        return self.returncode
+
 
 class Kube:
     """Thin, namespace-aware kubectl runner bound to one target."""
@@ -68,9 +75,20 @@ class Kube:
             proc = subprocess.run(argv, capture_output=True, text=True,
                                   timeout=timeout_s or self.timeout_s,
                                   input=input_text)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            # keep the partial output — it is the only clue why a long exec
+            # died (e.g. pgbackrest's last progress line before the stall)
+            tail = ""
+            for part in (exc.stderr, exc.stdout):
+                if part:
+                    text = part.decode("utf-8", "replace") \
+                        if isinstance(part, bytes) else str(part)
+                    if text.strip():
+                        tail = text.strip()[-300:]
+                        break
             raise KubeError(f"kubectl timed out after {timeout_s or self.timeout_s:.0f}s: "
-                            f"{' '.join(args[:6])}...")
+                            f"{' '.join(args[:6])}..."
+                            + (f" — last output: {tail}" if tail else ""))
         except FileNotFoundError:
             raise KubeError(f"kubectl binary not found ('{self.kubectl}') — is it installed "
                             "and on the worker's PATH?")

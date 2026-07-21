@@ -149,6 +149,18 @@ def preflight(kube: Kube, run: OpsRun, spec: OpsSpec,
                      timeout_s=30)
     atomic_write_text(run.raw_path("pgbackrest_info_before.json"), resj.stdout)
 
+    # A safety rail must fail CLOSED: if the info exec itself failed (API
+    # blip, pod restarting), we cannot know whether a backup is running —
+    # "cannot verify" is an abort, not a pass, or we fire into a running
+    # backup (the rc=50 field bug this check exists to prevent).
+    if not res.ok or not info_text.strip():
+        run.event("preflight", "ABORT: cannot verify stanza lock",
+                  f"pgbackrest info failed (rc={res.returncode}: "
+                  f"{(res.stderr or 'no output').strip()[:200]}) — refusing "
+                  "to fire a backup without proof the stanza is idle. "
+                  "Retry once the primary pod answers execs.")
+        return False, info_text, {}
+
     if lock_held(info_text) or lock_held(resj.stdout):
         run.event("preflight", "ABORT: stanza lock held",
                   "a backup/expire is already running — firing now would exit "

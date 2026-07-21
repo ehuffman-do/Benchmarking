@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import type { HealthDoc, HealthFinding, Job, KubeTarget, Me, OpsRun, Run, Topology } from "../types";
@@ -83,6 +83,9 @@ export function KubeTargetView({ me }: { me: Me }) {
   const [checks, setChecks] = useState<CheckEvent[] | null>(null);
   const [discovering, setDiscovering] = useState(false);
   const [confirm, setConfirm] = useState("");
+  const [confirmInvalid, setConfirmInvalid] = useState(false);
+  const confirmRef = useRef<HTMLInputElement>(null);
+  const bannerConfirmRef = useRef<HTMLInputElement>(null);
   const [health, setHealth] = useState<HealthDoc | null>(null);
   const [healthUtc, setHealthUtc] = useState<string | null>(null);
   const [healthRunning, setHealthRunning] = useState(false);
@@ -191,6 +194,21 @@ export function KubeTargetView({ me }: { me: Me }) {
 
   if (!kt) return <p className="subtle mono">{err ?? "loading…"}</p>;
   const members = topo?.patroni?.members ?? [];
+  const confirmExpected = kt.cr_name || kt.name;
+
+  // Client-side gate for destructive buttons: catch an empty or mistyped
+  // confirmation before the request, and point the user at the input.
+  function guardConfirm(ref: typeof confirmRef = confirmRef): boolean {
+    if (confirm.trim() === confirmExpected) {
+      setConfirmInvalid(false);
+      return true;
+    }
+    setConfirmInvalid(true);
+    const el = ref.current ?? confirmRef.current;
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    el?.focus();
+    return false;
+  }
 
   return (
     <>
@@ -240,9 +258,14 @@ export function KubeTargetView({ me }: { me: Me }) {
           ⚠ Operator backup schedules are PAUSED on this cluster (since {kt.schedules_paused_utc}).
           {isAdmin && (
             <> Type the cluster name and restore:&nbsp;
-              <input value={confirm} onChange={(e) => setConfirm(e.target.value)}
-                     placeholder={kt.cr_name} style={{ width: 140 }} />
+              <input ref={bannerConfirmRef} value={confirm}
+                     aria-label="Cluster name confirmation"
+                     onChange={(e) => { setConfirm(e.target.value); setConfirmInvalid(false); }}
+                     placeholder={`type ${confirmExpected} to confirm`}
+                     className={confirmInvalid ? "confirm-invalid" : undefined}
+                     style={{ width: 190 }} />
               <button className="btn-sm" onClick={() =>
+                guardConfirm(bannerConfirmRef) &&
                 launch("schedules/restore", { confirm }, false)}>Restore schedules</button></>
           )}
         </div>
@@ -393,9 +416,15 @@ export function KubeTargetView({ me }: { me: Me }) {
       {isAdmin && (
         <div className="card" style={{ marginTop: 16 }}>
           <div className="card-head"><h2>Operations</h2>
-            <span className="subtle">destructive actions require typing the cluster name:&nbsp;</span>
-            <input value={confirm} onChange={(e) => setConfirm(e.target.value)}
-                   placeholder={kt.cr_name || kt.name} className="mono" style={{ width: 180 }} />
+            <label className="subtle" htmlFor="confirm-cluster-name" style={{ margin: 0 }}>
+              Confirm cluster name (required for destructive actions):&nbsp;</label>
+            <input id="confirm-cluster-name" ref={confirmRef} value={confirm}
+                   onChange={(e) => { setConfirm(e.target.value); setConfirmInvalid(false); }}
+                   placeholder={`type ${confirmExpected} to confirm`}
+                   className={`mono${confirmInvalid ? " confirm-invalid" : ""}`}
+                   style={{ width: 220 }} />
+            {confirmInvalid && <span className="confirm-hint" role="alert">
+              type “{confirmExpected}” exactly to proceed</span>}
           </div>
           <div className="grid2">
             <div>
@@ -426,6 +455,7 @@ export function KubeTargetView({ me }: { me: Me }) {
               <button className="primary" onClick={() => {
                 const p = parsedCrParams();
                 if (!p) { setErr("parameters are not valid JSON"); return; }
+                if (!guardConfirm()) return;
                 launch("cr-apply", { confirm, params: { action: crAction,
                   [crAction === "patroni_params" ? "parameters" : "global"]: p,
                   prep: prepReset ? { reset_checkpointer: true } : {} } });
@@ -433,9 +463,9 @@ export function KubeTargetView({ me }: { me: Me }) {
               <h3 className="section-label" style={{ marginTop: 24 }}>Backup schedules</h3>
               <p className="subtle">Pause the operator&apos;s schedules for a test window (snapshot kept;
                 the UI nags until restored).</p>
-              <button onClick={() => launch("schedules/pause", { confirm }, false)}
+              <button onClick={() => guardConfirm() && launch("schedules/pause", { confirm }, false)}
                       disabled={kt.schedules_paused}>Pause schedules</button>{" "}
-              <button onClick={() => launch("schedules/restore", { confirm }, false)}
+              <button onClick={() => guardConfirm() && launch("schedules/restore", { confirm }, false)}
                       disabled={!kt.schedules_paused}>Restore schedules</button>
             </div>
             <div>
@@ -483,6 +513,7 @@ export function KubeTargetView({ me }: { me: Me }) {
                         {" — "}<span className="badge failed">not set</span>
                         {isAdmin && <>{" "}
                           <button className="btn-sm" onClick={() =>
+                            guardConfirm() &&
                             launch("cr-apply", { confirm, params: { action: "pgbackrest_global",
                               global: { "backup-standby": "y" } } })}>
                             Enable backup-standby now</button></>}
@@ -491,6 +522,7 @@ export function KubeTargetView({ me }: { me: Me }) {
                 </p>
               )}
               <button className="primary" onClick={() =>
+                guardConfirm() &&
                 launch("backup", { confirm, params: { type: bkType, path: bkPath, source: bkSource,
                   ...(bkLinked ? { linked_run_id: bkLinked } : {}) } })}>
                 Run backup (preflight first)</button>
@@ -513,6 +545,7 @@ export function KubeTargetView({ me }: { me: Me }) {
                   </select></div>
               </div>
               <button className="danger" onClick={() =>
+                guardConfirm() &&
                 launch("scenario", { confirm, params: { case: scCase, baseline_s: scBaseline,
                   settle_s: scSettle, probe: { mode: scProbe },
                   ...(bkLinked ? { linked_run_id: bkLinked } : {}) } })}>
@@ -601,22 +634,61 @@ export function KubeTargetView({ me }: { me: Me }) {
                 launch("pmm/enable", { params: { ...pmmParams, dry_run: true } })}>
                 Dry-run (show plan)</button>{" "}
               <button className="primary" disabled={!pmmHost.trim()} onClick={() =>
-                launch("pmm/enable", { confirm, params: pmmParams })}>
+                guardConfirm() && launch("pmm/enable", { confirm, params: pmmParams })}>
                 Enable PMM (rolls all pods)</button>{" "}
               <button className="danger" onClick={() =>
-                launch("pmm/disable", { confirm, params: {} })}>
+                guardConfirm() && launch("pmm/disable", { confirm, params: {} })}>
                 Disable (restore pre-PMM CR)</button>
             </>}
             {isAdmin && (
               <p className="subtle" style={{ marginTop: 6 }}>
                 Enable/disable are destructive (every instance pod restarts, HA-preserving) —
-                type the cluster name in the Operations box above to confirm. Disable restores
+                they use the “Confirm cluster name” box in the Operations card above; clicking
+                either button takes you there if it isn&apos;t filled in. Disable restores
                 the CR snapshot taken by the latest enable run.
               </p>
             )}
           </div>
         );
       })()}
+
+      {canOp && (
+        <div className="card" style={{ marginTop: 16 }}>
+          <div className="card-head"><h2>IOPS evidence</h2></div>
+          <p className="subtle" style={{ marginTop: 0 }}>
+            Can this cluster&apos;s pgdata volume exceed the standard 10K IOPS
+            throttle? Launch an evidence run with this cluster pre-attached —
+            storage identity (PVC/PV/StorageClass) and a 1s device-IOPS series
+            are captured automatically, and the run page shows the
+            capped / exceeds / inconclusive verdict with the full bundle
+            downloadable for independent review.
+          </p>
+          <Link className="btn primary" to={`/new?cluster=${targetId}&mode=suite`}>
+            Evidence suite (full matrix)</Link>{" "}
+          <Link className="btn" to={`/new?cluster=${targetId}&mode=rate-steps`}>
+            Rate-stepped knee finder</Link>
+          {isAdmin ? (
+            <>
+              <div style={{ marginTop: 10 }}>
+                <span className="subtle" style={{ fontSize: 12, marginRight: 8 }}>
+                  Direct device probe (sysbench fileio on the pgdata volume —
+                  TEST CLUSTERS ONLY; keeps test files between probes for fast
+                  iteration):</span>
+              </div>
+              <Link className="btn" to={`/new?cluster=${targetId}&mode=device-probe&variant=rndrw`}>
+                Probe: mixed (rndrw)</Link>{" "}
+              <Link className="btn" to={`/new?cluster=${targetId}&mode=device-probe&variant=rndrd`}>
+                Probe: read ceiling (rndrd)</Link>{" "}
+              <Link className="btn" to={`/new?cluster=${targetId}&mode=device-probe&variant=rndwr`}>
+                Probe: write ceiling (rndwr)</Link>
+            </>
+          ) : (
+            <span className="subtle" style={{ fontSize: 12 }}>
+              {" "}The direct device probe (sysbench fileio on the pgdata
+              volume) is admin-only — test clusters only.</span>
+          )}
+        </div>
+      )}
 
       <div className="card" style={{ marginTop: 16 }}>
         <div className="card-head"><h2>Op runs on this target</h2>

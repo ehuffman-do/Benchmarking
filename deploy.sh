@@ -692,6 +692,7 @@ EnvironmentFile=-${SECRETS_ENV_FILE}
 ExecStart=${BIN_WORKER}
 Restart=on-failure
 RestartSec=3
+KillMode=process
 TimeoutStopSec=120
 NoNewPrivileges=true
 ProtectSystem=strict

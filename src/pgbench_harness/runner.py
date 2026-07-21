@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import shutil
+import signal
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +18,7 @@ from pgbench_harness.errors import PreflightError, RunError
 from pgbench_harness.manifest import (
     STATUS_FAILED, STATUS_OK, STATUS_RUNNING, Level, Manifest, plan_levels,
 )
-from pgbench_harness.spec import Spec, dump_spec_copy, load_spec
+from pgbench_harness.spec import Spec, Sweep, dump_spec_copy, load_spec
 from pgbench_harness.soak import TIMESERIES_COLUMNS as SOAK_TIMESERIES_COLUMNS
 from pgbench_harness.summarize import IncrementalCsvWriter, SAMPLE_COLUMNS, write_parsed
 from pgbench_harness.util import (
@@ -78,7 +79,8 @@ def _dataset_error(check: "capture.DatasetCheck", spec_path: Path) -> PreflightE
 def cmd_validate(spec_path: Path) -> int:
     """`validate` subcommand: parse + validate a spec without connecting (CI lint)."""
     spec = load_spec(spec_path)  # raises SpecError (CLI prints message + hint, exit 2)
-    mode = "soak" if spec.is_soak else "sweep"
+    mode = ("soak" if spec.is_soak else "suite" if spec.is_suite
+            else "sweep" if spec.sweep else "device-probe")
     print(f"OK: {spec_path} is valid.")
     print(f"  label    : {spec.run.label}  ({spec.run.edition} / {spec.run.tshirt_size})")
     print(f"  target   : {spec.target.host}:{spec.target.port}/{spec.target.database} "
@@ -89,10 +91,23 @@ def cmd_validate(spec_path: Path) -> int:
         assert spec.soak is not None
         print(f"  soak     : {spec.soak.threads} threads for {fmt_duration(spec.soak.duration_s)} "
               f"(events: operator-marked only)")
-    else:
-        assert spec.sweep is not None
+    elif spec.is_suite:
+        assert spec.suite is not None
+        n = len(spec.suite.workloads) + (2 if spec.suite.pgbench else 0)
+        print(f"  suite    : {n} workloads x threads {list(spec.suite.threads)}, "
+              f"{spec.suite.duration_s}s/cell")
+    elif spec.sweep is not None:
         print(f"  sweep    : threads {list(spec.sweep.threads)}, {spec.sweep.duration_s}s/level, "
               f"{spec.sweep.repetitions} rep(s); budget {fmt_duration(planned_budget_s(spec))}")
+    if spec.cluster:
+        print(f"  cluster  : {spec.cluster.cr_kind}/{spec.cluster.cr_name} "
+              f"ns {spec.cluster.namespace} (storage identity + device IOPS captured)")
+    if spec.device_probe:
+        armed = "ARMED" if spec.device_probe.allow_device_probe else \
+            "disarmed (allow_device_probe: false)"
+        print(f"  probe    : fileio {spec.device_probe.test_mode} "
+              f"{spec.device_probe.file_total_size_gb}G x{spec.device_probe.threads}t "
+              f"— {armed}")
     return 0
 
 
@@ -109,7 +124,8 @@ def cmd_doctor() -> int:
         except (OSError, subprocess.SubprocessError):
             print(f"  {label:11}: (unavailable)")
     for label, args in (("sysbench", ["sysbench", "--version"]),
-                        ("psql", ["psql", "--version"])):
+                        ("psql", ["psql", "--version"]),
+                        ("pgbench", ["pgbench", "--version"])):
         try:
             out = subprocess.run(args, capture_output=True, text=True, timeout=15)
             print(f"  {label:11}: {(out.stdout or out.stderr).strip() or 'present'}")
@@ -401,8 +417,49 @@ def _live_sweep_callback(
         s = parse_interval_line(line)
         if s is not None:
             live.append([run_id, lvl.rep, lvl.threads, s.t_offset, s.tps, s.qps,
-                         s.r, s.w, s.o, s.lat_ms, s.err_s, s.reconn_s])
+                         s.r, s.w, s.o, s.lat_ms, s.err_s, s.reconn_s, lvl.seg])
     return _cb
+
+
+DISK_ABORT_BYTES = 500 * 1024 * 1024
+DISK_WARN_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _disk_guard(run_dir: Path, logger: logging.Logger,
+                warned: dict) -> None:
+    """Free-space check between segments/levels: a long run on a filling
+    volume must stop CLEANLY with a clear reason (results to date remain
+    valid and reportable) rather than corrupt its artifacts at ENOSPC."""
+    free = shutil.disk_usage(run_dir).free
+    if free < DISK_ABORT_BYTES:
+        raise RunError(
+            f"results volume has only {free // 1048576} MB free — stopping the "
+            "run before artifacts get corrupted",
+            hint="free disk space (old runs, logs) and resume/re-run; results "
+                 "written so far are intact and reportable.")
+    if free < DISK_WARN_BYTES and not warned.get("disk"):
+        warned["disk"] = True
+        logger.warning("results volume is low on space (%d MB free) — the run "
+                       "continues but will stop cleanly under %d MB",
+                       free // 1048576, DISK_ABORT_BYTES // 1048576)
+
+
+def _level_watchdog_s(duration_s: int) -> float:
+    """Wall-clock ceiling for one benchmark cell: the configured duration plus
+    a grace for connect/summary/histogram. A hung child (connected but silent)
+    must never freeze an hours-long run — the watchdog kills it, the level is
+    marked failed, and the sweep continues. Grace is env-tunable for tests."""
+    import os as _os
+    try:
+        grace = float(_os.environ.get("PGB_LEVEL_WATCHDOG_GRACE_S", "0") or 0)
+    except ValueError:
+        grace = 0.0                    # a typo'd env var must not kill a run
+    if grace <= 0:
+        # proportional but CAPPED: half a 24h cell is not an acceptable
+        # tolerance for a hung child — 15 min covers connect/summary/
+        # histogram on any healthy cell
+        grace = max(120.0, min(duration_s * 0.5, 900.0))
+    return duration_s + grace
 
 
 def _execute_level(
@@ -423,7 +480,8 @@ def _execute_level(
     logger.info("level %s: %s", lvl.key, cmd.display())
     rc = sysbench.run_streaming(
         cmd, sysbench.child_env(spec, password), run_dir / raw_rel, logger,
-        on_line=_live_sweep_callback(live, manifest.run_id, lvl))
+        on_line=_live_sweep_callback(live, manifest.run_id, lvl),
+        timeout_s=_level_watchdog_s(spec.sweep.duration_s))
     lvl.exit_code = rc
     lvl.finished_utc = utc_now_iso()
     if spec.capture.bgwriter_stats:
@@ -492,12 +550,13 @@ def cmd_run(
                if spec.capture.live_pg else None)
     if sampler:
         sampler.start()
+    dev_sampler = _start_observation(spec, run_dir, logger)
     # Live per-second series for the cockpit (incrementally appended during the
     # run); write_parsed rebuilds the canonical samples.csv atomically at finalize.
     live = IncrementalCsvWriter(run_dir / "parsed" / "samples.csv", SAMPLE_COLUMNS)
     try:
         _sweep(spec, password, run_dir, manifest, logger, live=live)
-    except Exception:  # noqa: BLE001 — never leave the manifest at 'running' on an abort
+    except BaseException:  # noqa: BLE001 — never leave the manifest at 'running' on an abort
         manifest.status = "failed"
         manifest.wall_time_s = _wall_time_s(manifest)
         manifest.save(run_dir)
@@ -506,14 +565,24 @@ def cmd_run(
         live.close()
         if sampler:
             sampler.stop()
+        if dev_sampler:
+            dev_sampler.stop()
     status = manifest.finalize_status()
     manifest.wall_time_s = _wall_time_s(manifest)
     manifest.save(run_dir)
-    write_parsed(run_dir, spec, manifest)
-    if spec.capture.pg_stat_monitor != "false" and pf.pg_stat_monitor:
-        atomic_write_text(run_dir / "env" / "pg_stat_monitor.json",
-                          capture.snapshot_pg_stat_monitor(spec, password) + "\n")
-    report.generate_report(run_dir)
+    # post-processing is best-effort: a report/parse failure after a multi-
+    # day sweep completed must not flip a real result into a failed job —
+    # the raw logs and manifest are intact and `report` can re-run later
+    try:
+        write_parsed(run_dir, spec, manifest)
+        _finish_evidence(run_dir, spec, logger)
+        if spec.capture.pg_stat_monitor != "false" and pf.pg_stat_monitor:
+            atomic_write_text(run_dir / "env" / "pg_stat_monitor.json",
+                              capture.snapshot_pg_stat_monitor(spec, password) + "\n")
+        report.generate_report(run_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("post-processing degraded (%s) — raw logs and manifest "
+                     "are intact; re-run `report %s` later", exc, manifest.run_id)
     logger.info("run %s finished with status '%s'; report: %s",
                 manifest.run_id, status, run_dir / "report.html")
     # Exit code drives the worker's job state: complete->0 (done), partial->1
@@ -608,6 +677,15 @@ def _live_soak_callback(
     return _cb
 
 
+def _whole_log_tail(seg_log: Path, fallback: str) -> str:
+    """The full segment log, lowercased, for signature scans — the 5-line
+    error excerpt can bury 'event queue is full' under earlier FATALs."""
+    try:
+        return seg_log.read_text(encoding="utf-8", errors="replace").lower()
+    except OSError:
+        return fallback.lower()
+
+
 def _segment_error_excerpt(seg_log: Path, rc: int, n_intervals: int) -> str:
     """Best-effort human reason a soak segment failed, read from its raw log.
 
@@ -658,6 +736,17 @@ def _soak_supervisor(
     segments: list[dict] = []
     seg = relaunches = total_intervals = 0
     consecutive_short = consecutive_zero_sample = 0
+    prev_rate_idx = -1
+    # Ladder position runs on elapsed time until a queue-full skip; a skip
+    # REBASES the ladder (new step index anchored at the next segment's
+    # start) so the forced step gets its full window instead of being
+    # re-derived from wall-clock and re-run (which also booked a spurious
+    # relaunch per healthy re-run — the round-5 review finding).
+    ladder_base_idx = 0
+    ladder_base_elapsed = 0
+    ladder_rebase_to: Optional[int] = None
+    prev_seg_failed = False          # previous segment exited non-zero
+    disk_warned: dict = {}
     last_excerpt = ""
 
     # Shared-clock anchor for the live per-second writer. Timeline events are NOT
@@ -690,12 +779,39 @@ def _soak_supervisor(
             remaining = int(round(deadline - now))
             if remaining < 1:
                 break
+            rate, seg_time = 0, remaining
+            if soak.rate_steps:
+                elapsed = soak.duration_s - remaining
+                if ladder_rebase_to is not None:     # a skip anchors here
+                    ladder_base_idx = ladder_rebase_to
+                    ladder_base_elapsed = elapsed
+                    ladder_rebase_to = None
+                into = elapsed - ladder_base_elapsed
+                idx = min(ladder_base_idx + into // soak.step_duration_s,
+                          len(soak.rate_steps) - 1)
+                rate = soak.rate_steps[idx]
+                seg_time = max(1, min(
+                    remaining,
+                    (idx - ladder_base_idx + 1) * soak.step_duration_s - into,
+                    soak.step_duration_s))
             seg += 1
-            if seg > 1:
+            _disk_guard(run_dir, logger, disk_warned)
+            # Relaunch accounting keys on the PREVIOUS segment's outcome, not
+            # on whether the step index happens to advance: a crash landing
+            # past a step boundary is still a relaunch, and a healthy segment
+            # completing inside an already-stamped step is not.
+            if seg > 1 and prev_seg_failed:
                 relaunches += 1
                 _append_event(run_dir, "loadgen_restart", f"sysbench relaunch #{relaunches}",
                               "supervisor relaunched the load generator after early exit", "auto")
-            cmd = sysbench.build_soak_command(spec, soak.threads, remaining)
+            if soak.rate_steps and idx != prev_rate_idx:
+                # planned step transition — stamp it for the report
+                _append_event(run_dir, "note",
+                              f"rate step {idx + 1}/{len(soak.rate_steps)}: "
+                              f"{rate or 'unthrottled'} tps offered",
+                              f"sysbench --rate={rate}", "auto")
+                prev_rate_idx = idx
+            cmd = sysbench.build_soak_command(spec, soak.threads, seg_time, rate=rate)
             seg_log = run_dir / "raw" / f"soak_seg{seg:02d}.log"
             seg_start = _iso_micros()
             seg_mono = time.monotonic()
@@ -703,11 +819,37 @@ def _soak_supervisor(
             # Bound the segment to its requested time plus a kill grace, so a child
             # that connects but hangs (no output, never exits) cannot block the loop
             # past the deadline — the watchdog SIGTERM/SIGKILLs it.
-            seg_timeout = float(remaining + soak.segment_kill_grace_s)
+            seg_timeout = float(seg_time + soak.segment_kill_grace_s)
+            # Mid-segment disk guard: a healthy non-stepped soak is ONE
+            # segment covering the whole window, so the per-segment check
+            # alone would run once at t=0. Piggyback on the per-line tap:
+            # every ~60s re-check free space; when critically low, terminate
+            # the child so the clean-abort path runs instead of ENOSPC
+            # corrupting artifacts days in.
+            inner_cb = _live_soak_callback(live, base_dt, seen_offsets, seg_log.stem)
+            disk_state = {"next_check": time.monotonic() + 60.0}
+
+            def _cb(ts_iso: str, red_line: str,
+                    _inner=inner_cb, _ds=disk_state) -> None:
+                _inner(ts_iso, red_line)
+                if time.monotonic() >= _ds["next_check"]:
+                    _ds["next_check"] = time.monotonic() + 60.0
+                    try:
+                        _disk_guard(run_dir, logger, disk_warned)
+                    except RunError as exc:
+                        _ds["abort"] = str(exc)
+                        p = stop["procs"].get("proc") if stop else None
+                        if p is not None:
+                            try:
+                                p.terminate()
+                            except OSError:
+                                pass
+
             rc, n_intervals, timed_out = sysbench.run_streaming_timestamped(
                 cmd, env, seg_log, logger,
                 timeout_s=seg_timeout, kill_grace_s=float(soak.segment_kill_grace_s),
-                on_line=_live_soak_callback(live, base_dt, seen_offsets, seg_log.stem))
+                on_line=_cb,
+                proc_holder=stop["procs"] if stop is not None else None)
             seg_wall = time.monotonic() - seg_mono
             excerpt = ""
             if rc != 0 or n_intervals == 0:
@@ -720,13 +862,43 @@ def _soak_supervisor(
                              "finished_utc": _iso_micros(), "exit_code": rc,
                              "intervals": n_intervals, "timed_out": timed_out,
                              "error_excerpt": excerpt})
+            # Rate-stepped mode: sysbench's "event queue is full" is not an
+            # outage — it is the deterministic answer "offered >> achievable"
+            # (each --rate event is a whole transaction; workers at this
+            # concurrency cannot keep up). That IS the knee-finder's datum:
+            # record it and ADVANCE the ladder instead of relaunching into
+            # the same doomed step for its whole window (the failure mode
+            # that burned max_relaunches in the field).
+            queue_full_skip = bool(
+                soak.rate_steps and rc != 0 and excerpt
+                and "event queue is full" in _whole_log_tail(seg_log, excerpt))
+            if queue_full_skip:
+                _append_event(run_dir, "note",
+                              f"rate step {idx + 1}/{len(soak.rate_steps)} "
+                              f"unachievable: offered {rate} tps exceeds worker "
+                              "capacity at this concurrency — the knee is "
+                              "below this rate",
+                              "sysbench: event queue full (deterministic, not "
+                              "an outage) — advancing to the next step", "auto")
+                logger.warning("soak: rate step %d (%s tps) unachievable — "
+                               "advancing the ladder", idx + 1, rate)
+                ladder_rebase_to = idx + 1
+                if ladder_rebase_to >= len(soak.rate_steps):
+                    logger.error("soak: every remaining rate step exceeds "
+                                 "worker capacity; ending the ladder early.")
+                    break
+            # a queue-full skip is a datum, not an outage — it never counts
+            # as a relaunch
+            prev_seg_failed = (rc != 0 or n_intervals == 0) and not queue_full_skip
             manifest.soak = _soak_doc(manifest, start_utc, soak.duration_s, segments, relaunches)
             manifest.save(run_dir)
+            if disk_state.get("abort"):     # segment record persisted first
+                raise RunError(disk_state["abort"])
             total_intervals += n_intervals
             consecutive_zero_sample = consecutive_zero_sample + 1 if n_intervals == 0 else 0
             consecutive_short = consecutive_short + 1 if seg_wall < min(5, remaining) else 0
             if rc == 0 and time.monotonic() >= deadline - 1:
-                break  # completed the window cleanly
+                break  # completed the window cleanly (or the final rate step)
             # The fast-fail / churn guards apply ONLY before the soak has produced
             # any samples (total_intervals == 0) — i.e. a load generator that is
             # broken from the start. Once it HAS produced samples, zero-sample or
@@ -815,9 +987,17 @@ def cmd_soak(
                        hint="add a soak: block (threads, duration_s) for resilience runs.")
     assert spec.soak is not None
     if dry_run:
-        cmd = sysbench.build_soak_command(spec, spec.soak.threads, spec.soak.duration_s)
-        print(f"# soak dry run for '{spec.run.label}'")
-        print(cmd.display())
+        if spec.soak.rate_steps:
+            print(f"# rate-stepped soak dry run for '{spec.run.label}' "
+                  f"({len(spec.soak.rate_steps)} steps x {spec.soak.step_duration_s}s)")
+            for i, r in enumerate(spec.soak.rate_steps, 1):
+                cmd = sysbench.build_soak_command(spec, spec.soak.threads,
+                                                  spec.soak.step_duration_s, rate=r)
+                print(f"[step {i}, rate {r or 'unthrottled':>6}] {cmd.display()}")
+        else:
+            cmd = sysbench.build_soak_command(spec, spec.soak.threads, spec.soak.duration_s)
+            print(f"# soak dry run for '{spec.run.label}'")
+            print(cmd.display())
         print(f"# fixed concurrency {spec.soak.threads}, duration "
               f"{fmt_duration(spec.soak.duration_s)} (supervisor relaunches on early exit)")
         print("# events: marked only by an operator (the console Annotate button or "
@@ -865,13 +1045,21 @@ def cmd_soak(
                        "(sysbench --ignore-errors is MySQL-only); on a hard error the load "
                        "generator exits and the supervisor relaunches it.")
     # Graceful stop: SIGINT/SIGTERM finalize a partial resilience report instead
-    # of discarding the run. The signal also reaches the child sysbench, which
-    # exits, unblocking the supervisor's read loop so it sees the flag.
+    # of discarding the run. A group-directed signal (Ctrl-C) also reaches the
+    # child; a PID-directed one does NOT — so the handler terminates the
+    # current child explicitly, or a single-segment soak would keep running
+    # for up to the whole remaining window (days) before seeing the flag.
     import signal
-    stop = {"flag": False}
+    stop = {"flag": False, "procs": {}}
 
     def _on_signal(_signum: int, _frame: object) -> None:
         stop["flag"] = True
+        p = stop["procs"].get("proc")
+        if p is not None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
 
     old_int = signal.signal(signal.SIGINT, _on_signal)
     old_term = signal.signal(signal.SIGTERM, _on_signal)
@@ -880,6 +1068,7 @@ def cmd_soak(
                if spec.capture.live_pg else None)
     if sampler:
         sampler.start()
+    dev_sampler = _start_observation(spec, run_dir, logger)
     supervisor_error: Optional[BaseException] = None
     try:
         manifest.soak = _soak_supervisor(spec, password, run_dir, manifest, logger, stop=stop)
@@ -889,6 +1078,8 @@ def cmd_soak(
     finally:
         if sampler:
             sampler.stop()
+        if dev_sampler:
+            dev_sampler.stop()
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
     # ALWAYS finalize: persist a terminal manifest status + (best-effort) report,
@@ -897,6 +1088,7 @@ def cmd_soak(
     # SSE 'done' event, which key off manifest.status).
     status = _finalize_soak(run_dir, spec, manifest, logger,
                             aborted=supervisor_error is not None)
+    _finish_evidence(run_dir, spec, logger)
     if supervisor_error is not None:
         raise supervisor_error
     # Exit code drives the worker's job state: complete->0 (done), partial->1
@@ -915,7 +1107,9 @@ def _sweep(
     done = len(manifest.levels) - len(pending)
     if done:
         logger.info("resume: %d level(s) already completed, %d remaining", done, len(pending))
+    warned: dict = {}
     for i, lvl in enumerate(pending):
+        _disk_guard(run_dir, logger, warned)
         _execute_level(spec, password, run_dir, manifest, lvl, logger, live=live)
         if i < len(pending) - 1 and spec.sweep.cooldown_s > 0:
             logger.info("cooldown %ds ...", spec.sweep.cooldown_s)
@@ -972,10 +1166,306 @@ def _wall_time_s(manifest: Manifest) -> float:
 def cmd_report(run_dir: Path) -> int:
     """`report` subcommand: regenerate the report for an existing run (sweep or soak)."""
     setup_logging()
-    if (run_dir / "parsed" / "soak_summary.json").exists() or \
-            Manifest.load(run_dir).mode == "soak":
+    mode = Manifest.load(run_dir).mode
+    if mode in ("suite", "probe"):
+        from pgbench_harness import report_evidence
+        out = report_evidence.generate_evidence_report(run_dir)
+    elif (run_dir / "parsed" / "soak_summary.json").exists() or mode == "soak":
         out = report_soak.generate_soak_report(run_dir)
     else:
         out = report.generate_report(run_dir)
     get_logger().info("report written: %s", out)
     return 0
+
+
+# ── IOPS ceiling verification: observation, suite mode, device probe ──
+
+def cluster_target_mismatch(spec: Spec) -> str:
+    """Warn when the attached cluster doesn't look like the SQL target: the
+    device series would measure an IDLE cluster while the load runs elsewhere
+    — silently poisoned evidence. DO hostnames normally embed the cluster
+    name, so a non-match is suspicious (still a warning: private hostnames
+    can legitimately differ)."""
+    if spec.cluster is None:
+        return ""
+    cr = spec.cluster.cr_name.lower()
+    host = spec.target.host.lower()
+    if cr and cr not in host:
+        return (f"attached cluster '{spec.cluster.cr_name}' does not appear in "
+                f"the SQL target host '{spec.target.host}' — if these are "
+                "different clusters, the device-IOPS series and storage "
+                "identity will describe an IDLE cluster while the load runs "
+                "elsewhere, and the verdict will be meaningless. Double-check "
+                "the connection profile and the attached cluster refer to the "
+                "SAME cluster.")
+    return ""
+
+
+def _start_observation(spec: Spec, run_dir: Path, logger: logging.Logger):
+    """Cluster-aware evidence capture: storage identity + 1s device sampler.
+    Pure-SQL runs (no cluster: section) skip this entirely; any failure is a
+    recorded warning, never a run failure."""
+    if spec.cluster is None:
+        return None
+    mism = cluster_target_mismatch(spec)
+    if mism:
+        logger.warning("cluster/target cross-check: %s", mism)
+        wpath = run_dir / "env" / "device_io_warning.txt"
+        wpath.parent.mkdir(parents=True, exist_ok=True)
+        with open(wpath, "a", encoding="utf-8") as fh:
+            fh.write(f"{utc_now_iso()} {mism}\n")
+    from pgbench_harness import deviceio
+    try:
+        ident = deviceio.capture_storage_identity(spec, run_dir, logger)
+        logger.info("storage identity: %s", ident.get("finding")
+                    or "; ".join(ident.get("warnings", [])) or "captured")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("storage identity capture failed: %s", exc)
+    sampler = deviceio.DeviceIoSampler(spec, run_dir, logger)
+    return sampler if sampler.start() else None
+
+
+def _finish_evidence(run_dir: Path, spec: Spec, logger: logging.Logger) -> Optional[dict]:
+    """Derive the device series, compute the verdict, write evidence.json,
+    and print the finding — for every run kind."""
+    from pgbench_harness import deviceio, evidence
+    try:
+        rows = deviceio.derive_device_series(run_dir)
+        verdict = deviceio.compute_verdict(
+            rows, spec.limits,
+            deviceio.load_event_markers(run_dir)) if spec.cluster else None
+        doc = evidence.build_evidence(run_dir, spec, verdict)
+        if verdict:
+            line = f"IOPS verdict: {verdict['finding'].upper()} — {verdict['detail']}"
+            logger.info("%s", line)
+            print(line, flush=True)
+        return doc
+    except Exception as exc:  # noqa: BLE001 — evidence must not undo a finished run
+        logger.warning("evidence assembly degraded: %s", exc)
+        return None
+
+
+def _suite_segments(spec: Spec) -> list[Level]:
+    assert spec.suite is not None
+    levels: list[Level] = []
+    for seg in spec.suite.workloads:
+        for t in spec.suite.threads:
+            levels.append(Level(rep=1, threads=t, seg=seg))
+    if spec.suite.pgbench:
+        for seg in ("pgbench_tpcb", "pgbench_select"):
+            for t in spec.suite.threads:
+                levels.append(Level(rep=1, threads=t, seg=seg))
+    return levels
+
+
+def _segment_spec(spec: Spec, seg: str) -> Spec:
+    """Derived per-segment Spec: the segment's workload over the suite ladder,
+    expressed as a one-level sweep so _execute_level runs unchanged."""
+    assert spec.suite is not None
+    wl = dataclasses.replace(spec.workload, type=seg,
+                             dataset_gb=0.0, mix="",
+                             rand_type=spec.workload.rand_type)
+    sweep = Sweep(threads=spec.suite.threads, duration_s=spec.suite.duration_s,
+                  warmup_s=spec.suite.warmup_s, cooldown_s=spec.suite.cooldown_s)
+    return dataclasses.replace(spec, workload=wl, sweep=sweep, suite=None)
+
+
+def _execute_pgbench_level(
+    spec: Spec, password: str, run_dir: Path, manifest: Manifest,
+    lvl: Level, logger: logging.Logger,
+) -> None:
+    """One pgbench cell (TPC-B or SELECT-only at N clients) — the independent
+    second driver, same bookkeeping contract as _execute_level."""
+    from pgbench_harness import pgbench_cmd
+    assert spec.suite is not None
+    raw_rel = f"raw/{lvl.key}.log"
+    lvl.raw_log = raw_rel
+    lvl.status = STATUS_RUNNING
+    lvl.started_utc = utc_now_iso()
+    manifest.save(run_dir)
+    if spec.capture.io_stats:
+        io_pre = capture.snapshot_io_stats(spec, password)
+    cmd = pgbench_cmd.build_pgbench_run(
+        spec, lvl.threads, spec.suite.duration_s,
+        select_only=(lvl.seg == "pgbench_select"))
+    logger.info("level %s: %s", lvl.key, cmd.display())
+    rc = sysbench.run_streaming(cmd, sysbench.child_env(spec, password),
+                                run_dir / raw_rel, logger,
+                                timeout_s=_level_watchdog_s(spec.suite.duration_s))
+    lvl.exit_code = rc
+    lvl.finished_utc = utc_now_iso()
+    if spec.capture.io_stats:
+        atomic_write_json(run_dir / "raw" / f"{lvl.key}_iostats.json",
+                          {"pre": io_pre,
+                           "post": capture.snapshot_io_stats(spec, password)})
+    if rc == 0:
+        lvl.status = STATUS_OK
+        logger.info("level %s: OK", lvl.key)
+    else:
+        lvl.status = STATUS_FAILED
+        tail = (run_dir / raw_rel).read_text(errors="replace").splitlines()[-5:]
+        lvl.error_excerpt = "\n".join(tail) or f"pgbench exited with code {rc}"
+        logger.error("level %s FAILED (exit %d) — continuing", lvl.key, rc)
+    manifest.save(run_dir)
+
+
+def print_suite_dry_run(spec: Spec) -> None:
+    from pgbench_harness import pgbench_cmd
+    assert spec.suite is not None
+    levels = _suite_segments(spec)
+    print(f"# suite dry run for '{spec.run.label}': {len(levels)} cells, "
+          f"{spec.suite.duration_s}s each + {spec.suite.cooldown_s}s stabilization")
+    for lvl in levels:
+        if lvl.seg.startswith("pgbench"):
+            cmd = pgbench_cmd.build_pgbench_run(
+                spec, lvl.threads, spec.suite.duration_s,
+                select_only=(lvl.seg == "pgbench_select"))
+        else:
+            cmd = sysbench.build_run_command(_segment_spec(spec, lvl.seg), lvl.threads)
+        print(f"[{lvl.seg:>18} c{lvl.threads:>3}] {cmd.display()}")
+    if spec.suite.pgbench:
+        print(f"# pgbench dataset: `pgbench -i -s {spec.suite.pgbench_scale}` "
+              "runs once before the pgbench cells")
+    n = len(levels)
+    budget = n * spec.suite.duration_s + (n - 1) * spec.suite.cooldown_s
+    print(f"# planned wall-clock budget: {fmt_duration(budget)}")
+    print(f"# password source: env var {spec.target.password_env} -> PGPASSWORD")
+
+
+def cmd_suite(spec_path: Path, results_dir: Path, dry_run: bool = False,
+              prepare: bool = False) -> int:
+    """`suite` subcommand: the storage team's full evidentiary matrix — four
+    sysbench OLTP workloads + pgbench TPC-B/SELECT-only across the thread
+    ladder — as sequential segments in one consolidated evidence bundle."""
+    from pgbench_harness import pgbench_cmd, report_evidence
+    spec = load_spec(spec_path)
+    if not spec.is_suite:
+        raise RunError("this spec has no 'suite' section",
+                       hint="add a suite: block (duration_s, threads, workloads).")
+    assert spec.suite is not None
+    if dry_run:
+        print_suite_dry_run(spec)
+        return 0
+    password = spec.password()
+    get_redactor().register(password)
+    _maybe_prepare(spec_path, results_dir, prepare, setup_logging())
+    run_id = make_run_id(spec.run.label)
+    run_dir = results_dir / run_id
+    n = 1
+    while run_dir.exists():
+        n += 1
+        run_id = f"{make_run_id(spec.run.label)}-{n}"
+        run_dir = results_dir / run_id
+    (run_dir / "raw").mkdir(parents=True, exist_ok=True)
+    dump_spec_copy(spec, run_dir / "spec.yaml")
+    dump_spec_copy(spec, run_dir / "env" / "spec.yaml")
+    manifest = Manifest(run_id=run_id, label=spec.run.label, edition=spec.run.edition,
+                        tshirt_size=spec.run.tshirt_size, mode="suite",
+                        levels=_suite_segments(spec))
+    manifest.save(run_dir)
+    logger = setup_logging(run_dir / "harness.log")
+    logger.info("suite %s -> %s (%d cells)", run_id, run_dir, len(manifest.levels))
+    try:
+        pf = capture.run_preflight(spec, password, logger)
+        assert pf.dataset is not None
+        if not pf.dataset.ok:
+            raise _dataset_error(pf.dataset, spec_path)
+    except PreflightError:
+        manifest.status = "failed"
+        manifest.save(run_dir)
+        raise
+    manifest.preflight = _preflight_doc(pf)
+    manifest.status = "running"
+    manifest.save(run_dir)
+    capture.capture_env(run_dir, spec, password, pf)
+    _attach_prepare_stats(spec, results_dir, run_dir, logger)
+    sampler = (capture.LivePgSampler(spec, password, run_dir,
+                                     spec.capture.live_pg_interval_s, logger)
+               if spec.capture.live_pg else None)
+    if sampler:
+        sampler.start()
+    dev_sampler = _start_observation(spec, run_dir, logger)
+    live = IncrementalCsvWriter(run_dir / "parsed" / "samples.csv", SAMPLE_COLUMNS)
+    pgbench_ready = False
+    # Graceful stop for a multi-hour matrix: SIGTERM (deploys, supervisors)
+    # must finalize a partial bundle like soak does, not die mid-cell with
+    # the manifest stuck 'running' and the child orphaned.
+    def _on_term(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+    old_term = signal.signal(signal.SIGTERM, _on_term)
+    abort_exc: Optional[BaseException] = None
+    try:
+        pending = manifest.pending_levels()
+        disk_warned: dict = {}
+        for i, lvl in enumerate(pending):
+            _disk_guard(run_dir, logger, disk_warned)
+            _append_event(run_dir, "note", f"segment {lvl.seg} c{lvl.threads}",
+                          "suite cell start", "auto")
+            if lvl.seg.startswith("pgbench"):
+                if not pgbench_ready:
+                    init = pgbench_cmd.build_pgbench_init(spec, spec.suite.pgbench_scale)
+                    logger.info("pgbench init: %s", init.display())
+                    rc = sysbench.run_streaming(
+                        init, sysbench.child_env(spec, password),
+                        run_dir / "raw" / "pgbench_init.log", logger,
+                        timeout_s=7200)
+                    if rc != 0:
+                        raise RunError(f"pgbench -i failed (exit {rc}) — see "
+                                       "raw/pgbench_init.log")
+                    pgbench_ready = True
+                _execute_pgbench_level(spec, password, run_dir, manifest, lvl, logger)
+            else:
+                _execute_level(_segment_spec(spec, lvl.seg), password, run_dir,
+                               manifest, lvl, logger, live=live)
+            if i < len(pending) - 1 and spec.suite.cooldown_s > 0:
+                logger.info("stabilization %ds ...", spec.suite.cooldown_s)
+                time.sleep(spec.suite.cooldown_s)
+    except BaseException as exc:  # noqa: BLE001 — incl. KeyboardInterrupt/SIGTERM
+        abort_exc = exc
+        logger.error("suite aborted mid-matrix: %s — finalizing the "
+                     "completed cells", exc)
+    finally:
+        live.close()
+        if sampler:
+            sampler.stop()
+        if dev_sampler:
+            dev_sampler.stop()
+        signal.signal(signal.SIGTERM, old_term)
+    # An abort mid-matrix must not discard the completed cells: finalize the
+    # real per-level status (partial beats failed-wholesale) and emit the
+    # bundle best-effort — same contract as _finalize_soak.
+    status = manifest.finalize_status()
+    if abort_exc is not None and status == "complete":
+        status = "partial"                      # aborted between cells
+    manifest.status = status
+    manifest.wall_time_s = _wall_time_s(manifest)
+    manifest.finished_utc = utc_now_iso()
+    manifest.save(run_dir)
+    try:
+        write_parsed(run_dir, spec, manifest)
+        _finish_evidence(run_dir, spec, logger)
+        report_evidence.generate_evidence_report(run_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("suite post-processing degraded (%s) — raw logs and "
+                     "manifest are intact; re-run `report` later", exc)
+    if abort_exc is not None:
+        if isinstance(abort_exc, KeyboardInterrupt):
+            raise RunError("suite interrupted — completed cells finalized "
+                           f"(status '{status}'); report: "
+                           f"{run_dir / 'report.html'}")
+        raise abort_exc
+    logger.info("suite %s finished with status '%s'; report: %s",
+                manifest.run_id, status, run_dir / "report.html")
+    return {"complete": 0, "partial": 1}.get(status, 2)
+
+
+def cmd_device_probe(spec_path: Path, results_dir: Path, dry_run: bool = False) -> int:
+    """`device-probe` subcommand: sysbench fileio against the pgdata volume
+    from a pod pinned to the primary's node (see deviceprobe.py guardrails)."""
+    from pgbench_harness import deviceprobe
+    spec = load_spec(spec_path)
+    if spec.device_probe is None:
+        raise RunError("this spec has no 'device_probe' section",
+                       hint="add device_probe: {allow_device_probe: true, ...} "
+                            "plus a cluster: section — TEST CLUSTERS ONLY.")
+    return deviceprobe.run_device_probe(spec, results_dir, dry_run=dry_run)

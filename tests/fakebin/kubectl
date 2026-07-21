@@ -43,6 +43,12 @@ CR_KIND = os.environ.get("FAKE_KUBE_CR_KIND", "perconapgcluster")
 # seconds after the patch. A naive readiness poll passes instantly (old pods
 # stay Ready); the spec-aware wait must block until the stagger completes.
 ROLL_S = float(os.environ.get("FAKE_KUBE_ROLL_S", "0.5"))
+# Device-truth simulation: the block device behind /pgdata serves this many
+# IOPS (counters advance at this rate) at this utilization — the knob that
+# lets tests produce capped / exceeds / inconclusive verdicts on demand.
+DEV_IOPS = float(os.environ.get("FAKE_KUBE_DEV_IOPS", "9800"))
+DEV_UTIL = float(os.environ.get("FAKE_KUBE_DEV_UTIL", "98"))
+DEV_MAJMIN = "259:4"
 
 
 def default_state():
@@ -214,10 +220,14 @@ def pod_json(st, name, kind):
     ready = alive and not starting
     # UID changes when the pod is recreated: the PMM roll and every delete.
     uid = f"uid-{name}-{'pmm' if rolled else 'base'}-{int(st['deleted'].get(name, 0))}"
+    volumes = ([{"name": "postgres-data",
+                 "persistentVolumeClaim": {"claimName": f"{name}-pgdata"}}]
+               if kind == "instance" else [])
     return {
         "metadata": {"name": name, "namespace": "percona", "uid": uid,
                      "labels": labels},
-        "spec": {"nodeName": node, "containers": containers},
+        "spec": {"nodeName": node, "containers": containers,
+                 "volumes": volumes},
         "status": {"phase": "Running" if alive else "Pending", "podIP": ip,
                    "containerStatuses": [{"name": c["name"], "ready": ready,
                                           "restartCount": 0}
@@ -518,6 +528,82 @@ def archive_queue_depth(st):
 
 def handle_exec(st, pod, argv):
     joined = " ".join(argv)
+    if argv[0] == "cat" and "/proc/self/mountinfo" in joined:
+        out(MOUNTINFO)
+        return 0
+    if argv[0] == "cat" and "/proc/diskstats" in joined:
+        out(diskstats_text())
+        return 0
+    if argv[0] == "sh" and "diskstats" in joined and "while" in joined:
+        # FAKE_KUBE_STREAM_DIE_S: the stream dies after N seconds (rc 1) —
+        # exercises the sampler's auto-respawn on long runs
+        die = float(os.environ.get("FAKE_KUBE_STREAM_DIE_S", "0"))
+        deadline = now() + (die or float(os.environ.get("FAKE_KUBE_LOG_FOLLOW_S", "30")))
+        while now() < deadline:
+            out(str(int(now() * 1000)))
+            out(diskstats_text())
+            out("===")
+            sys.stdout.flush()
+            time.sleep(1)
+        return 1 if die else 0
+    if argv[0] == "df" and "-Pk" in argv:
+        out("Filesystem 1024-blocks Used Available Capacity Mounted on")
+        out(f"/dev/nvme1n1 524288000 104857600 "
+            f"{os.environ.get('FAKE_KUBE_DF_AVAIL_KB', '419430400')} 20% /pgdata")
+        return 0
+    if argv[0] == "mkdir":
+        return 0
+    if argv[0] == "sh" and "rm -rf" in joined:
+        st["probe_files"] = False
+        save(st)
+        return 0
+    if argv[0] == "sh" and "ls /pgdata/pgb-fileio-probe" in joined:
+        return 0 if st.get("probe_files") else 1
+    if argv[0] == "sh" and "stat -c %s /pgdata/pgb-fileio-probe" in joined:
+        # geometry check: first-file size (or MISSING) + last-file presence
+        if st.get("probe_files"):
+            out(str(st.get("probe_file_bytes", 0)))
+            want_last = f"test_file.{st.get('probe_file_num', 1) - 1} "
+            out("LAST-YES" if want_last in joined + " " else "LAST-NO")
+        else:
+            out("MISSING")
+            out("LAST-NO")
+        return 0
+    if "sysbench" in joined and "fileio" in joined:
+        t_arg = next((a.split("=", 1)[1] for a in joined.split()
+                      if a.startswith("--time=")), "0")
+        if joined.rstrip().endswith("prepare"):
+            st["probe_files"] = True
+            args = {a.split("=", 1)[0]: a.split("=", 1)[1]
+                    for a in joined.split() if "=" in a}
+            num = int(args.get("--file-num", "128"))
+            size_mb = int(args.get("--file-total-size", "1024M").rstrip("MG"))
+            st["probe_file_num"] = num
+            st["probe_file_bytes"] = size_mb * 1048576 // num
+            save(st)
+            out("128 files, 8192Kb each, 1024Mb total")
+            out("Creating files for the test...")
+            return 0
+        if joined.rstrip().endswith("cleanup"):
+            out("Removing test files...")
+            return 0
+        if os.environ.get("FAKE_KUBE_FILEIO_RUN_RC"):
+            # simulate the load-driving exec dying instantly (API blip,
+            # fd-limit fatal, etc.) — exercises the salvage path
+            sys.stderr.write("error: unable to upgrade connection\n")
+            return int(os.environ["FAKE_KUBE_FILEIO_RUN_RC"])
+        run_t = min(int(t_arg or 1), 20)
+        time.sleep(run_t)                      # let the device sampler collect
+        r, w = DEV_IOPS * 0.6, DEV_IOPS * 0.4
+        out("sysbench 1.0.20 (using bundled LuaJIT 2.1.0-beta2)\n")
+        out("File operations:")
+        out(f"    reads/s:                      {r:.2f}")
+        out(f"    writes/s:                     {w:.2f}")
+        out("    fsyncs/s:                     0.00\n")
+        out("Throughput:")
+        out(f"    read, MiB/s:                  {r * 16 / 1024:.2f}")
+        out(f"    written, MiB/s:               {w * 16 / 1024:.2f}")
+        return 0
     if argv[0] == "patronictl":
         if argv[1] == "list":
             out(patronictl_list(st))
@@ -560,6 +646,10 @@ def handle_exec(st, pod, argv):
             return 0
     if argv[0] == "pgbackrest" or (argv[0] == "bash" and "pgbackrest" in joined):
         if "info" in argv:
+            if os.environ.get("FAKE_KUBE_PGBACKREST_INFO_RC"):
+                # exec/pgbackrest failure — the lock check must fail CLOSED
+                sys.stderr.write("error: unable to upgrade connection\n")
+                return int(os.environ["FAKE_KUBE_PGBACKREST_INFO_RC"])
             out(pgbackrest_info_json(st) if "--output=json" in argv
                 else pgbackrest_info(st))
             return 0
@@ -648,6 +738,30 @@ def handle_exec(st, pod, argv):
         return 0
     sys.stderr.write(f"fake kubectl exec: unhandled command: {joined}\n")
     return 1
+
+
+def diskstats_text():
+    """Node diskstats with counters advancing at DEV_IOPS (reads 60/40 writes),
+    ~16KB per IO, utilization DEV_UTIL%."""
+    t = now()
+    reads = int(t * DEV_IOPS * 0.6)
+    writes = int(t * DEV_IOPS * 0.4)
+    rd_sec, wr_sec = reads * 32, writes * 32
+    io_ms = int(t * DEV_UTIL * 10)          # DEV_UTIL% of wall-clock, in ms
+    wt_ms = int(t * DEV_UTIL * 40)          # ~4 in-flight at full util
+    maj, minor = DEV_MAJMIN.split(":")
+    lines = [
+        f"   7       0 loop0 55 0 2288 10 0 0 0 0 0 20 10 0 0 0 0",
+        f" {maj}       {minor} nvme1n1 {reads} 12 {rd_sec} {reads // 3} "
+        f"{writes} 40 {wr_sec} {writes // 2} 2 {io_ms} {wt_ms} 0 0 0",
+        f" 259       0 nvme0n1 9000 5 720000 4000 8000 10 640000 6000 0 8000 10000 0 0 0",
+    ]
+    return "\n".join(lines)
+
+
+MOUNTINFO = (f"469 432 {DEV_MAJMIN} / /pgdata rw,relatime - ext4 "
+             "/dev/nvme1n1 rw\n"
+             "470 432 0:123 / /tmp rw - tmpfs tmpfs rw\n")
 
 
 def handle_pmm_logs(st, pod):
@@ -757,6 +871,19 @@ def main():
             named = [a for a in rest if not a.startswith("-") and a != "json"]
             if named and not o_name:
                 name = named[0]
+                extra = st.get("extra_pods", {}).get(name)
+                if extra is not None:
+                    out(json.dumps({
+                        "metadata": {"name": name, "uid": f"uid-{name}",
+                                     "labels": {"app": "pgbench-harness-device-probe"}},
+                        "spec": {"nodeName": extra["node"],
+                                 "containers": [{"name": "fileio",
+                                                 "image": extra["image"]}]},
+                        "status": {"phase": "Running",
+                                   "containerStatuses": [{"name": "fileio",
+                                                          "ready": True,
+                                                          "restartCount": 0}]}}))
+                    return 0
                 if not pod_alive(st, name):
                     sys.stderr.write(f'Error from server (NotFound): pods "{name}" not found\n')
                     return 1
@@ -787,6 +914,39 @@ def main():
                 out(json.dumps(st["cr"]))
                 return 0
             out(json.dumps({"items": [st["cr"]]}))
+            return 0
+        if kind in ("pvc", "persistentvolumeclaim", "persistentvolumeclaims"):
+            name = args[2]
+            out(json.dumps({
+                "metadata": {"name": name,
+                             "annotations": {"volume.kubernetes.io/storage-provisioner":
+                                             "dobs.csi.digitalocean.com"}},
+                "spec": {"storageClassName": os.environ.get("FAKE_KUBE_SC",
+                                                            "do-block-storage"),
+                         "volumeName": f"pv-{name}"},
+                "status": {"capacity": {"storage": "500Gi"}}}))
+            return 0
+        if kind in ("pv", "persistentvolume", "persistentvolumes"):
+            name = args[2]
+            out(json.dumps({
+                "metadata": {"name": name},
+                "spec": {"capacity": {"storage": "500Gi"},
+                         "csi": {"driver": "dobs.csi.digitalocean.com",
+                                 "volumeHandle": "e2fa2c55-fake-volume-id",
+                                 "volumeAttributes": (
+                                     {"iopsPerGB": os.environ["FAKE_KUBE_SC_IOPS"]}
+                                     if os.environ.get("FAKE_KUBE_SC_IOPS")
+                                     else {})}}}))
+            return 0
+        if kind in ("storageclass", "storageclasses", "sc"):
+            name = args[2]
+            params = {"fsType": "ext4"}
+            if os.environ.get("FAKE_KUBE_SC_IOPS"):
+                params["iopsPerGB"] = os.environ["FAKE_KUBE_SC_IOPS"]
+            out(json.dumps({
+                "metadata": {"name": name, "annotations": {}},
+                "provisioner": "dobs.csi.digitalocean.com",
+                "parameters": params}))
             return 0
         if kind == "secret":
             name = args[2] if len(args) > 2 else ""
@@ -867,6 +1027,15 @@ def main():
             return 1
         akind = str(doc.get("kind", ""))
         aname = str((doc.get("metadata") or {}).get("name", ""))
+        if akind == "Pod":
+            st.setdefault("extra_pods", {})[aname] = {
+                "node": (doc.get("spec") or {}).get("nodeName", ""),
+                "image": ((doc.get("spec") or {}).get("containers")
+                          or [{}])[0].get("image", ""),
+                "created": now()}
+            save(st)
+            out(f"pod/{aname} created")
+            return 0
         if akind == "Secret":
             st["pmm_secret"] = aname
             save(st)
@@ -963,6 +1132,11 @@ def main():
             return 1
         if args[1] in ("pod", "pods"):
             name = args[2]
+            if name in st.get("extra_pods", {}):
+                del st["extra_pods"][name]
+                save(st)
+                out(f'pod "{name}" deleted')
+                return 0
             st["deleted"][name] = now()
             if name == st["leader"]:
                 if os.environ.get("FAKE_KUBE_C1_ELECT") == "1":

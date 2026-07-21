@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>IOPS evidence — {{ manifest.run_id }}</title>
+<style>
+  body { font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+         margin: 0 auto; max-width: 1100px; padding: 24px; color: #1a1d21; }
+  h1 { font-size: 22px; } h2 { font-size: 17px; margin-top: 32px;
+       border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13px; }
+  th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+  th { background: #f4f5f7; } td.num, th.num { text-align: right; }
+  .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  .verdict { padding: 14px 18px; border-radius: 8px; margin: 16px 0; font-size: 15px; }
+  .verdict.capped { background: #fdeaea; border: 1px solid #d33; }
+  .verdict.exceeds { background: #e8f7ec; border: 1px solid #2a8; }
+  .verdict.inconclusive { background: #fff6e0; border: 1px solid #d90; }
+  .chart img { max-width: 100%; }
+  .subtle { color: #667; font-size: 12px; }
+  ul.sql { font-family: ui-monospace, monospace; font-size: 12px; }
+  .wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>IOPS ceiling verification — {{ manifest.run_id }}</h1>
+<p class="subtle">Generated {{ ev.generated_utc }} · run status
+  <b>{{ manifest.status }}</b> · mode {{ manifest.mode }} ·
+  purpose: {{ ev.purpose }}</p>
+
+<h2 id="verdict">1. Executive summary — verdict</h2>
+{% if verdict %}
+<div class="verdict {{ verdict.finding }}">
+  <b>{{ verdict.finding | upper }}</b> — {{ verdict.detail }}
+</div>
+<table>
+  <tr><th>Peak sustained device IOPS ({{ verdict.sustain_window_s }}s window)</th>
+      <td class="num">{{ "{:,.0f}".format(verdict.peak_sustained_iops) }}</td></tr>
+  <tr><th>Peak 1s device IOPS</th>
+      <td class="num">{{ "{:,.0f}".format(verdict.peak_1s_iops) }}</td></tr>
+  <tr><th>Device utilization at peak</th>
+      <td class="num">{{ verdict.util_pct_at_peak }}%</td></tr>
+  <tr><th>Queue depth at peak</th>
+      <td class="num">{{ verdict.queue_depth_at_peak }}</td></tr>
+  <tr><th>Reference limits (recorded, not hardcoded)</th>
+      <td>standard {{ "{:,}".format(ev.limits.standard_iops) }} ·
+          burst {{ "{:,}".format(ev.limits.burst_iops) }} ·
+          target {{ "{:,}".format(ev.limits.target_iops) }}
+          (±{{ ev.limits.tolerance_pct }}%)</td></tr>
+  <tr><th>Device samples</th><td class="num">{{ device_samples }}</td></tr>
+</table>
+{% else %}
+<p><b>No device-level verdict</b> — this run was not cluster-aware, so only
+SQL-side throughput was measured (see caveats).</p>
+{% endif %}
+
+<h2 id="storage">2. Storage identity (config-level evidence)</h2>
+{% if storage.pvc %}
+<table>
+  <tr><th>Primary pod / node</th><td class="mono">{{ storage.pod }} / {{ storage.node }}</td></tr>
+  <tr><th>pgdata PVC</th><td class="mono">{{ storage.pvc.name }}
+      ({{ storage.pvc.capacity }})</td></tr>
+  <tr><th>StorageClass</th><td class="mono">{{ storage.pvc.storage_class }}</td></tr>
+  {% if storage.pv %}
+  <tr><th>PV / CSI provisioner</th><td class="mono">{{ storage.pv.name }} ·
+      {{ storage.pv.provisioner }}</td></tr>
+  <tr><th>Volume ID</th><td class="mono">{{ storage.pv.volume_id }}</td></tr>
+  {% endif %}
+  {% if storage.storage_class %}
+  <tr><th>StorageClass parameters</th>
+      <td class="mono">{{ storage.storage_class.parameters | tojson }}</td></tr>
+  {% endif %}
+</table>
+<p><b>{{ storage.finding }}</b></p>
+{% else %}
+<p class="subtle">Storage identity unavailable:
+   {{ (storage.warnings or ["no cluster: section in the spec"]) | join("; ") }}</p>
+{% endif %}
+
+<h2 id="workloads">3. Workloads — exactly what SQL each transaction runs</h2>
+{% for w in ev.workloads %}
+<h3>{{ w.label }} <span class="subtle">({{ w.workload }}, driver {{ w.driver }})</span></h3>
+<ul class="sql">
+  {% for q in w.per_txn %}<li>{{ q }}</li>{% endfor %}
+</ul>
+<p class="subtle">{{ w.profile }}</p>
+{% endfor %}
+
+{% if peak %}
+<h2 id="peak">4. Peak throughput summary</h2>
+<div class="wrap"><table>
+  <thead><tr><th>Workload</th><th class="num">Best @ clients</th>
+    <th class="num">TPS</th><th class="num">QPS</th>
+    <th class="num">p95 ms</th><th class="num">avg ms</th></tr></thead>
+  <tbody>
+  {% for p in peak %}
+    <tr><td>{{ p.seg }}</td><td class="num">{{ p.threads }}</td>
+        <td class="num">{{ "{:,.0f}".format(p.tps) }}</td>
+        <td class="num">{{ "{:,.0f}".format(p.qps) if p.qps else "—" }}</td>
+        <td class="num">{{ p.lat_p95 if p.lat_p95 is not none else "—" }}</td>
+        <td class="num">{{ p.lat_avg if p.lat_avg is not none else "—" }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% endif %}
+
+{% if segs %}
+<h2 id="results">5. Full per-concurrency results</h2>
+{% for seg, rows in segs.items() %}
+<h3>{{ seg }}</h3>
+<div class="wrap"><table>
+  <thead><tr><th class="num">clients</th><th>status</th><th class="num">TPS</th>
+    <th class="num">QPS</th><th class="num">p95 ms</th><th class="num">p99 ms</th>
+    <th class="num">avg ms</th><th class="num">errors</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr><td class="num">{{ r.threads }}</td><td>{{ r.status }}</td>
+        <td class="num">{{ "{:,.0f}".format(r.tps_avg) if r.tps_avg else "—" }}</td>
+        <td class="num">{{ "{:,.0f}".format(r.qps_avg) if r.qps_avg else "—" }}</td>
+        <td class="num">{{ r.lat_p95 if r.lat_p95 is not none else "—" }}</td>
+        <td class="num">{{ r.lat_p99 if r.lat_p99 is not none else "—" }}</td>
+        <td class="num">{{ r.lat_avg if r.lat_avg is not none else "—" }}</td>
+        <td class="num">{{ r.errors if r.errors is not none else "—" }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% endfor %}
+{% endif %}
+
+{% if fileio %}
+<h2 id="fileio">Direct device probe (sysbench fileio)</h2>
+<table>
+  <tr><th>Mode</th><td>{{ fileio.test_mode }} / {{ fileio.io_mode }} IO,
+      {{ fileio.threads }} threads, {{ fileio.block_kb }} KB blocks,
+      {{ fileio.file_total_size_gb }} GiB files</td></tr>
+  <tr><th>reads/s · writes/s · fsyncs/s</th>
+      <td class="num">{{ fileio.reads_s | default("—") }} ·
+          {{ fileio.writes_s | default("—") }} ·
+          {{ fileio.fsyncs_s | default("—") }}</td></tr>
+  <tr><th>combined IOPS</th><td class="num"><b>{{ fileio.iops | default("—") }}</b></td></tr>
+  <tr><th>throughput</th><td class="num">{{ fileio.read_mb_s | default(0) }} +
+      {{ fileio.write_mb_s | default(0) }} MiB/s</td></tr>
+  <tr><th>window</th><td class="mono">{{ fileio.started_utc }} →
+      {{ fileio.finished_utc }} (PMM cross-reference)</td></tr>
+{% if fileio.source %}
+  <tr><th>figure source</th><td><b>{{ fileio.source }}</b> — device counters
+      are node-wide (include WAL/checkpoint IO), not sysbench's own
+      accounting</td></tr>
+{% endif %}
+</table>
+{% endif %}
+
+{% if charts.tps %}
+<h2 id="scaling">6. Scaling curves</h2>
+<div class="chart"><img src="{{ charts.tps }}" alt="TPS scaling"></div>
+<div class="chart"><img src="{{ charts.lat }}" alt="latency scaling"></div>
+{% endif %}
+
+{% if charts.device %}
+<h2 id="device">7. Device IOPS timeline (ground truth)</h2>
+<div class="chart"><img src="{{ charts.device }}" alt="device IOPS timeline"></div>
+<p class="subtle">1s samples of the block device backing /pgdata
+  (/proc/diskstats deltas, node-level — includes WAL, checkpoints, autovacuum
+  and any backups). The engine-side logical view (pg_stat_io 8&nbsp;KB blocks)
+  is in parsed/pg_timeseries.csv and per-level io deltas in the summary —
+  divergence between the two is expected and explained in the caveats.
+  Event marks: {{ events | length }} stamped.</p>
+{% endif %}
+
+<h2 id="caveats">8. Caveats — honest limitations of this run</h2>
+<ul>
+  {% for c in ev.caveats %}<li>{{ c }}</li>{% endfor %}
+</ul>
+
+<h2 id="pgsettings">9. Database configuration (full capture)</h2>
+{% if key_settings and all_settings %}
+<p class="subtle">Key performance settings first; the complete
+  <code>pg_settings</code> capture follows — use it to diff providers
+  (e.g. DO Advanced vs Aiven) setting by setting. Raw CSV:
+  <code>env/pg_settings.csv</code> in the bundle.</p>
+<table>
+  <thead><tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr></thead>
+  <tbody>
+  {% for s in key_settings %}
+    <tr><td class="mono">{{ s.name }}</td><td class="mono">{{ s.setting }}</td>
+        <td class="mono">{{ s.unit }}</td><td class="mono">{{ s.source }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<details>
+  <summary>Full pg_settings dump ({{ all_settings | length }} rows)</summary>
+  <div class="wrap"><table>
+    <thead><tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr></thead>
+    <tbody>
+    {% for s in all_settings %}
+      <tr><td class="mono">{{ s.name }}</td><td class="mono">{{ s.setting }}</td>
+          <td class="mono">{{ s.unit }}</td><td class="mono">{{ s.source }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</details>
+{% else %}
+<p class="subtle">pg_settings capture disabled or unavailable for this run.</p>
+{% endif %}
+
+<h2 id="env">10. Environment</h2>
+<table>
+  <tr><th>Server</th><td class="mono">{{ env.server_version }}</td></tr>
+  <tr><th>sysbench</th><td class="mono">{{ env.sysbench_version }}</td></tr>
+  <tr><th>Harness</th><td class="mono">{{ env.harness_version }}</td></tr>
+  <tr><th>Load host</th><td class="mono">{{ env.host_info }}</td></tr>
+</table>
+<p class="subtle">Machine-readable everything: evidence.json · CSVs:
+parsed/device_io.csv, parsed/samples.csv, parsed/pg_timeseries.csv ·
+raw: raw/diskstats.log, per-cell logs. Timestamps are UTC ISO — line the
+device timeline up with PMM using the event marks and the fileio window.</p>
+<footer class="subtle">Generated by pgbench-harness — evidence bundle for
+independent review.</footer>
+</body>
+</html>

@@ -1,5 +1,239 @@
 # Changelog
 
+## Unreleased — hotfix: error paths crashed on KubeResult.rc
+
+- Field crash: the device probe's new exec-death salvage path (and the
+  backup/failover fail-closed lock checks) referenced `res.rc`, but the
+  field is `returncode` — the AttributeError only fired when the exec
+  actually FAILED, masking the real failure and discarding the run.
+  All sites fixed, `KubeResult.rc` added as an alias so the mistake
+  class is inert, and the fake cluster gained failure knobs
+  (FAKE_KUBE_FILEIO_RUN_RC, FAKE_KUBE_PGBACKREST_INFO_RC) so these
+  error paths are now exercised by tests: a dying probe exec produces a
+  partial run with a device-derived verdict, and a failing pgbackrest
+  info aborts the backup preflight.
+
+## Unreleased — bug bash round 5 (whole-harness adversarial review)
+
+- **Knee-finder ladder accounting rewritten**: after a queue-full skip the
+  ladder REBASES (the forced step gets its full window anchored at the next
+  segment's start) instead of being re-derived from wall-clock — the old
+  math re-ran the forced step and booked a spurious relaunch per healthy
+  re-run, which burned max_relaunches, forced "partial" status and polluted
+  the report with fake restart events. Relaunch accounting now keys on the
+  previous segment's actual outcome: a crash landing past a step boundary
+  counts (it used to evade the budget), a healthy completion never does,
+  and queue-full skips are a datum, not an outage. Queue-full detection
+  scans the whole segment log (the 5-line excerpt could bury it).
+- **Soaks are stoppable**: a PID-directed SIGTERM only set a flag that was
+  checked between segments — a single-segment week-long soak would ignore
+  it for days. The handler now terminates the current load generator so
+  the partial-report finalize runs immediately.
+- **Disk guard now guards**: the free-space check ran once per segment —
+  once at t=0 for a healthy non-stepped soak. It now re-checks every ~60s
+  during the stream and cleanly aborts (results-so-far intact) instead of
+  hitting ENOSPC days in; and a harness-side tee failure (ENOSPC on the
+  log write) kills the child instead of orphaning a load generator that
+  keeps hammering the target for up to --time.
+- **Suite aborts keep the completed cells**: SIGTERM/Ctrl-C mid-matrix (and
+  a pgbench-init failure) finalize the real per-level status (partial, not
+  failed-wholesale), emit the bundle best-effort, and no longer leave the
+  manifest stuck 'running' with an orphaned child. run/suite post-
+  processing (parse + report) is best-effort after a completed run — a
+  report bug can no longer flip a multi-day result into a failed job.
+- **Parsers**: numeric regexes no longer accept malformed tokens ("12..3"
+  from a torn log splice crashed finalize); pgbench "lat NaN" progress
+  lines (a stalled interval — exactly the sample not to lose) parse as 0.
+- **Watchdog grace capped** at 15 min (was duration/2 — 12h tolerance for a
+  hung child in a 24h cell); a typo'd PGB_LEVEL_WATCHDOG_GRACE_S is ignored
+  instead of crashing at level start.
+- **soak.report_interval_s must be 1**: the downtime/TTR model is strictly
+  per-second dense; any coarser interval scored ~(1-1/N) of a flawless run
+  as outage. Explicitly rejected now.
+- **Worker: recycled PIDs can no longer be adopted** — orphan reattach and
+  Cancel now verify process identity via /proc start time, not just
+  os.kill(pid,0): after a droplet reboot a recycled pid used to become a
+  phantom "running" job that starved the queue, and Cancel could SIGKILL an
+  unrelated process group. A non-UTF-8 byte in child output no longer
+  abandons a live benchmark (errors=replace), and any worker-side failure
+  now terminates the benchmark process group instead of orphaning it with
+  the job marked failed.
+- **Worker: decrypted kubeconfig copies are swept** — a worker restart
+  mid-job skipped the normal cleanup, leaving the plaintext kubeconfig on
+  disk indefinitely; startup now sweeps copies whose job is no longer
+  running, and reattach convergence unlinks its own.
+- **Cockpit stream correctness**: the live-CSV tail detects the harness's
+  atomic finalize/resume rewrite by inode and tells the client to rebuild
+  (was: torn rows or thousands of duplicate points in the "final" chart);
+  CRLF row terminators are stripped; the task-output stream tails by byte
+  offset (was O(file) per second) and drains the final lines that land
+  with the terminal state flip (they used to vanish).
+- **Backup/failover safety rails fail CLOSED**: an exec failure during the
+  pgBackRest lock check used to read as "lock clear" — the harness could
+  fire a backup or failover into a running backup, the exact field bug the
+  check exists to prevent. "Cannot verify" now aborts with the reason.
+- **Report regeneration survives cross-version/partial data**: manifests
+  with unknown keys (newer harness, hand annotations) no longer TypeError
+  every report entry point; older soak summaries missing newer keys no
+  longer KeyError the recovery path; the webapp now routes suite/probe
+  runs to the evidence renderer (the sweep renderer 500'd on them) and
+  the sweep renderer raises a real error instead of an assert.
+- **Failover stitch is derived data**: a stitcher exception downgrades to
+  a warning event instead of flipping a successful scenario run to failed
+  (captures are intact on disk).
+- **Kubeconfig redaction parses the document**: JSON kubeconfigs (every
+  line quoted) and YAML block scalars evaded the line-regex — ZERO values
+  were registered with the redactor for those formats. The sensitive keys
+  are now found by structured walk, with the line scan as fallback; an
+  empty kubeconfig path is rejected instead of silently falling back to
+  ~/.kube/config (wrong-cluster risk).
+- **Small but real**: a "tps": null in a soak summary no longer makes the
+  whole run vanish from the index; string-valued tags no longer explode
+  into per-character tags; ops liveness treats EPERM as alive; an unknown
+  health severity no longer aborts postprocess; kubectl timeouts keep the
+  child's last output as the diagnosis; the connection-ceiling probe reaps
+  killed psql children (was: zombies for the process lifetime).
+- **Web tier**: run artifact downloads spool to disk instead of building
+  a potentially multi-GB tar.gz in RAM; /runs/{id}/provider-metrics gets
+  the same traversal guard as every other run route; SSE streams no longer
+  pin an unused SQLite connection for their lifetime; malformed
+  kube_target_id / scheduled_utc are clean 400s (a bad scheduled_utc used
+  to make the job silently permanently ineligible).
+
+## Unreleased — device-probe iteration (field fixes from the first live probe)
+
+- **Device probe is now a first-class New Run mode** (admin-only): threads,
+  async backlog, IO pattern (rndrw/rndrd/rndwr), duration, file geometry and
+  keep-files are form fields — no more pasting YAML. Cluster pages
+  quick-launch all three patterns with the cluster pre-attached, and the
+  form refuses to submit without an attached cluster. The knee-finder's
+  seeded rate ladder now starts low (100…2000, 0) — unachievable steps skip
+  forward, but a ladder that opens far beyond capacity wastes its first
+  segments.
+
+- **Verdicts say WHEN and DURING WHAT**: the first live EXCEEDS verdict
+  (12,540 IOPS sustained) turned out to sit in sysbench's end-of-run fsync
+  flush — a large-write regime — while the steady random phase served
+  ~7.4K; only PMM could show that. The verdict now stamps the sustained-
+  peak window's UTC timestamps and attributes it to the phase event that
+  contains it ("[peak window 04:36:41–04:36:51 UTC, during 'fileio run']"),
+  and the device probe stamps its phases (prepare / run / done) into
+  events.jsonl like every other run mode already did. A peak that butts
+  against the next phase marker is additionally flagged as a possible
+  flush/transition burst.
+
+- **`device_probe.keep_files`**: preparing the fileio test set took ~5 min
+  for 100 GB on the live cluster and was repeated on every probe run. With
+  `keep_files: true` the probe skips prepare when the files already exist
+  under `/pgdata/pgb-fileio-probe/` and skips cleanup at the end, so
+  probe iterations (more threads, deeper backlog, rndrd vs rndwr) start in
+  seconds. The free-space guardrail relaxes accordingly when reusing.
+  A final run with `keep_files: false` (or a manual
+  `rm -rf /pgdata/pgb-fileio-probe` in the pod) reclaims the space.
+- **"fileio result: ?" fixed by device-derived fallback**: some sysbench
+  builds print a summary format our regexes don't match, leaving the
+  evidence bundle without probe figures. When summary parsing yields
+  nothing, the probe now derives reads/s, writes/s, total IOPS and MB/s
+  from the device counter series over the run window and labels the
+  source, so the verdict engine and report always get real numbers
+  (the raw sysbench output is still kept in `raw/fileio_run.log`).
+
+## Unreleased — longevity hardening (hours-to-week-long runs)
+
+- **Cell watchdog for sweep/suite/pgbench**: a hung load generator
+  (connected but silent) froze a run forever — soak always had a watchdog,
+  the sweep path did not. Every cell now has a wall-clock ceiling
+  (duration + grace); a hung child is killed, the level marked failed with
+  "harness watchdog killed the load generator", and the run continues.
+- **Deploy-safe long runs**: worker unit gets `KillMode=process`; benchmark
+  children (own process groups) survive worker restarts, and the restarted
+  worker re-attaches by PID (startup reconcile) and converges the job + run
+  index when the child eventually finishes. `deploy.sh --update` mid-run no
+  longer kills a week-long benchmark.
+- **Sampler resilience**: the live PG sampler survives per-iteration
+  exceptions instead of dying silently for the rest of the run; the device
+  IOPS stream auto-respawns with backoff when the exec dies (token refresh,
+  failover, network blips) — gaps stay visible, never interpolated — and
+  now streams only the sampled device's diskstats line (megabytes per week,
+  not gigabytes).
+- **Cockpit scales to week-long series**: the SSE stream tails CSVs
+  incrementally by byte offset (was: re-parse the whole file every second
+  per viewer — pathological past a few hours) with a capped backfill of the
+  most recent ~6 h on (re)connect (`reset` flag; full history stays in the
+  CSVs/report), and the browser keeps a rolling window instead of unbounded
+  arrays. The page also rebuilds a dead EventSource on network-online /
+  tab-wake, so laptop sleep or moving houses just reconnects.
+- **Disk-space guard**: sweep/suite/soak check free space between cells/
+  segments — low space warns once, critically low stops the run CLEANLY
+  with results-so-far intact, instead of corrupting artifacts at ENOSPC.
+- **Reports: full DB-settings capture restored everywhere** — the suite/
+  probe evidence report and the soak report now include the key-settings
+  table + the full pg_settings dump (the classic sweep report always had
+  it), so provider-vs-provider settings diffs (DO Advanced vs Aiven) work
+  from any run's report. Raw CSV remains env/pg_settings.csv in the bundle.
+
+
+## Unreleased — field fixes from the first live PMM enablement
+
+- **HTTP 401 from the PMM inventory API is no longer reported as "server
+  unreachable"** — a status code is an answer. 401/403 now reads "PMM API
+  rejected the token" with an actionable pointer (check the service-account
+  token/role in the PMM UI; the agents use the same value). Still a
+  warning, never a run failure.
+- **`libs MISSING` false alarm hardened**: the runtime
+  `shared_preload_libraries` probe on a freshly bounced/elected leader now
+  retries for up to 60s and surfaces the real psql error when it ultimately
+  fails (an empty answer no longer silently reads as "libraries missing"),
+  and library matching normalizes quotes/spaces/operator-doubled entries the
+  way real clusters render the value.
+
+
+- **Single pane of glass**: the whole framework runs from the console. New
+  Run gains a **suite mode** form (ladder/duration/pgbench toggle), an
+  **io_stress** workload form (dataset_gb / mix / key distribution), and
+  **rate steps** on soak; an "Attach cluster" selector lists the registered
+  Kube Targets — attaching one makes the worker inject that target's
+  kubeconfig AND auto-synthesizes the spec's `cluster:` section from the
+  registry, so storage identity + the device-IOPS series are captured with
+  zero YAML editing. The cluster page gains an **IOPS evidence** quick-launch
+  card (suite / rate-stepped, pre-attached). The run page shows the
+  **verdict banner** (capped / exceeds / inconclusive) served by the new
+  `/api/runs/{id}/evidence` endpoint, next to the existing bundle download.
+  Device-probe specs submit through New Run too (admin-only, requires an
+  attached cluster, plus the in-spec `allow_device_probe` arming the runner
+  enforces); web dry-run renders suite and probe plans.
+
+- **New run modes**: `suite` (the storage team's full evidentiary matrix —
+  oltp_point_select / read_only / read_write / write_only + pgbench TPC-B and
+  SELECT-only across a thread ladder, sequential segments, one consolidated
+  bundle), rate-stepped soak (`soak.rate_steps` + `step_duration_s` via
+  sysbench `--rate`, each step stamped as an event), and `device-probe`
+  (guardrailed sysbench fileio from a pod pinned to the primary's node,
+  mounting the pgdata PVC — refuses without `allow_device_probe: true`,
+  checks free space >= 2x file size, cleans up files + pod on all exit paths).
+- **`workload.type: io_stress`**: `dataset_gb` as the primary knob (table_size
+  derived; sized to defeat caches), `mix: read|write|mixed` picks the stock
+  lua, `rand_type` configurable (uniform default).
+- **pgbench as a second driver**: command builders + progress/summary parsers
+  mirroring the sysbench module; `doctor` checks the binary.
+- **Cluster-aware evidence** (spec `cluster:` section, KUBECONFIG env-only):
+  storage identity capture (PVC/PV/StorageClass/placement with high-IOPS
+  marker detection — "no marker" recorded as evidence) and a 1s device IOPS
+  series (single long-lived exec streaming /proc/diskstats; device resolved
+  from /proc/self/mountinfo; derivation to reads/writes/IOPS/MB/s/await/util/
+  queue in summarize). Both degrade to recorded warnings, never run failures.
+- **Verdict engine**: configurable `limits:` (recorded, not hardcoded);
+  10s-sustained peak + utilization -> **capped / exceeds / inconclusive**
+  with the numbers and, for inconclusive, what stopped scaling. Printed in
+  CLI output and the report.
+- **Evidence bundle**: report.html mirroring the storage team's structure
+  (verdict, storage identity, per-workload exact-SQL descriptions generated
+  from workload definitions, peak + per-concurrency tables, scaling charts,
+  device timeline with reference-limit lines + event marks, auto-populated
+  caveats), plus evidence.json and CSV series; the existing web "Artifacts"
+  download ships it as one self-interpreting archive.
+
+
 ## Unreleased — PMM bug bash (round 3): seven fixes
 
 - **Bounce is now genuinely HA-preserving**: the sidecar bounce deletes

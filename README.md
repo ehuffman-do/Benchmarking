@@ -454,6 +454,66 @@ metrics only), no provisioning/scheduling/CI, no results web server, no
 engines other than PostgreSQL, no load engines other than sysbench, and no
 tuning logic — the harness measures, humans tune.
 
+## IOPS ceiling verification (evidence framework)
+
+Settles one question with evidence: **can this cluster's pgdata volume exceed
+the standard 10K block-storage IOPS limit, or not.** Three run modes feed one
+evidence pipeline; every cluster-aware run (a spec with a `cluster:` section
+and `$KUBECONFIG` exported) additionally captures the **storage identity**
+(PVC → PV → StorageClass → placement; "config shows no high-IOPS marker" is
+recorded as evidence too) and a **1s device IOPS series** from
+`/proc/diskstats` inside the primary pod (node-level counters — includes WAL,
+checkpoints, backups; the `pg_stat_io` logical view is captured alongside).
+
+```bash
+# 1. The full evidentiary matrix (storage-team parity): 4 sysbench OLTP
+#    workloads + pgbench TPC-B/SELECT-only x thread ladder, one bundle.
+pgbench-harness suite --spec examples/iops-suite.yaml --prepare
+
+# 2. The knee finder: offered load climbs through rate steps while the
+#    device series shows what the volume actually serves.
+pgbench-harness soak --spec examples/iops-rate-steps.yaml
+
+# 3. The definitive ceiling test (TEST CLUSTERS ONLY): sysbench fileio from
+#    a pod pinned to the primary's node, mounting the pgdata PVC directly.
+#    Iterating on threads/backlog? Set device_probe.keep_files: true to reuse
+#    the prepared test files across runs (skips the multi-minute prepare);
+#    a final run without it cleans them up.
+pgbench-harness device-probe --spec examples/device-probe.yaml
+```
+
+All three modes are launchable from the web console: a cluster page's "IOPS
+evidence" card quick-launches the suite, the knee finder, and (admin-only)
+the device probe in its three patterns — mixed `rndrw`, pure-read `rndrd`,
+pure-write `rndwr` — with the cluster pre-attached; New Run's
+`device probe` mode exposes threads / async backlog / pattern / duration /
+file geometry / keep-files as form fields.
+
+Every mode ends with a printed **verdict** judged against the spec's
+`limits:` (recorded, never hardcoded): **capped** (sustained plateau within
+tolerance of the standard limit), **exceeds** (sustained above it — the
+observed ceiling is reported), or **inconclusive** (the run never generated
+enough pressure — the report says what stopped scaling so the run can be
+redesigned). `workload.type: io_stress` sizes the dataset via `dataset_gb`
+(>= 2x instance RAM defeats caches — the storage team's own report measured
+cache on reads; ours must not).
+
+The run directory is the **evidence bundle**: `report.html` (verdict, storage
+identity, per-workload plain-language SQL, per-concurrency tables, scaling
+charts, device timeline with reference-limit lines and event marks, honest
+caveats), `evidence.json` (machine-readable everything), and CSV time series
+(`parsed/device_io.csv`, `parsed/samples.csv`, `parsed/pg_timeseries.csv`).
+Download it from the web UI's run page ("Artifacts") as one archive — it is
+self-interpreting and can be uploaded to Claude for independent analysis with
+zero additional context.
+
+**Reading results next to PMM**: timestamps are UTC ISO everywhere and every
+suite cell / rate step / fileio window is stamped as an event. Open PMM's
+instances-overview scoped to the run window (specs with a `pmm:` section get
+deep links in the report), find the event mark, and compare PMM's disk graphs
+with `parsed/device_io.csv` — they should agree; the verdict is computed from
+the harness's own series so the bundle stands alone.
+
 ## Cluster Ops (Kubernetes / Percona PG Operator)
 
 A separate console section for operating Kubernetes-hosted PostgreSQL

@@ -374,7 +374,12 @@ def generate_report(run_dir: Path) -> Path:
         raise ReportError(f"no spec.yaml in {run_dir}",
                           hint="is this a pgbench-harness run directory?")
     spec = load_spec(spec_path)
-    assert spec.sweep is not None, "generate_report is for sweep runs; use report_soak for soak"
+    if spec.sweep is None:
+        # a real error, not an assert: asserts vanish under -O and the wrong
+        # renderer must fail loudly, not crash later on spec.sweep.warmup_s
+        raise ReportError(
+            "generate_report renders sweep runs only — use report_soak for "
+            "soaks and report_evidence for suite/device-probe runs")
     manifest = Manifest.load(run_dir)
     summary = write_parsed(run_dir, spec, manifest)  # raw logs are the source of truth
     samples = load_samples_csv(run_dir / "parsed" / "samples.csv")

@@ -7,6 +7,7 @@ be resumed with ``run --resume`` — levels whose status is ``ok`` or
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -27,6 +28,7 @@ class Level:
 
     rep: int
     threads: int
+    seg: str = ""                     # suite segment (workload name); "" = classic sweep
     status: str = STATUS_PENDING
     started_utc: str = ""
     finished_utc: str = ""
@@ -36,7 +38,8 @@ class Level:
 
     @property
     def key(self) -> str:
-        return f"rep{self.rep}_t{self.threads:03d}"
+        base = f"rep{self.rep}_t{self.threads:03d}"
+        return f"{self.seg}_{base}" if self.seg else base
 
 
 @dataclass
@@ -94,8 +97,17 @@ class Manifest:
                 hint="is this a pgbench-harness run directory?",
             )
         doc = read_json(path)
-        levels = [Level(**lvl) for lvl in doc.pop("levels", [])]
-        return cls(levels=levels, **doc)
+        # Cross-version tolerance in BOTH directions: dataclass defaults
+        # cover keys MISSING from older manifests; unknown keys from a NEWER
+        # harness (or a hand-annotated run) are dropped instead of raising
+        # TypeError — report regeneration is a recovery path and must not
+        # be pinned to the exact schema version that wrote the run.
+        lvl_fields = {f.name for f in dataclasses.fields(Level)}
+        man_fields = {f.name for f in dataclasses.fields(cls)} - {"levels"}
+        levels = [Level(**{k: v for k, v in lvl.items() if k in lvl_fields})
+                  for lvl in doc.pop("levels", [])]
+        return cls(levels=levels,
+                   **{k: v for k, v in doc.items() if k in man_fields})
 
 
 def plan_levels(threads: tuple[int, ...], repetitions: int) -> list[Level]:

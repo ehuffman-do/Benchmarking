@@ -1,0 +1,30 @@
+# Rate-stepped soak — the knee finder. Offered load climbs through rate_steps
+# (sysbench --rate, txn/s; 0 = unthrottled) holding each step for
+# step_duration_s; each step start is stamped as an event so the report shows
+# offered vs achieved vs latency per step against the device IOPS series.
+run:
+  label: iops-rate-steps
+  edition: advanced
+  tshirt_size: 8c32g
+target:
+  host: db.example.com
+  port: 25060
+  database: defaultdb
+  user: doadmin
+  password_env: PGB_TARGET_PASSWORD
+workload:
+  type: io_stress
+  tables: 16
+  dataset_gb: 64
+  mix: mixed
+soak:
+  threads: 64
+  rate_steps: [500, 1000, 2000, 4000, 8000, 0]   # 0 = unthrottled final step
+  step_duration_s: 180
+cluster:
+  cr_name: cluster1
+  namespace: percona
+limits:
+  standard_iops: 10000
+  burst_iops: 15000
+  target_iops: 40000

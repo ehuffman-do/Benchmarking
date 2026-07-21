@@ -94,8 +94,30 @@ if threads in _threadset("FAKE_SYSBENCH_HANG_THREADS"):
 
 print("Threads started!\n")
 base_tps = 100.0 * threads
+# --rate throttles offered load; FAKE_SYSBENCH_REALTIME paces 1s/interval so
+# supervisors (rate-stepped soak) see real wall-clock segments.
+_rate = next((float(a.split("=", 1)[1]) for a in args
+              if a.startswith("--rate=")), 0.0)
+_realtime = os.environ.get("FAKE_SYSBENCH_REALTIME") == "1"
+# Offered rate beyond worker capacity: sysbench aborts with the queue-full
+# FATAL (deterministic, immediate-ish) — the knee-finder skip-ahead trigger.
+_qf = float(os.environ.get("FAKE_SYSBENCH_QUEUE_FULL_RATE", "0") or 0)
+if _qf and _rate >= _qf:
+    for t in range(1, 3):
+        if _realtime:
+            time.sleep(1)
+        print(f"[ {t}s ] thds: {threads} tps: 100.00 qps: 2000.00 "
+              f"(r/w/o: 1400.00/400.00/200.00) lat (ms,99%): 48662.51 "
+              f"err/s 0.00 reconn/s: 0.00")
+    print("FATAL: The event queue is full. This means the worker threads "
+          "are unable to keep up with the specified event generation rate")
+    sys.exit(1)
 for t in range(1, duration + 1):
+    if _realtime:
+        time.sleep(1)
     tps = base_tps * (0.8 if t == 1 else 1.0) + t * 0.5
+    if _rate:
+        tps = min(tps, _rate)
     qps = tps * 20
     r, w, o = qps * 0.5, qps * 0.33, qps * 0.17
     # Mimic real sysbench-tpcc: "err/s" has NO colon (regression guard).

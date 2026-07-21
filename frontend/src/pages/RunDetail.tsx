@@ -7,7 +7,7 @@ import { LogConsole } from "../components/LogConsole";
 import { SeriesTable } from "../components/SeriesTable";
 import { fmtCompact, fmtInt } from "../lib/format";
 import {
-  appendBatch, appendPg, emptyPg, emptySeries, openStream,
+  appendBatch, appendPg, emptyPg, emptySeries, openStream, trimPg, trimSeries,
   type PgSeries, type Progress, type Series,
 } from "../lib/sse";
 
@@ -39,7 +39,11 @@ export function RunDetail({ me }: { me: Me }) {
   const [activeJob, setActiveJob] = useState<Job | null>(null);
   const [budget, setBudget] = useState(0);   // planned wall-clock budget (from hello)
   const [mode, setMode] = useState("");      // sweep | soak (from hello)
+  const [verdict, setVerdict] = useState<{ finding: string; detail: string;
+    peak_sustained_iops: number } | null>(null);
   const seriesRef = useRef<Series>(emptySeries());
+  const esRef = useRef<EventSource | null>(null);
+  const [nonce, setNonce] = useState(0);
   const pgRef = useRef<PgSeries>(emptyPg());
   const canRun = me.role === "operator" || me.role === "admin";
 
@@ -49,6 +53,15 @@ export function RunDetail({ me }: { me: Me }) {
       .then((js) => setActiveJob(js.find((j) => j.run_id === runId) ?? null))
       .catch(() => {});
   }, [runId]);
+
+  useEffect(() => {
+    if (!run || !["complete", "partial", "failed"].includes(run.status || "")) return;
+    api.get<{ verdict: { finding: string; detail: string;
+                         peak_sustained_iops: number } | null }>(
+      `/api/runs/${runId}/evidence`)
+      .then((ev) => setVerdict(ev.verdict))
+      .catch(() => setVerdict(null));
+  }, [runId, run?.status]);
 
   useEffect(() => {
     const es = openStream(runId, {
@@ -64,13 +77,15 @@ export function RunDetail({ me }: { me: Me }) {
       },
       onLog: (chunk) => setLog((prev) => prev + chunk),
       onSamples: (b) => {
-        if (b.offset === 0) seriesRef.current = emptySeries();
+        if (b.reset || b.offset === 0) seriesRef.current = emptySeries();
         appendBatch(seriesRef.current, b);
+        trimSeries(seriesRef.current);   // rolling window: week-long runs must not eat the tab
         setSeries({ ...seriesRef.current });
       },
       onPg: (b) => {
-        if (b.offset === 0) pgRef.current = emptyPg();
+        if (b.reset || b.offset === 0) pgRef.current = emptyPg();
         appendPg(pgRef.current, b);
+        trimPg(pgRef.current);
         setPg({ ...pgRef.current });
       },
       onProgress: (p) => setProgress(p),
@@ -81,8 +96,26 @@ export function RunDetail({ me }: { me: Me }) {
       },
       onError: () => setStreamState("reconnecting…"),
     });
-    return () => es.close();
-  }, [runId]);
+    esRef.current = es;
+    // Laptop sleep / network moves can kill the EventSource permanently
+    // (readyState CLOSED = the browser gave up reconnecting). Rebuild it on
+    // wake/online and refresh the run row — the run itself lives server-side.
+    const revive = () => {
+      if (esRef.current && esRef.current.readyState === 2 /* CLOSED */) {
+        setStreamState("reconnecting…");
+        setNonce((n) => n + 1);          // re-runs this effect: fresh stream
+      }
+      api.get<Run>(`/api/runs/${runId}`).then(setRun).catch(() => {});
+    };
+    const onVis = () => { if (!document.hidden) revive(); };
+    window.addEventListener("online", revive);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("online", revive);
+      document.removeEventListener("visibilitychange", onVis);
+      es.close();
+    };
+  }, [runId, nonce]);
 
   async function mark(type: string) {
     try {
@@ -170,6 +203,13 @@ export function RunDetail({ me }: { me: Me }) {
         <span className="chip live-chip"><i className={live ? "dot on" : "dot"} /> {streamState}</span>
       </div>
 
+      {verdict && (
+        <div className={`banner-${verdict.finding === "exceeds" ? "ok" : "err"}`}
+             style={{ marginBottom: 10 }}>
+          <b>IOPS verdict: {verdict.finding.toUpperCase()}</b>
+          {" — "}{verdict.detail}
+        </div>
+      )}
       <div className="actions">
         <Link className="btn primary" to={`/runs/${runId}/report`}>View report</Link>
         <a className="btn" href={`/runs/${runId}/report/download`}>Download</a>

@@ -154,6 +154,13 @@ MIGRATIONS: list[tuple[int, str]] = [
     );
     CREATE INDEX idx_health_hist ON health_history(kube_target_id, ts_utc);
     """),
+    # 8: PID identity for orphan reattach — os.kill(pid,0) alone mistakes a
+    #    RECYCLED pid (reboot, pid_max wrap) for the surviving benchmark,
+    #    which starves the queue and lets Cancel signal a stranger. The
+    #    process start time (/proc/<pid>/stat field 22) disambiguates.
+    (8, """
+    ALTER TABLE jobs ADD COLUMN pid_start TEXT;
+    """),
 ]
 
 

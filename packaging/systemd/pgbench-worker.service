@@ -22,6 +22,12 @@ RestartSec=3
 # on stop before it is killed.
 TimeoutStopSec=120
 KillSignal=SIGTERM
+# Only the worker process itself is killed on stop/restart (deploys!): the
+# benchmark children are their own process groups and keep running through a
+# worker restart — the worker re-attaches to them at startup (see
+# worker.reconcile_startup). A deliberate Stop from the UI still kills the
+# whole group via killpg.
+KillMode=process
 
 # --- Hardening ---
 # The worker spawns external processes (sysbench, psql, the pgbench-harness

@@ -77,14 +77,19 @@ def _connection_args(spec: Spec) -> list[str]:
 
 def _workload_args(spec: Spec) -> tuple[str, list[str], Optional[str]]:
     """Return (script, workload args, cwd) for the configured workload."""
+    from pgbench_harness.spec import IO_STRESS_MIXES
     w = spec.workload
     if w.type == "tpcc":
         script = "./tpcc.lua"
         args = [f"--tables={w.tables}", f"--scale={w.scale}"]
         cwd: Optional[str] = w.tpcc_path
     else:
-        script = w.type
+        # io_stress is stock lua under the hood: mix picks the script, the
+        # oversized dataset + rand_type do the cache-defeating work
+        script = IO_STRESS_MIXES[w.mix] if w.type == "io_stress" else w.type
         args = [f"--tables={w.tables}", f"--table-size={w.table_size}"]
+        if w.rand_type:
+            args.append(f"--rand-type={w.rand_type}")
         cwd = None
     return script, args + list(w.extra_args), cwd
 
@@ -109,7 +114,8 @@ def build_run_command(spec: Spec, threads: int) -> SysbenchCommand:
     return SysbenchCommand(argv=tuple(argv), cwd=cwd)
 
 
-def build_soak_command(spec: Spec, threads: int, time_s: int) -> SysbenchCommand:
+def build_soak_command(spec: Spec, threads: int, time_s: int,
+                       rate: int = 0) -> SysbenchCommand:
     """Build a soak `run` command: fixed concurrency for *time_s* seconds.
 
     Note on outage survival: sysbench's `--ignore-errors` is MySQL-driver only;
@@ -130,6 +136,7 @@ def build_soak_command(spec: Spec, threads: int, time_s: int) -> SysbenchCommand
             f"--report-interval={spec.soak.report_interval_s}",
             "--percentile=99",
         ]
+        + ([f"--rate={rate}"] if rate else [])
         + (["--histogram"] if spec.capture.histogram else [])
         + ["run"]
     )
@@ -141,6 +148,8 @@ def build_prepare_command(spec: Spec) -> SysbenchCommand:
     script, wargs, cwd = _workload_args(spec)
     if spec.sweep is not None:
         peak = max(spec.sweep.threads)
+    elif spec.suite is not None:
+        peak = max(spec.suite.threads)
     else:
         assert spec.soak is not None
         peak = spec.soak.threads
@@ -161,6 +170,8 @@ def run_streaming(
     logger: logging.Logger,
     heartbeat_every: int = 60,
     on_line: Optional[Callable[[str], None]] = None,
+    timeout_s: Optional[float] = None,
+    kill_grace_s: float = 10.0,
 ) -> int:
     """Run *cmd*, teeing stdout+stderr line-buffered to *log_path* live.
 
@@ -186,22 +197,55 @@ def run_streaming(
             f"could not execute '{cmd.argv[0]}': {exc}",
             hint="install sysbench (see README) and re-run preflight.",
         ) from exc
+    # Optional watchdog (same escalation as the soak path): a level whose
+    # child hangs — connected but silent, or stuck in a dying network — must
+    # never freeze a long benchmark forever. done/timed_out mirror
+    # run_streaming_timestamped's contract.
+    done = threading.Event()
+    timed_out = {"flag": False}
+    watchdog: Optional[threading.Thread] = None
+    if timeout_s is not None:
+        watchdog = threading.Thread(
+            target=_kill_after_timeout,
+            args=(proc, float(timeout_s), float(kill_grace_s), done, timed_out, logger),
+            daemon=True)
+        watchdog.start()
     lines_seen = 0
-    with open(log_path, "w", encoding="utf-8") as log:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            red = redact(line)
-            log.write(red)
-            log.flush()
-            if on_line is not None:
-                try:
-                    on_line(red)
-                except Exception:  # noqa: BLE001  a live-tap error must never kill the run
-                    pass
-            lines_seen += 1
-            if lines_seen % heartbeat_every == 0:
-                logger.info("    %s", redact(line.rstrip()))
-    return proc.wait()
+    try:
+        with open(log_path, "w", encoding="utf-8") as log:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                red = redact(line)
+                log.write(red)
+                log.flush()
+                if on_line is not None:
+                    try:
+                        on_line(red)
+                    except Exception:  # noqa: BLE001  a live-tap error must never kill the run
+                        pass
+                lines_seen += 1
+                if lines_seen % heartbeat_every == 0:
+                    logger.info("    %s", redact(line.rstrip()))
+        rc = proc.wait()
+    except BaseException:
+        # a harness-side failure in the tee loop (ENOSPC on log.write being
+        # the realistic one) must never orphan the load generator — it would
+        # keep hammering the target for up to --time after the run "failed"
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+        raise
+    finally:
+        done.set()
+    if watchdog is not None:
+        watchdog.join(timeout=5)
+    if timed_out["flag"]:
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write(f"FATAL: harness watchdog killed the load generator after "
+                      f"{timeout_s:.0f}s (hung or silent child)\n")
+    return rc
 
 
 def _kill_after_timeout(
@@ -242,6 +286,7 @@ def run_streaming_timestamped(
     timeout_s: Optional[float] = None,
     kill_grace_s: float = 10.0,
     on_line: Optional[Callable[[str, str], None]] = None,
+    proc_holder: Optional[dict] = None,
 ) -> tuple[int, int, bool]:
     """Run *cmd*, teeing each line to *log_path* prefixed with the read-time UTC.
 
@@ -271,6 +316,10 @@ def run_streaming_timestamped(
             f"could not execute '{cmd.argv[0]}': {exc}",
             hint="install sysbench (see README) and re-run preflight.",
         ) from exc
+    if proc_holder is not None:
+        # graceful-stop hook: a signal handler can terminate the CURRENT
+        # child instead of waiting out a segment that may be days long
+        proc_holder["proc"] = proc
     intervals = 0
     seen = 0
     timed_out = {"flag": False}
@@ -302,10 +351,21 @@ def run_streaming_timestamped(
                 if seen % heartbeat_every == 0:
                     logger.info("    %s", redact(line.rstrip()))
         rc = proc.wait()
+    except BaseException:
+        # never orphan the load generator on a harness-side tee failure
+        # (ENOSPC writing the log): it would keep hammering the target
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+        raise
     finally:
         done.set()                              # release the watchdog (no-op if it already fired)
         if watchdog is not None:
             watchdog.join(timeout=1.0)
+        if proc_holder is not None:
+            proc_holder.pop("proc", None)
     return rc, intervals, timed_out["flag"]
 
 

@@ -52,6 +52,24 @@ def _build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--dry-run", action="store_true",
                     help="print the sysbench command per level and the wall-clock budget, then exit")
 
+    st = sub.add_parser("suite", help="full evidentiary matrix (4 sysbench + 2 "
+                                      "pgbench workloads x thread ladder) -> one "
+                                      "evidence bundle")
+    st.add_argument("--spec", required=True, type=Path)
+    st.add_argument("--results-dir", type=Path, default=Path("results"))
+    st.add_argument("--prepare", action="store_true",
+                    help="load the dataset first if missing")
+    st.add_argument("--dry-run", action="store_true",
+                    help="print every cell's command and the budget, then exit")
+
+    dp = sub.add_parser("device-probe",
+                        help="sysbench fileio on the pgdata volume from a "
+                             "node-pinned pod (guardrailed; TEST CLUSTERS ONLY)")
+    dp.add_argument("--spec", required=True, type=Path)
+    dp.add_argument("--results-dir", type=Path, default=Path("results"))
+    dp.add_argument("--dry-run", action="store_true",
+                    help="print the pod plan + fileio commands, then exit")
+
     sk = sub.add_parser("soak", help="fixed-concurrency resilience run (failover/scale) + report")
     sk.add_argument("--spec", required=True, type=Path)
     sk.add_argument("--results-dir", type=Path, default=Path("results"))
@@ -167,6 +185,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return cmd_run(args.spec, args.results_dir, resume=args.resume,
                            run_dir_opt=args.run_dir, dry_run=args.dry_run,
                            prepare=args.prepare)
+        if args.command == "suite":
+            from pgbench_harness.runner import cmd_suite
+            return cmd_suite(args.spec, args.results_dir,
+                             dry_run=args.dry_run, prepare=args.prepare)
+        if args.command == "device-probe":
+            from pgbench_harness.runner import cmd_device_probe
+            return cmd_device_probe(args.spec, args.results_dir,
+                                    dry_run=args.dry_run)
         if args.command == "soak":
             from pgbench_harness.runner import cmd_soak
             return cmd_soak(args.spec, args.results_dir, dry_run=args.dry_run,

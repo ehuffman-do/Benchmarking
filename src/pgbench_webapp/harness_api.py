@@ -27,8 +27,19 @@ def validate_yaml(spec_yaml: str) -> dict[str, Any]:
         spec = parse_spec(doc)
     except SpecError as exc:
         return {"ok": False, "error": str(exc), "hint": getattr(exc, "hint", "")}
-    return {"ok": True, "mode": "soak" if spec.is_soak else "sweep",
-            "label": spec.run.label, "workload": spec.workload.type}
+    if spec.is_soak:
+        mode = "soak"
+    elif spec.is_suite:
+        mode = "suite"
+    elif spec.sweep is not None:
+        mode = "sweep"
+    else:
+        mode = "device-probe"
+    return {"ok": True, "mode": mode, "label": spec.run.label,
+            "workload": spec.workload.type,
+            "cluster_aware": spec.cluster is not None,
+            "probe_armed": bool(spec.device_probe
+                                and spec.device_probe.allow_device_probe)}
 
 
 def _spec_from_yaml(spec_yaml: str) -> Spec:
@@ -38,6 +49,28 @@ def _spec_from_yaml(spec_yaml: str) -> Spec:
 def dry_run(spec_yaml: str) -> dict[str, Any]:
     """Exact planned sysbench commands + wall-clock budget (mirrors `--dry-run`)."""
     spec = _spec_from_yaml(spec_yaml)
+    if spec.is_suite:
+        from pgbench_harness.runner import print_suite_dry_run
+        import contextlib, io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_suite_dry_run(spec)
+        lines = buf.getvalue().splitlines()
+        n = sum(1 for ln in lines if ln.startswith("["))
+        assert spec.suite is not None
+        return {"mode": "suite",
+                "budget_s": n * spec.suite.duration_s
+                            + max(0, n - 1) * spec.suite.cooldown_s,
+                "commands": lines}
+    if spec.device_probe is not None and spec.sweep is None and spec.soak is None:
+        from pgbench_harness.deviceprobe import run_device_probe
+        import contextlib, io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_device_probe(spec, Path("."), dry_run=True)
+        return {"mode": "device-probe",
+                "budget_s": spec.device_probe.duration_s,
+                "commands": buf.getvalue().splitlines()}
     if spec.is_soak:
         assert spec.soak is not None
         cmd = sysbench.build_soak_command(spec, spec.soak.threads, spec.soak.duration_s)
@@ -54,22 +87,28 @@ def dry_run(spec_yaml: str) -> dict[str, Any]:
 
 def generate_report(run_dir: Path) -> Path:
     """(Re)generate the report for a run dir (mode-aware), returning the file path."""
-    if (run_dir / "parsed" / "soak_summary.json").exists() or \
-            (run_dir / "manifest.json").exists() and _is_soak(run_dir):
+    mode = _run_mode(run_dir)
+    if mode == "soak" or (run_dir / "parsed" / "soak_summary.json").exists():
         return _report_soak.generate_soak_report(run_dir)
+    if mode in ("suite", "probe"):
+        # same dispatch as the CLI's cmd_report — the sweep renderer asserts
+        # spec.sweep and 500'd on suite/device-probe runs
+        from pgbench_harness import report_evidence
+        return report_evidence.generate_evidence_report(run_dir)
     return _report.generate_report(run_dir)
 
 
-def _is_soak(run_dir: Path) -> bool:
+def _run_mode(run_dir: Path) -> str:
     import json
     try:
-        return json.loads((run_dir / "manifest.json").read_text()).get("mode") == "soak"
+        return str(json.loads((run_dir / "manifest.json").read_text())
+                   .get("mode", ""))
     except (OSError, ValueError):
-        return False
+        return ""
 
 
 def report_filename(run_dir: Path) -> str:
-    return "soak_report.html" if _is_soak(run_dir) else "report.html"
+    return "soak_report.html" if _run_mode(run_dir) == "soak" else "report.html"
 
 
 def compare(run_dirs: list[Path], out_path: Path) -> Path:

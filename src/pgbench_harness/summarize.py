@@ -21,7 +21,7 @@ from pgbench_harness.util import atomic_write_json, atomic_write_text
 
 SAMPLE_COLUMNS = [
     "run_id", "rep", "threads", "t_offset", "tps", "qps", "r", "w", "o",
-    "lat_p99", "err_s", "reconn_s",
+    "lat_p99", "err_s", "reconn_s", "seg",
 ]
 
 
@@ -68,15 +68,15 @@ def summarize_level(
     from the histogram (interpolated) when available; otherwise only the
     declared 99th percentile from the summary block is reported.
     """
-    assert spec.sweep is not None
-    steady = trim_warmup(parsed.samples, spec.sweep.warmup_s)
+    warmup_s, duration_s = _level_window(spec)
+    steady = trim_warmup(parsed.samples, warmup_s)
     out: dict[str, Any] = {
         "qps_avg": round(statistics.fmean(s.qps for s in steady), 2) if steady else None,
         "tps_avg": round(statistics.fmean(s.tps for s in steady), 2) if steady else None,
         "errors": round(sum(s.err_s for s in steady), 2) if steady else None,
         "reconnects": round(sum(s.reconn_s for s in steady), 2) if steady else None,
-        "duration_s": spec.sweep.duration_s,
-        "steady_state_window": [spec.sweep.warmup_s, spec.sweep.duration_s],
+        "duration_s": duration_s,
+        "steady_state_window": [warmup_s, duration_s],
         "samples_total": len(parsed.samples),
         "samples_steady": len(steady),
     }
@@ -97,10 +97,33 @@ def summarize_level(
     return out
 
 
-def _samples_rows(run_id: str, rep: int, threads: int, parsed: ParsedLog) -> list[list[Any]]:
+def _level_window(spec: Spec) -> tuple[int, int]:
+    """(warmup_s, duration_s) for a level — sweep or suite segment."""
+    if spec.sweep is not None:
+        return spec.sweep.warmup_s, spec.sweep.duration_s
+    assert spec.suite is not None
+    return spec.suite.warmup_s, spec.suite.duration_s
+
+
+def _parse_level_log(log_path, seg: str) -> ParsedLog:
+    """Driver-aware raw-log parse: pgbench segments use the pgbench parser."""
+    if seg.startswith("pgbench"):
+        from pgbench_harness.pgbench_cmd import parse_pgbench_progress
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        samples = [s for s in (parse_pgbench_progress(ln)
+                               for ln in text.splitlines()) if s is not None]
+        errors = [ln for ln in text.splitlines()
+                  if "error" in ln.lower() or "FATAL" in ln]
+        return ParsedLog(samples=samples, summary=None, histogram=[],
+                         error_lines=errors)
+    return parse_log_file(log_path)
+
+
+def _samples_rows(run_id: str, rep: int, threads: int, parsed: ParsedLog,
+                  seg: str = "") -> list[list[Any]]:
     return [
         [run_id, rep, threads, s.t_offset, s.tps, s.qps, s.r, s.w, s.o,
-         s.lat_ms, s.err_s, s.reconn_s]
+         s.lat_ms, s.err_s, s.reconn_s, seg]
         for s in parsed.samples
     ]
 
@@ -166,7 +189,7 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
     Re-parsing from raw is the source of truth, so reports can be regenerated
     after parser improvements without re-running benchmarks.
     """
-    assert spec.sweep is not None
+    assert spec.sweep is not None or spec.suite is not None
     parsed_dir = run_dir / "parsed"
     parsed_dir.mkdir(parents=True, exist_ok=True)
     pcts = spec.report.percentiles
@@ -177,14 +200,26 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
             "rep": lvl.rep, "threads": lvl.threads, "status": lvl.status,
             "error_excerpt": lvl.error_excerpt or None,
         }
+        if lvl.seg:
+            entry["seg"] = lvl.seg
+            entry["driver"] = "pgbench" if lvl.seg.startswith("pgbench")                 else "sysbench"
         log_path = run_dir / lvl.raw_log if lvl.raw_log else None
         if log_path is not None and log_path.exists():
-            parsed = parse_log_file(log_path)
-            rows.extend(_samples_rows(manifest.run_id, lvl.rep, lvl.threads, parsed))
+            parsed = _parse_level_log(log_path, lvl.seg)
+            rows.extend(_samples_rows(manifest.run_id, lvl.rep, lvl.threads, parsed, lvl.seg))
             if lvl.status == STATUS_OK:
                 entry.update(summarize_level(parsed, spec, pcts))
+                if lvl.seg.startswith("pgbench"):
+                    from pgbench_harness.pgbench_cmd import parse_pgbench_summary
+                    pgs = parse_pgbench_summary(
+                        log_path.read_text(encoding="utf-8", errors="replace"))
+                    entry["lat_avg"] = pgs.get("lat_avg_ms")
+                    entry["transactions"] = pgs.get("transactions")
+                    if pgs.get("tps"):
+                        entry["tps_avg"] = entry["tps_avg"] or round(pgs["tps"], 2)
                 iostats = io_delta(
-                    run_dir / "raw" / f"{lvl.key}_iostats.json", spec.sweep.duration_s)
+                    run_dir / "raw" / f"{lvl.key}_iostats.json",
+                    _level_window(spec)[1])
                 if iostats is not None:
                     entry["io"] = iostats
             elif parsed.error_lines and not entry["error_excerpt"]:
@@ -202,7 +237,8 @@ def write_parsed(run_dir: Path, spec: Spec, manifest: Manifest) -> dict[str, Any
         "tshirt_size": manifest.tshirt_size,
         "status": manifest.status,
         "workload": dict(spec.raw.get("workload", {})),
-        "sweep": dict(spec.raw.get("sweep", {})),
+        "sweep": dict(spec.raw.get("sweep", {}) or spec.raw.get("suite", {})),
+        "suite": dict(spec.raw.get("suite", {})) or None,
         "percentiles": list(pcts),
         "levels": levels_out,
     }

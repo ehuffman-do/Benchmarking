@@ -128,6 +128,16 @@ install marker and switches to the update path.
 
 ## 3. Update
 
+**Updating mid-benchmark is safe.** The worker unit runs with
+`KillMode=process`: a `deploy.sh --update` (or any worker restart) kills only
+the worker process — a running benchmark is its own process group, keeps
+running, and the restarted worker re-attaches to it by PID and converges the
+job when it finishes. Long runs also survive browser disconnects entirely:
+the load generator runs on this droplet, so closing the laptop, changing
+networks, or logging in from elsewhere only affects the live view, which
+reconnects and backfills automatically.
+
+
 ```bash
 sudo ./deploy.sh --update
 # or simply (auto-detected once INSTALLED_VERSION exists):

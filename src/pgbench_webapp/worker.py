@@ -115,6 +115,20 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
             store.delete(job_password_ref(job["id"]))
             return "failed"
         kube_tmp = ops_support.prepare_env(cfg, store, env, kt, job["id"])
+    elif kind in ("run", "soak", "suite", "device_probe") and job["kube_target_id"]:
+        # cluster-aware benchmark: inject KUBECONFIG so storage identity and
+        # the device IOPS series can be captured. A vanished target degrades
+        # the evidence (recorded by the runner) except for device_probe, which
+        # is meaningless without the cluster.
+        kt = queries.get_kube_target(conn, job["kube_target_id"])
+        if kt is not None:
+            kube_tmp = ops_support.prepare_env(cfg, store, env, kt, job["id"])
+        elif kind == "device_probe":
+            queries.update_job(conn, job["id"], state="failed", pid=None,
+                               finished_utc=utc_now_iso(),
+                               error="kube target no longer exists")
+            store.delete(job_password_ref(job["id"]))
+            return "failed"
 
     before = _run_dir_names(cfg.results_dir)
     if ops_support.is_ops_kind(kind):
@@ -136,7 +150,10 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
             argv.append("--create-db")
         if opts.get("recreate") in ("database", "tables"):
             argv += ["--recreate", opts["recreate"], "--confirm", str(opts.get("confirm", ""))]
-    else:                                       # run | soak
+    elif kind == "device_probe":
+        argv = [cfg.harness_bin, "device-probe", "--spec", str(spec_file),
+                "--results-dir", str(cfg.results_dir)]
+    else:                                       # run | soak | suite
         argv = [cfg.harness_bin, kind, "--spec", str(spec_file),
                 "--results-dir", str(cfg.results_dir)]
         if job["resume_run_id"] and kind == "run":   # UI-driven resume of a sweep
@@ -144,15 +161,19 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
     log_path = cfg.data_dir / "jobs" / f"job_{job['id']}.out"
     redact = get_redactor().redact
     head: list[str] = []
+    proc = None
     try:
         with open(log_path, "w", encoding="utf-8") as logf:
             # start_new_session=True: the harness becomes its own session/group
             # leader (pgid == pid), so a Stop can signal the WHOLE tree (harness +
             # sysbench grandchild) with one killpg instead of orphaning sysbench.
+            # errors="replace": a single non-UTF-8 byte from sysbench/kubectl
+            # must not abandon a live multi-day benchmark mid-tee.
             proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                    start_new_session=True)
-            queries.update_job(conn, job["id"], pid=proc.pid)
+                                    errors="replace", start_new_session=True)
+            queries.update_job(conn, job["id"], pid=proc.pid,
+                               pid_start=_proc_start_ticks(proc.pid))
             assert proc.stdout is not None
             early_run_id: Optional[str] = None
             for line in proc.stdout:
@@ -170,7 +191,7 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                         early_run_id = rid
                         queries.update_job(conn, job["id"], run_id=rid)
                         ops_support.index_ops_run(cfg, conn, rid, job)
-                if early_run_id is None and kind in ("run", "soak"):
+                if early_run_id is None and kind in ("run", "soak", "suite", "device_probe"):
                     rid = _parse_run_id(red, cfg.results_dir)
                     if rid:
                         early_run_id = rid
@@ -193,7 +214,7 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
         # to the new manifest-bearing dir, then to the resume dir.
         # preflight/prepare/doctor/ops_validate/ops_discover never set a run_id.
         run_id: Optional[str] = None
-        if kind in ("run", "soak"):
+        if kind in ("run", "soak", "suite", "device_probe"):
             run_id = _parse_run_id("".join(head), cfg.results_dir)
             if run_id is None:
                 new_dirs = sorted(_run_dir_names(cfg.results_dir) - before)
@@ -231,6 +252,25 @@ def run_job(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row,
                 queries.upsert_run(conn, row)
         _notify(cfg, conn, job, state, run_id)
         return state
+    except BaseException:
+        # a worker-side failure (tee exception, DB error) must never orphan
+        # the benchmark process group: it would keep loading the target for
+        # up to --time while the job reads 'failed' and the freed slot lets
+        # a second benchmark start against the same cluster
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+                proc.wait()
+        raise
     finally:
         store.delete(job_password_ref(job["id"]))   # secret gone even on error
         if kube_tmp is not None:
@@ -248,7 +288,7 @@ def _notify(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row, state: str,
                       detail="worker finished job")
     except Exception:  # noqa: BLE001
         pass
-    if job["kind"] not in ("run", "soak"):
+    if job["kind"] not in ("run", "soak", "suite", "device_probe"):
         return   # don't email/Slack for preflight/prepare/doctor health checks
     try:
         from pgbench_webapp import notify as _n
@@ -264,6 +304,35 @@ def _notify(cfg: Config, conn: sqlite3.Connection, job: sqlite3.Row, state: str,
         pass
 
 
+def _proc_start_ticks(pid: int) -> str:
+    """The process start time (/proc/<pid>/stat field 22, clock ticks since
+    boot) — the identity that survives what a bare pid does not: a recycled
+    pid after a reboot or pid_max wrap has a different start time."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # field 2 (comm) can contain spaces/parens — split after the LAST ')'
+        return stat.rsplit(")", 1)[1].split()[19]   # field 22, 0-indexed 19
+    except (OSError, IndexError):
+        return ""
+
+
+def _pid_is_our_child(pid: int, recorded_start: str) -> bool:
+    """Liveness + identity: alive AND (when we recorded a start time) the
+    same process, not a recycled pid. EPERM means alive-but-other-uid —
+    with a recorded start time that's decisive: not ours."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return bool(recorded_start) and _proc_start_ticks(pid) == recorded_start
+    except OSError:
+        return False
+    if not recorded_start:
+        return True          # legacy row (pre-migration): keep old behavior
+    return _proc_start_ticks(pid) == recorded_start
+
+
 def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
     """On worker start, mark orphaned 'running'/'canceling' jobs whose process is
     gone as interrupted, so the queue isn't wedged after a crash/restart, then
@@ -276,13 +345,8 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
         if ops_support.is_ops_kind(job["kind"]):
             continue
         pid = job["pid"]
-        alive = False
-        if pid:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except OSError:
-                alive = False
+        pid_start = (job["pid_start"] if "pid_start" in job.keys() else "") or ""
+        alive = bool(pid) and _pid_is_our_child(int(pid), pid_start)
         if not alive:
             # 'canceling' with a dead pid was a stop in flight -> canceled; a
             # 'running' orphan crashed -> failed (and is resumable for sweeps).
@@ -291,11 +355,86 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
                                finished_utc=utc_now_iso(),
                                error=("stopped (worker restart)" if terminal == "canceled"
                                       else "interrupted (worker restart); resume from the run page"))
+        elif job["state"] == "running" and job["kind"] in (
+                "run", "soak", "suite", "device_probe"):
+            # The harness child SURVIVED the worker restart (KillMode=process;
+            # it is its own process group). Re-attach: watch the pid and
+            # converge the job + run when it finishes — a deploy mid-way
+            # through a week-long benchmark must not lose it.
+            threading.Thread(target=_reattach_orphan,
+                             args=(cfg, job["id"], int(pid), pid_start),
+                             name=f"reattach-{job['id']}", daemon=True).start()
     # Converge stuck-running runs against their now-terminal jobs and re-index
     # the filesystem so no run survives a restart still showing 'live'.
     index.reconcile(conn, cfg.results_dir)
     # Same for Cluster Ops jobs/runs, which index.reconcile does not cover.
     ops_support.reconcile_stale_ops_jobs(cfg, conn, startup=True)
+    _sweep_stale_kubeconfigs(cfg, conn)
+
+
+def _sweep_stale_kubeconfigs(cfg: Config, conn: sqlite3.Connection) -> None:
+    """Delete decrypted per-job kubeconfig copies whose job is no longer
+    running: run_job's finally does this on the normal path, but a worker
+    restart mid-job (the supported KillMode=process flow) skips that finally
+    — without the sweep the plaintext kubeconfig outlives the job forever."""
+    kc_dir = cfg.data_dir / "kubeconfigs"
+    if not kc_dir.is_dir():
+        return
+    live = {int(j["id"]) for j in queries.list_jobs(
+        conn, states=("running", "canceling"))}
+    for f in kc_dir.glob(".job_*.kubeconfig"):
+        try:
+            jid = int(f.name.split("_", 1)[1].split(".", 1)[0])
+        except (ValueError, IndexError):
+            jid = -1
+        if jid not in live:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
+def _reattach_orphan(cfg: Config, job_id: int, pid: int,
+                     pid_start: str = "", poll_s: float = 5.0) -> None:
+    """Adopted child from before a worker restart: poll the pid (we cannot
+    wait() a non-child) and converge the job row + run index from the run
+    directory's manifest when it exits. The run dir stays the source of
+    truth, so nothing is lost even if THIS worker restarts again."""
+    conn = connect(cfg.db_path)
+    try:
+        queries.audit(conn, None, "job_reattach", target=f"job:{job_id}",
+                      detail=f"pid={pid} survived a worker restart")
+        while _pid_is_our_child(pid, pid_start):
+            time.sleep(poll_s)
+        job = queries.get_job(conn, job_id)
+        if job is None or job["state"] not in ("running", "canceling"):
+            return                               # someone else converged it
+        status = ""
+        if job["run_id"]:
+            try:
+                manifest = json.loads(
+                    (cfg.results_dir / job["run_id"] / "manifest.json")
+                    .read_text(encoding="utf-8"))
+                status = manifest.get("status", "")
+            except (OSError, ValueError):
+                status = ""
+        state = "done" if status in ("complete", "partial") else             ("canceled" if job["state"] == "canceling" else "failed")
+        queries.update_job(conn, job_id, state=state, pid=None,
+                           finished_utc=utc_now_iso(),
+                           error="" if state == "done" else
+                           f"run ended with status '{status or 'unknown'}' "
+                           "(converged after worker restart)")
+        index.reconcile(conn, cfg.results_dir)
+        try:   # the adopted job's decrypted kubeconfig copy dies with it
+            (cfg.data_dir / "kubeconfigs" / f".job_{job_id}.kubeconfig").unlink()
+        except OSError:
+            pass
+        queries.audit(conn, None, f"job_{state}", target=job["run_id"] or f"job:{job_id}",
+                      detail="converged by re-attach after worker restart")
+    except Exception:  # noqa: BLE001 — a re-attach failure must not kill the worker
+        pass
+    finally:
+        conn.close()
 
 
 def _run_job_threaded(cfg: Config, store: SecretStore, job_id: int) -> None:
@@ -416,6 +555,11 @@ def stop_job_process(cfg: Config, conn: sqlite3.Connection, job_id: int) -> bool
     pid = job["pid"]
     if not pid:
         return True                              # nothing to signal; reconcile finalizes
+    pid_start = (job["pid_start"] if "pid_start" in job.keys() else "") or ""
+    if not _pid_is_our_child(int(pid), pid_start):
+        # recycled pid (reboot / pid_max wrap): the benchmark is long gone —
+        # do NOT killpg a stranger's process group; reconcile finalizes
+        return True
     try:
         pgid = os.getpgid(pid)
     except OSError:
