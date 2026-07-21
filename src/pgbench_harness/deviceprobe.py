@@ -346,7 +346,8 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
                             timeout_s=float(dp.duration_s + 300))
             run_out = res.stdout
             if not res.ok:
-                run_exec_failed = f"exec exited rc={res.rc}: {res.stderr[:300]}"
+                run_exec_failed = (f"exec exited rc={res.returncode}: "
+                                   f"{res.stderr[:300]}")
         except KubeError as exc:
             run_out, run_exec_failed = "", str(exc)
         atomic_write_text(run_dir / "raw" / "fileio_run.log",

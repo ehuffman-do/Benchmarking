@@ -40,6 +40,13 @@ class KubeResult:
     def ok(self) -> bool:
         return self.returncode == 0
 
+    @property
+    def rc(self) -> int:
+        """Alias for returncode. A field-crash lesson: error-formatting code
+        wrote `.rc`, which only executes on the rare failure path — the
+        AttributeError then masked the real failure. Support both names."""
+        return self.returncode
+
 
 class Kube:
     """Thin, namespace-aware kubectl runner bound to one target."""

@@ -155,7 +155,7 @@ def preflight(kube: Kube, run: OpsRun, spec: OpsSpec,
     # backup (the rc=50 field bug this check exists to prevent).
     if not res.ok or not info_text.strip():
         run.event("preflight", "ABORT: cannot verify stanza lock",
-                  f"pgbackrest info failed (rc={res.rc}: "
+                  f"pgbackrest info failed (rc={res.returncode}: "
                   f"{(res.stderr or 'no output').strip()[:200]}) — refusing "
                   "to fire a backup without proof the stanza is idle. "
                   "Retry once the primary pod answers execs.")
