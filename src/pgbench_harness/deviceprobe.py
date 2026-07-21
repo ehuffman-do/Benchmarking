@@ -76,6 +76,38 @@ def _pod_manifest(spec: Spec, pod_name: str, node: str, pvc: str) -> str:
     })
 
 
+def _fill_from_device(run_dir: Path, start_iso: str,
+                      end_iso: str) -> dict[str, Any]:
+    """Probe figures from the harness's own device series over the fileio
+    window — used when the sysbench summary format is unrecognized."""
+    from datetime import datetime, timezone
+
+    from pgbench_harness.deviceio import derive_device_series
+
+    def ms(iso: str) -> float:
+        return datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).timestamp() * 1000
+
+    try:
+        t0, t1 = ms(start_iso), ms(end_iso)
+    except (ValueError, TypeError):
+        return {}
+    rows = [r for r in derive_device_series(run_dir)
+            if t0 <= r["t_epoch_ms"] <= t1]
+    if not rows:
+        return {"source": "no summary and no device rows — see raw/fileio_run.log"}
+    n = len(rows)
+    return {
+        "reads_s": round(sum(r["reads_s"] for r in rows) / n, 1),
+        "writes_s": round(sum(r["writes_s"] for r in rows) / n, 1),
+        "iops": round(sum(r["iops"] for r in rows) / n, 1),
+        "read_mb_s": round(sum(r["read_mb_s"] for r in rows) / n, 2),
+        "write_mb_s": round(sum(r["write_mb_s"] for r in rows) / n, 2),
+        "source": "derived from device counters (sysbench summary format "
+                  "unrecognized — raw/fileio_run.log has the original)",
+    }
+
+
 def parse_fileio_result(text: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, rx in FILEIO_RESULT_RES.items():
@@ -136,14 +168,16 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
     sampler: Optional[deviceio.DeviceIoSampler] = None
 
     def _cleanup() -> None:
-        # files first (needs the pod), then the pod itself; both idempotent
+        # files first (needs the pod), then the pod itself; both idempotent.
+        # keep_files leaves the test files for the next probe iteration.
         if created["pod"]:
-            try:
-                kube.exec(pod_name, "fileio",
-                          ["sh", "-c", f"rm -rf /pgdata/{PROBE_DIR}"],
-                          timeout_s=120)
-            except KubeError:
-                pass
+            if not dp.keep_files:
+                try:
+                    kube.exec(pod_name, "fileio",
+                              ["sh", "-c", f"rm -rf /pgdata/{PROBE_DIR}"],
+                              timeout_s=120)
+                except KubeError:
+                    pass
             try:
                 kube.run(["delete", "pod", pod_name, "--wait=false"])
             except KubeError:
@@ -176,6 +210,9 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
                         ["df", "-Pk", "/pgdata"], timeout_s=20, check=True)
         avail_kb = int(res.stdout.strip().splitlines()[-1].split()[3])
         need_kb = int(dp.file_total_size_gb * 2 * 1048576)
+        if dp.keep_files:
+            # reused files are already allocated; only headroom is needed
+            need_kb = int(dp.file_total_size_gb * 0.2 * 1048576)
         if avail_kb < need_kb:
             raise RunError(
                 f"free space guardrail: {avail_kb / 1048576:.1f} GiB available on "
@@ -204,11 +241,21 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
 
         sh = lambda phase_args: ["sh", "-c", "cd /pgdata/" + PROBE_DIR + " && "
                                  + " ".join(fileio + phase_args)]
-        logger.info("fileio prepare (%.0fG in %d files) ...",
-                    dp.file_total_size_gb, dp.file_num)
-        res = kube.exec(pod_name, "fileio", sh(["prepare"]),
-                        timeout_s=3600, check=True)
-        atomic_write_text(run_dir / "raw" / "fileio_prepare.log", res.stdout)
+        have_files = kube.exec(
+            pod_name, "fileio",
+            ["sh", "-c", f"ls /pgdata/{PROBE_DIR}/test_file.0"],
+            timeout_s=20).ok
+        if dp.keep_files and have_files:
+            logger.info("reusing existing test files in /pgdata/%s "
+                        "(keep_files: true — prepare skipped)", PROBE_DIR)
+            atomic_write_text(run_dir / "raw" / "fileio_prepare.log",
+                              "(skipped: reusing existing test files)\n")
+        else:
+            logger.info("fileio prepare (%.0fG in %d files) ...",
+                        dp.file_total_size_gb, dp.file_num)
+            res = kube.exec(pod_name, "fileio", sh(["prepare"]),
+                            timeout_s=3600, check=True)
+            atomic_write_text(run_dir / "raw" / "fileio_prepare.log", res.stdout)
         t0 = utc_now_iso()
         logger.info("fileio run: %s for %ds x%d threads ...",
                     dp.test_mode, dp.duration_s, dp.threads)
@@ -218,15 +265,29 @@ def run_device_probe(spec: Spec, results_dir: Path, dry_run: bool = False) -> in
                         timeout_s=float(dp.duration_s + 300), check=True)
         atomic_write_text(run_dir / "raw" / "fileio_run.log", res.stdout)
         result = parse_fileio_result(res.stdout)
+        if "iops" not in result:
+            # sysbench build printed an unrecognized summary format (field
+            # report: "fileio result: ?") — the device counters are the
+            # ground truth anyway, so derive the figures from them
+            result.update(_fill_from_device(
+                run_dir, t0, utc_now_iso()))
         result.update({"started_utc": t0, "finished_utc": utc_now_iso(),
                        "test_mode": dp.test_mode, "io_mode": dp.io_mode,
                        "threads": dp.threads, "block_kb": dp.block_size_kb,
                        "file_total_size_gb": dp.file_total_size_gb})
         atomic_write_json(run_dir / "parsed" / "fileio_summary.json", result)
         logger.info("fileio result: %s", result.get("iops", "?"))
-        res = kube.exec(pod_name, "fileio", sh(["cleanup"]), timeout_s=600)
-        atomic_write_text(run_dir / "raw" / "fileio_cleanup.log",
-                          res.stdout if res.ok else res.stderr)
+        if dp.keep_files:
+            logger.info("keep_files: true — test files left in /pgdata/%s for "
+                        "the next probe (run once with keep_files: false, or "
+                        "rm -rf the directory, to reclaim %.0fG)",
+                        PROBE_DIR, dp.file_total_size_gb)
+            atomic_write_text(run_dir / "raw" / "fileio_cleanup.log",
+                              "(skipped: keep_files)\n")
+        else:
+            res = kube.exec(pod_name, "fileio", sh(["cleanup"]), timeout_s=600)
+            atomic_write_text(run_dir / "raw" / "fileio_cleanup.log",
+                              res.stdout if res.ok else res.stderr)
         manifest.status = "complete"
     except (Exception, KeyboardInterrupt) as exc:
         manifest.status = "failed"

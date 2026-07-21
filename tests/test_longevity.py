@@ -284,3 +284,64 @@ def test_sse_stream_serves_running_run_incrementally(tmp_path):
     assert payload["reset"] is True
     assert len(payload["rows"]) == SSE_BACKFILL_ROWS   # capped, not 22k+
     assert payload["offset"] == 500                    # where the window starts
+
+
+def test_cluster_target_mismatch_cross_check():
+    """Attaching kube cluster A while SQL-targeting cluster B must be called
+    out — the device series would measure an idle cluster."""
+    from pgbench_harness.runner import cluster_target_mismatch
+    from pgbench_harness.spec import parse_spec
+    doc = make_spec_doc()
+    doc["target"]["host"] = "adv-pg-bm-ehuff-1-bawya.db1.ondigitalocean.com"
+    doc["cluster"] = {"cr_name": "adv-pg-bm-ehuff-1"}
+    assert cluster_target_mismatch(parse_spec(doc)) == ""      # same cluster
+    doc["cluster"] = {"cr_name": "adv-pgsql-30gsmal-nyc3-50415"}
+    msg = cluster_target_mismatch(parse_spec(doc))
+    assert "IDLE cluster" in msg and "SAME cluster" in msg     # cross-wired
+    assert cluster_target_mismatch(parse_spec(make_spec_doc())) == ""
+
+
+def test_rate_ladder_advances_past_unachievable_steps(fake_env, tmp_path, monkeypatch):
+    """Field failure: --rate steps far above worker capacity made sysbench
+    abort with 'event queue is full' on every relaunch, burning all 50
+    relaunches inside one step. That answer is DATA (the knee is below the
+    offered rate): the supervisor now records it and advances the ladder."""
+    monkeypatch.setenv("FAKE_SYSBENCH_REALTIME", "1")
+    monkeypatch.setenv("FAKE_SYSBENCH_QUEUE_FULL_RATE", "500")  # >=500 tps dies
+    results = tmp_path / "results"
+    doc = make_spec_doc()
+    del doc["sweep"]
+    doc["soak"] = {"threads": 4, "rate_steps": [1000, 2000, 100],
+                   "step_duration_s": 4}
+    spec_path = tmp_path / "ladder.yaml"
+    spec_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    t0 = time.monotonic()
+    rc = run_cli("soak", "--spec", str(spec_path), "--results-dir", str(results))
+    elapsed = time.monotonic() - t0
+    assert rc in (0, 1)
+    assert elapsed < 60, "ladder did not advance past doomed steps"
+    run_dir = find_run_dir(results)
+    events = (run_dir / "events.jsonl").read_text()
+    assert "rate step 1/3 unachievable: offered 1000 tps" in events
+    assert "rate step 2/3 unachievable: offered 2000 tps" in events
+    assert "rate step 3/3: 100 tps offered" in events     # achievable step ran
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["soak"]["relaunches"] == 0            # skips, not relaunches
+
+
+def test_verdict_shallow_queue_full_util_names_the_real_suspect():
+    """100% util with a shallow queue means time-busy, not saturation — the
+    verdict must point at concurrency/the device-probe, not volume sizing."""
+    from pgbench_harness.deviceio import compute_verdict
+    from pgbench_harness.spec import Limits
+    rows = [{"t_epoch_ms": 1000 * i, "reads_s": 3500.0, "writes_s": 2300.0,
+             "iops": 5800.0, "read_mb_s": 50.0, "write_mb_s": 12.0,
+             "await_ms": 6.6, "util_pct": 100.0, "queue_depth": 28.0}
+            for i in range(30)]
+    v = compute_verdict(rows, Limits())
+    assert v["finding"] == "inconclusive"
+    assert "NOT saturation" in v["detail"]
+    assert "device-probe" in v["detail"]
+    deep = [dict(r, queue_depth=200.0) for r in rows]
+    v = compute_verdict(deep, Limits())
+    assert "smaller-provisioned" in v["detail"]           # deep queue: sizing suspect

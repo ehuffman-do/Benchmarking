@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — device-probe iteration (field fixes from the first live probe)
+
+- **`device_probe.keep_files`**: preparing the fileio test set took ~5 min
+  for 100 GB on the live cluster and was repeated on every probe run. With
+  `keep_files: true` the probe skips prepare when the files already exist
+  under `/pgdata/pgb-fileio-probe/` and skips cleanup at the end, so
+  probe iterations (more threads, deeper backlog, rndrd vs rndwr) start in
+  seconds. The free-space guardrail relaxes accordingly when reusing.
+  A final run with `keep_files: false` (or a manual
+  `rm -rf /pgdata/pgb-fileio-probe` in the pod) reclaims the space.
+- **"fileio result: ?" fixed by device-derived fallback**: some sysbench
+  builds print a summary format our regexes don't match, leaving the
+  evidence bundle without probe figures. When summary parsing yields
+  nothing, the probe now derives reads/s, writes/s, total IOPS and MB/s
+  from the device counter series over the run window and labels the
+  source, so the verdict engine and report always get real numbers
+  (the raw sysbench output is still kept in `raw/fileio_run.log`).
+
 ## Unreleased — longevity hardening (hours-to-week-long runs)
 
 - **Cell watchdog for sweep/suite/pgbench**: a hung load generator
