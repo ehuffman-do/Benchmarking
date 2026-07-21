@@ -88,6 +88,9 @@ class DeviceIoSampler:
     warning in env/device_io_warning.txt, never raised.
     """
 
+    RESPAWN_BACKOFF_S = 5.0
+    MAX_RESPAWN_WARNINGS = 10
+
     def __init__(self, spec: Spec, run_dir: Path, logger=None) -> None:
         self.spec = spec
         self.run_dir = run_dir
@@ -95,6 +98,8 @@ class DeviceIoSampler:
         self._proc: Optional[subprocess.Popen] = None
         self._fh = None
         self._watch: Optional[threading.Thread] = None
+        self._stopped = threading.Event()
+        self._respawns = 0
         self.device: dict[str, Any] = {}
 
     def _warn(self, msg: str) -> None:
@@ -105,45 +110,79 @@ class DeviceIoSampler:
         with open(wpath, "a", encoding="utf-8") as fh:
             fh.write(f"{utc_now_iso()} {msg}\n")
 
-    def start(self) -> bool:
-        try:
-            kube = _kube(self.spec)
-            pod = _primary_pod(self.spec, kube)
+    def _spawn(self) -> None:
+        """One stream incarnation. The in-pod loop prints only the ONE device
+        line (not the whole diskstats table): a week-long run writes megabytes
+        instead of gigabytes, and the raw truth for the sampled device is
+        preserved unchanged."""
+        kube = _kube(self.spec)
+        pod = _primary_pod(self.spec, kube)
+        if not self.device:
             self.device = resolve_pgdata_device(kube, pod)
             atomic_write_text(self.run_dir / "raw" / "diskstats_device.json",
                               json.dumps(self.device, indent=1))
-            self._fh = open(self.run_dir / "raw" / "diskstats.log", "a",
-                            encoding="utf-8", errors="replace")
-            loop = ("while true; do date +%s%3N; cat /proc/diskstats; "
-                    "echo ===; sleep 1; done")
-            self._proc = kube.stream(
-                ["exec", pod, "-c", "database", "--", "sh", "-c", loop],
-                stdout=self._fh, stderr=subprocess.DEVNULL)
-            self._watch = threading.Thread(target=self._watchdog, daemon=True)
-            self._watch.start()
-            if self.logger:
-                self.logger.info("device-io sampler on %s (%s %s)", pod,
-                                 self.device.get("device"),
-                                 self.device.get("majmin"))
-            return True
+        maj, minor = str(self.device["majmin"]).split(":")
+        loop = ("while true; do date +%s%3N; "
+                f"awk '$1 == {maj} && $2 == {minor}' /proc/diskstats; "
+                "echo ===; sleep 1; done")
+        if self._fh is not None:          # respawn: don't leak the old handle
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+        self._fh = open(self.run_dir / "raw" / "diskstats.log", "a",
+                        encoding="utf-8", errors="replace")
+        self._proc = kube.stream(
+            ["exec", pod, "-c", "database", "--", "sh", "-c", loop],
+            stdout=self._fh, stderr=subprocess.DEVNULL)
+        if self.logger:
+            self.logger.info("device-io sampler on %s (%s %s)", pod,
+                             self.device.get("device"),
+                             self.device.get("majmin"))
+
+    def start(self) -> bool:
+        try:
+            self._spawn()
         except Exception as exc:  # noqa: BLE001 — observation must not kill the run
             self._warn(f"failed to start: {exc}")
             self.stop()
             return False
+        self._watch = threading.Thread(target=self._supervise, daemon=True)
+        self._watch.start()
+        return True
 
-    def _watchdog(self) -> None:
-        proc = self._proc
-        if proc is None:
-            return
-        proc.wait()
-        if proc.returncode not in (0, None) and self._fh is not None:
-            self._warn(f"sampling stream exited rc={proc.returncode} mid-run — "
-                       "device series is truncated")
+    def _supervise(self) -> None:
+        """Keep the stream alive for the whole run: exec streams DIE over long
+        windows (token refresh, pod restart, network blips, failover moving
+        the primary). Respawn with backoff until stop(); the derivation
+        already treats gaps as gaps, never as fabricated rates."""
+        while not self._stopped.is_set():
+            proc = self._proc
+            if proc is None:
+                return
+            proc.wait()
+            if self._stopped.is_set():
+                return
+            self._respawns += 1
+            if self._respawns <= self.MAX_RESPAWN_WARNINGS:
+                self._warn(f"sampling stream died (rc={proc.returncode}) — "
+                           f"respawn #{self._respawns} after "
+                           f"{self.RESPAWN_BACKOFF_S:.0f}s; the gap is visible "
+                           "in the series, not interpolated")
+            if self._stopped.wait(self.RESPAWN_BACKOFF_S):
+                return
+            try:
+                # the primary may have MOVED — re-resolve pod (device identity
+                # is re-checked: a new maj:min would need a fresh resolution)
+                self._spawn()
+            except Exception as exc:  # noqa: BLE001
+                if self._respawns <= self.MAX_RESPAWN_WARNINGS:
+                    self._warn(f"respawn failed: {exc} — retrying")
 
     def stop(self) -> None:
+        self._stopped.set()
         if self._proc is not None:
             try:
-                self._fh = None  # watchdog: an exit after stop() is expected
                 self._proc.terminate()
                 self._proc.wait(timeout=10)
             except Exception:  # noqa: BLE001
@@ -152,6 +191,14 @@ class DeviceIoSampler:
                 except OSError:
                     pass
             self._proc = None
+        if self._watch is not None:
+            self._watch.join(timeout=5)
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
 
 
 def capture_storage_identity(spec: Spec, run_dir: Path, logger=None) -> dict[str, Any]:

@@ -257,6 +257,8 @@ def test_suite_e2e_capped_verdict_and_evidence_bundle(iops_env, monkeypatch):
     assert "exactly what SQL" in html
     assert "data:image/png;base64," in html               # charts inline
     assert "Caveats" in html
+    # full DB-settings capture renders in the evidence report (provider diffing)
+    assert "Full pg_settings dump" in html and "shared_buffers" in html
     # per-seg rows in the summary + seg column in samples.csv
     summary = json.loads((run_dir / "parsed" / "summary.json").read_text())
     assert any(lv.get("driver") == "pgbench" for lv in summary["levels"])
@@ -306,6 +308,8 @@ def test_rate_stepped_soak_inconclusive_verdict(iops_env, monkeypatch):
     assert ev["verdict"]["finding"] == "inconclusive"
     assert "pressure" in ev["verdict"]["detail"]
     # offered load honored: step-1 samples are throttled to ~50 tps
+    soak_html = (run_dir / "soak_report.html").read_text()
+    assert "Full pg_settings dump" in soak_html           # settings in soak too
     ts = (run_dir / "parsed" / "soak_timeseries.csv").read_text().splitlines()
     first_tps = [float(r.split(",")[2]) for r in ts[1:4] if r.split(",")[2]]
     assert first_tps and all(t <= 60 for t in first_tps)

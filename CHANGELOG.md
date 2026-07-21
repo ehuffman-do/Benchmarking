@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — longevity hardening (hours-to-week-long runs)
+
+- **Cell watchdog for sweep/suite/pgbench**: a hung load generator
+  (connected but silent) froze a run forever — soak always had a watchdog,
+  the sweep path did not. Every cell now has a wall-clock ceiling
+  (duration + grace); a hung child is killed, the level marked failed with
+  "harness watchdog killed the load generator", and the run continues.
+- **Deploy-safe long runs**: worker unit gets `KillMode=process`; benchmark
+  children (own process groups) survive worker restarts, and the restarted
+  worker re-attaches by PID (startup reconcile) and converges the job + run
+  index when the child eventually finishes. `deploy.sh --update` mid-run no
+  longer kills a week-long benchmark.
+- **Sampler resilience**: the live PG sampler survives per-iteration
+  exceptions instead of dying silently for the rest of the run; the device
+  IOPS stream auto-respawns with backoff when the exec dies (token refresh,
+  failover, network blips) — gaps stay visible, never interpolated — and
+  now streams only the sampled device's diskstats line (megabytes per week,
+  not gigabytes).
+- **Cockpit scales to week-long series**: the SSE stream tails CSVs
+  incrementally by byte offset (was: re-parse the whole file every second
+  per viewer — pathological past a few hours) with a capped backfill of the
+  most recent ~6 h on (re)connect (`reset` flag; full history stays in the
+  CSVs/report), and the browser keeps a rolling window instead of unbounded
+  arrays. The page also rebuilds a dead EventSource on network-online /
+  tab-wake, so laptop sleep or moving houses just reconnects.
+- **Disk-space guard**: sweep/suite/soak check free space between cells/
+  segments — low space warns once, critically low stops the run CLEANLY
+  with results-so-far intact, instead of corrupting artifacts at ENOSPC.
+- **Reports: full DB-settings capture restored everywhere** — the suite/
+  probe evidence report and the soak report now include the key-settings
+  table + the full pg_settings dump (the classic sweep report always had
+  it), so provider-vs-provider settings diffs (DO Advanced vs Aiven) work
+  from any run's report. Raw CSV remains env/pg_settings.csv in the bundle.
+
+
 ## Unreleased — field fixes from the first live PMM enablement
 
 - **HTTP 401 from the PMM inventory API is no longer reported as "server

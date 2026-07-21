@@ -362,7 +362,15 @@ def generate_soak_report(run_dir: Path) -> Path:
                    for ev in summary["events"]],
     }
     interactive = build_interactive(run_dir, summary, tl)
+    from pgbench_harness.capture import KEY_SETTINGS
+    from pgbench_harness.report import load_pg_settings
+    settings = load_pg_settings(env_dir)
+    settings_map = {s["name"]: s for s in settings}
     html = _jinja_env().get_template("soak_report.html.j2").render(
+        key_settings=[settings_map.get(k, {"name": k, "setting": "n/a",
+                                           "unit": "", "source": ""})
+                      for k in KEY_SETTINGS],
+        all_settings=settings,
         summary=summary,
         charts=charts,
         interactive=interactive,

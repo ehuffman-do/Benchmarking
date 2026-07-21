@@ -170,6 +170,8 @@ def run_streaming(
     logger: logging.Logger,
     heartbeat_every: int = 60,
     on_line: Optional[Callable[[str], None]] = None,
+    timeout_s: Optional[float] = None,
+    kill_grace_s: float = 10.0,
 ) -> int:
     """Run *cmd*, teeing stdout+stderr line-buffered to *log_path* live.
 
@@ -195,22 +197,45 @@ def run_streaming(
             f"could not execute '{cmd.argv[0]}': {exc}",
             hint="install sysbench (see README) and re-run preflight.",
         ) from exc
+    # Optional watchdog (same escalation as the soak path): a level whose
+    # child hangs — connected but silent, or stuck in a dying network — must
+    # never freeze a long benchmark forever. done/timed_out mirror
+    # run_streaming_timestamped's contract.
+    done = threading.Event()
+    timed_out = {"flag": False}
+    watchdog: Optional[threading.Thread] = None
+    if timeout_s is not None:
+        watchdog = threading.Thread(
+            target=_kill_after_timeout,
+            args=(proc, float(timeout_s), float(kill_grace_s), done, timed_out, logger),
+            daemon=True)
+        watchdog.start()
     lines_seen = 0
-    with open(log_path, "w", encoding="utf-8") as log:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            red = redact(line)
-            log.write(red)
-            log.flush()
-            if on_line is not None:
-                try:
-                    on_line(red)
-                except Exception:  # noqa: BLE001  a live-tap error must never kill the run
-                    pass
-            lines_seen += 1
-            if lines_seen % heartbeat_every == 0:
-                logger.info("    %s", redact(line.rstrip()))
-    return proc.wait()
+    try:
+        with open(log_path, "w", encoding="utf-8") as log:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                red = redact(line)
+                log.write(red)
+                log.flush()
+                if on_line is not None:
+                    try:
+                        on_line(red)
+                    except Exception:  # noqa: BLE001  a live-tap error must never kill the run
+                        pass
+                lines_seen += 1
+                if lines_seen % heartbeat_every == 0:
+                    logger.info("    %s", redact(line.rstrip()))
+        rc = proc.wait()
+    finally:
+        done.set()
+    if watchdog is not None:
+        watchdog.join(timeout=5)
+    if timed_out["flag"]:
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write(f"FATAL: harness watchdog killed the load generator after "
+                      f"{timeout_s:.0f}s (hung or silent child)\n")
+    return rc
 
 
 def _kill_after_timeout(

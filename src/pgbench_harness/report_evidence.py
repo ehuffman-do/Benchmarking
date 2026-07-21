@@ -16,7 +16,7 @@ from typing import Any, Optional
 from pgbench_harness import evidence as evidence_mod
 from pgbench_harness.errors import ReportError
 from pgbench_harness.manifest import Manifest
-from pgbench_harness.report import _jinja_env, fig_to_base64
+from pgbench_harness.report import _jinja_env, fig_to_base64, load_pg_settings
 from pgbench_harness.spec import load_spec
 from pgbench_harness.util import atomic_write_text, read_json
 
@@ -148,7 +148,14 @@ def generate_evidence_report(run_dir: Path) -> Path:
         except OSError:
             return ""
 
+    from pgbench_harness.capture import KEY_SETTINGS
+    settings = load_pg_settings(env_dir)
+    settings_map = {s["name"]: s for s in settings}
     html = _jinja_env().get_template("evidence_report.html.j2").render(
+        key_settings=[settings_map.get(k, {"name": k, "setting": "n/a",
+                                           "unit": "", "source": ""})
+                      for k in KEY_SETTINGS],
+        all_settings=settings,
         ev=ev, manifest=manifest, spec=spec, summary=summary, segs=segs,
         peak=peak, charts=charts, fileio=ev.get("fileio"),
         storage=ev.get("storage_identity") or {},

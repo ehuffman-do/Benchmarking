@@ -167,7 +167,38 @@ SQL-side throughput was measured (see caveats).</p>
   {% for c in ev.caveats %}<li>{{ c }}</li>{% endfor %}
 </ul>
 
-<h2 id="env">9. Environment</h2>
+<h2 id="pgsettings">9. Database configuration (full capture)</h2>
+{% if key_settings and all_settings %}
+<p class="subtle">Key performance settings first; the complete
+  <code>pg_settings</code> capture follows — use it to diff providers
+  (e.g. DO Advanced vs Aiven) setting by setting. Raw CSV:
+  <code>env/pg_settings.csv</code> in the bundle.</p>
+<table>
+  <thead><tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr></thead>
+  <tbody>
+  {% for s in key_settings %}
+    <tr><td class="mono">{{ s.name }}</td><td class="mono">{{ s.setting }}</td>
+        <td class="mono">{{ s.unit }}</td><td class="mono">{{ s.source }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<details>
+  <summary>Full pg_settings dump ({{ all_settings | length }} rows)</summary>
+  <div class="wrap"><table>
+    <thead><tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr></thead>
+    <tbody>
+    {% for s in all_settings %}
+      <tr><td class="mono">{{ s.name }}</td><td class="mono">{{ s.setting }}</td>
+          <td class="mono">{{ s.unit }}</td><td class="mono">{{ s.source }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</details>
+{% else %}
+<p class="subtle">pg_settings capture disabled or unavailable for this run.</p>
+{% endif %}
+
+<h2 id="env">10. Environment</h2>
 <table>
   <tr><th>Server</th><td class="mono">{{ env.server_version }}</td></tr>
   <tr><th>sysbench</th><td class="mono">{{ env.sysbench_version }}</td></tr>

@@ -1026,49 +1026,66 @@ def _sse(cfg: Config, run_dir: Path, max_ticks: int = 6 * 3600) -> Iterator[str]
     """
     log = run_dir / "harness.log"
     sent_log = 0
-    sent_rows = 0
-    pg_sent = 0
+    samples_tail = _CsvTail()
+    pg_tail = _CsvTail()
+    sent_any = {"samples": False, "pg": False}
     cur_file: Optional[str] = None
     budget_s = _planned_budget_s(run_dir)
+
+    def _samples_path() -> tuple[Optional[str], Optional[Path]]:
+        for rel in ("parsed/soak_timeseries.csv", "parsed/samples.csv"):
+            if (run_dir / rel).exists():
+                return rel, run_dir / rel
+        return None, None
+
+    def _emit_series() -> Iterator[str]:
+        nonlocal cur_file, samples_tail
+        rel, path = _samples_path()
+        if path is not None:
+            if rel != cur_file:              # first/swapped file -> fresh tail
+                cur_file, samples_tail = rel, _CsvTail()
+                sent_any["samples"] = False
+            rows = samples_tail.read_new(path)
+            if rows:
+                # `reset` marks the first batch of THIS stream so a
+                # reconnecting client rebuilds instead of double-appending
+                # (offset may be huge after a capped backfill of a long run)
+                yield _event("samples", {"file": rel, "header": samples_tail.header,
+                                         "offset": samples_tail.row_count,
+                                         "reset": not sent_any["samples"],
+                                         "rows": rows})
+                samples_tail.row_count += len(rows)
+                sent_any["samples"] = True
+        rows = pg_tail.read_new(run_dir / "parsed" / "pg_timeseries.csv")
+        if rows:
+            yield _event("pg", {"header": pg_tail.header,
+                                "offset": pg_tail.row_count,
+                                "reset": not sent_any["pg"], "rows": rows})
+            pg_tail.row_count += len(rows)
+            sent_any["pg"] = True
+
     yield _event("hello", {"run_id": run_dir.name, "mode": _run_mode(run_dir),
                            "status": _run_status(run_dir), "budget_s": budget_s,
-                           "start_utc": _run_start_utc(run_dir)})
+                           "start_utc": _run_start_utc(run_dir),
+                           "backfill_cap": SSE_BACKFILL_ROWS})
     for _ in range(max_ticks):
         if log.exists():
             chunk, sent_log = _read_tail(log, sent_log)   # byte offset; incremental
             if chunk:
                 yield _event("log", chunk)
-        rel, header, data = _read_samples(run_dir)
-        if rel is not None:
-            if rel != cur_file:          # first/swapped file -> client resets
-                cur_file, sent_rows = rel, 0
-            if len(data) > sent_rows:
-                yield _event("samples", {"file": rel, "header": header,
-                                         "offset": sent_rows, "rows": data[sent_rows:]})
-                sent_rows = len(data)
-        pg_header, pg_data = _read_csv(run_dir / "parsed" / "pg_timeseries.csv")
-        if pg_header and len(pg_data) > pg_sent:
-            yield _event("pg", {"header": pg_header, "offset": pg_sent, "rows": pg_data[pg_sent:]})
-            pg_sent = len(pg_data)
+        yield from _emit_series()
         yield _event("progress", _progress(run_dir, budget_s))
         status = _run_status(run_dir)
         if status in ("complete", "partial", "failed", "canceled"):
             # Final drain before `done`: the harness writes its last log lines and
             # the terminal manifest status in the same instant, so bytes can land
             # AFTER this tick's reads above. Re-read log (incl. a trailing partial
-            # line), samples and pg so the cockpit never loses the final fragment.
+            # line) and both series so the cockpit never loses the final fragment.
             if log.exists():
                 chunk, sent_log = _read_tail(log, sent_log, include_partial=True)
                 if chunk:
                     yield _event("log", chunk)
-            rel, header, data = _read_samples(run_dir)
-            if rel is not None and rel == cur_file and len(data) > sent_rows:
-                yield _event("samples", {"file": rel, "header": header,
-                                         "offset": sent_rows, "rows": data[sent_rows:]})
-            pg_header, pg_data = _read_csv(run_dir / "parsed" / "pg_timeseries.csv")
-            if pg_header and len(pg_data) > pg_sent:
-                yield _event("pg", {"header": pg_header, "offset": pg_sent,
-                                    "rows": pg_data[pg_sent:]})
+            yield from _emit_series()
             yield _event("done", {"status": status})
             return
         time.sleep(1)
@@ -1278,6 +1295,64 @@ def _read_tail(path: Path, offset: int, include_partial: bool = False) -> tuple[
         return "", offset
     consumed = data[: nl + 1]
     return consumed.decode("utf-8", "replace"), offset + len(consumed)
+
+
+# Live cockpit backfill cap: on (re)connect, at most this many most-recent
+# rows are replayed before switching to incremental tailing. Bounds both the
+# server parse cost and the browser's memory for week-long runs; the full
+# series always lives in the CSV/report.
+SSE_BACKFILL_ROWS = 21600            # 6 h at 1 s cadence
+
+
+class _CsvTail:
+    """Byte-offset incremental CSV reader for the SSE loop.
+
+    First read: parse once, return the LAST `cap` rows (offset tells the
+    client where they sit in the file). Every later read: only the new bytes
+    past the stored offset — a week-long file costs O(new rows) per tick,
+    not O(all rows).
+    """
+
+    def __init__(self, cap: int = SSE_BACKFILL_ROWS) -> None:
+        self.cap = cap
+        self.header = ""
+        self.byte_off = 0
+        self.row_count = 0               # rows emitted so far (file-absolute)
+        self._partial = ""
+
+    def read_new(self, path: Path) -> list[str]:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return []
+        if size < self.byte_off:         # rewritten/truncated file -> restart
+            self.__init__(self.cap)
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(self.byte_off)
+                data = fh.read()
+        except OSError:
+            return []
+        if not data:
+            return []
+        text = self._partial + data.decode("utf-8", "replace")
+        nl = text.rfind("\n")
+        if nl == -1:
+            self._partial = text
+            self.byte_off += len(data)
+            return []
+        self._partial = text[nl + 1:]
+        lines = text[:nl].split("\n")
+        self.byte_off += len(data)
+        if not self.header:
+            if not lines:
+                return []
+            self.header = lines[0]
+            lines = lines[1:]
+            if len(lines) > self.cap:    # first read of a huge file: cap it
+                self.row_count = len(lines) - self.cap
+                lines = lines[-self.cap:]
+        return [ln for ln in lines if ln]
 
 
 def _read_csv(path: Path) -> tuple[str, list[str]]:

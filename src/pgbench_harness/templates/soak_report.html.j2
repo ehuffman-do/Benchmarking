@@ -267,6 +267,35 @@ events: <code>events.jsonl</code> · raw logs: <code>raw/soak_seg*.log</code>
       or <code>pgbench-harness mark</code>) and then get the per-event analysis above.</li>
   </ul>
 </div>
+<div class="card">
+  <h2>Database configuration (full capture)</h2>
+  {% if key_settings and all_settings %}
+  <table>
+    <thead><tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr></thead>
+    <tbody>
+    {% for s in key_settings %}
+      <tr><td>{{ s.name }}</td><td>{{ s.setting }}</td>
+          <td>{{ s.unit }}</td><td>{{ s.source }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <details>
+    <summary>Full pg_settings dump ({{ all_settings | length }} rows)</summary>
+    <table>
+      <thead><tr><th>Setting</th><th>Value</th><th>Unit</th><th>Source</th></tr></thead>
+      <tbody>
+      {% for s in all_settings %}
+        <tr><td>{{ s.name }}</td><td>{{ s.setting }}</td>
+            <td>{{ s.unit }}</td><td>{{ s.source }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% else %}
+  <p>pg_settings capture disabled or unavailable for this run.</p>
+  {% endif %}
+</div>
+
 {% if pmm_links %}
 <section>
   <h2>PMM — observation layer</h2>

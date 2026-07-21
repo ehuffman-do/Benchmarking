@@ -535,14 +535,17 @@ def handle_exec(st, pod, argv):
         out(diskstats_text())
         return 0
     if argv[0] == "sh" and "diskstats" in joined and "while" in joined:
-        deadline = now() + float(os.environ.get("FAKE_KUBE_LOG_FOLLOW_S", "30"))
+        # FAKE_KUBE_STREAM_DIE_S: the stream dies after N seconds (rc 1) —
+        # exercises the sampler's auto-respawn on long runs
+        die = float(os.environ.get("FAKE_KUBE_STREAM_DIE_S", "0"))
+        deadline = now() + (die or float(os.environ.get("FAKE_KUBE_LOG_FOLLOW_S", "30")))
         while now() < deadline:
             out(str(int(now() * 1000)))
             out(diskstats_text())
             out("===")
             sys.stdout.flush()
             time.sleep(1)
-        return 0
+        return 1 if die else 0
     if argv[0] == "df" and "-Pk" in argv:
         out("Filesystem 1024-blocks Used Available Capacity Mounted on")
         out(f"/dev/nvme1n1 524288000 104857600 "

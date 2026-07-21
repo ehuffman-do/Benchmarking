@@ -1028,15 +1028,30 @@ class LivePgSampler:
             pass
 
     def _run(self) -> None:
+        # every iteration is guarded: one unexpected error (transient outage,
+        # odd server answer) must never kill the sampler thread for the rest
+        # of a week-long run — it skips the sample and keeps going
         t0 = time.monotonic()
-        prev = self._sample()
+        errors = 0
+        try:
+            prev = self._sample()
+        except Exception:  # noqa: BLE001
+            prev = None
         while not self._stop.wait(self.interval):
-            cur = self._sample()
-            if cur is None:
-                continue
-            if prev is not None:
-                self._append(pg_delta_row(prev, cur, cur["_mono"] - t0))
-            prev = cur
+            try:
+                cur = self._sample()
+                if cur is None:
+                    continue
+                if prev is not None:
+                    self._append(pg_delta_row(prev, cur, cur["_mono"] - t0))
+                prev = cur
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                if self.logger and errors <= 3:
+                    self.logger.warning("live PG sampler: sample skipped (%s)%s",
+                                        exc, " — further errors suppressed"
+                                        if errors == 3 else "")
+                prev = None
 
     def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

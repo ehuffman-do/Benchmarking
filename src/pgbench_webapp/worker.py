@@ -308,11 +308,63 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
                                finished_utc=utc_now_iso(),
                                error=("stopped (worker restart)" if terminal == "canceled"
                                       else "interrupted (worker restart); resume from the run page"))
+        elif job["state"] == "running" and job["kind"] in (
+                "run", "soak", "suite", "device_probe"):
+            # The harness child SURVIVED the worker restart (KillMode=process;
+            # it is its own process group). Re-attach: watch the pid and
+            # converge the job + run when it finishes — a deploy mid-way
+            # through a week-long benchmark must not lose it.
+            threading.Thread(target=_reattach_orphan,
+                             args=(cfg, job["id"], int(pid)),
+                             name=f"reattach-{job['id']}", daemon=True).start()
     # Converge stuck-running runs against their now-terminal jobs and re-index
     # the filesystem so no run survives a restart still showing 'live'.
     index.reconcile(conn, cfg.results_dir)
     # Same for Cluster Ops jobs/runs, which index.reconcile does not cover.
     ops_support.reconcile_stale_ops_jobs(cfg, conn, startup=True)
+
+
+def _reattach_orphan(cfg: Config, job_id: int, pid: int,
+                     poll_s: float = 5.0) -> None:
+    """Adopted child from before a worker restart: poll the pid (we cannot
+    wait() a non-child) and converge the job row + run index from the run
+    directory's manifest when it exits. The run dir stays the source of
+    truth, so nothing is lost even if THIS worker restarts again."""
+    conn = connect(cfg.db_path)
+    try:
+        queries.audit(conn, None, "job_reattach", target=f"job:{job_id}",
+                      detail=f"pid={pid} survived a worker restart")
+        while True:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break                            # child finished (or died)
+            time.sleep(poll_s)
+        job = queries.get_job(conn, job_id)
+        if job is None or job["state"] not in ("running", "canceling"):
+            return                               # someone else converged it
+        status = ""
+        if job["run_id"]:
+            try:
+                manifest = json.loads(
+                    (cfg.results_dir / job["run_id"] / "manifest.json")
+                    .read_text(encoding="utf-8"))
+                status = manifest.get("status", "")
+            except (OSError, ValueError):
+                status = ""
+        state = "done" if status in ("complete", "partial") else             ("canceled" if job["state"] == "canceling" else "failed")
+        queries.update_job(conn, job_id, state=state, pid=None,
+                           finished_utc=utc_now_iso(),
+                           error="" if state == "done" else
+                           f"run ended with status '{status or 'unknown'}' "
+                           "(converged after worker restart)")
+        index.reconcile(conn, cfg.results_dir)
+        queries.audit(conn, None, f"job_{state}", target=job["run_id"] or f"job:{job_id}",
+                      detail="converged by re-attach after worker restart")
+    except Exception:  # noqa: BLE001 — a re-attach failure must not kill the worker
+        pass
+    finally:
+        conn.close()
 
 
 def _run_job_threaded(cfg: Config, store: SecretStore, job_id: int) -> None:

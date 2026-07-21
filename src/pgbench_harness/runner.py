@@ -420,6 +420,40 @@ def _live_sweep_callback(
     return _cb
 
 
+DISK_ABORT_BYTES = 500 * 1024 * 1024
+DISK_WARN_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _disk_guard(run_dir: Path, logger: logging.Logger,
+                warned: dict) -> None:
+    """Free-space check between segments/levels: a long run on a filling
+    volume must stop CLEANLY with a clear reason (results to date remain
+    valid and reportable) rather than corrupt its artifacts at ENOSPC."""
+    free = shutil.disk_usage(run_dir).free
+    if free < DISK_ABORT_BYTES:
+        raise RunError(
+            f"results volume has only {free // 1048576} MB free — stopping the "
+            "run before artifacts get corrupted",
+            hint="free disk space (old runs, logs) and resume/re-run; results "
+                 "written so far are intact and reportable.")
+    if free < DISK_WARN_BYTES and not warned.get("disk"):
+        warned["disk"] = True
+        logger.warning("results volume is low on space (%d MB free) — the run "
+                       "continues but will stop cleanly under %d MB",
+                       free // 1048576, DISK_ABORT_BYTES // 1048576)
+
+
+def _level_watchdog_s(duration_s: int) -> float:
+    """Wall-clock ceiling for one benchmark cell: the configured duration plus
+    a grace for connect/summary/histogram. A hung child (connected but silent)
+    must never freeze an hours-long run — the watchdog kills it, the level is
+    marked failed, and the sweep continues. Grace is env-tunable for tests."""
+    import os as _os
+    grace = float(_os.environ.get("PGB_LEVEL_WATCHDOG_GRACE_S", "0") or 0) \
+        or max(120.0, duration_s * 0.5)
+    return duration_s + grace
+
+
 def _execute_level(
     spec: Spec, password: str, run_dir: Path, manifest: Manifest,
     lvl: Level, logger: logging.Logger, live: Optional[IncrementalCsvWriter] = None,
@@ -438,7 +472,8 @@ def _execute_level(
     logger.info("level %s: %s", lvl.key, cmd.display())
     rc = sysbench.run_streaming(
         cmd, sysbench.child_env(spec, password), run_dir / raw_rel, logger,
-        on_line=_live_sweep_callback(live, manifest.run_id, lvl))
+        on_line=_live_sweep_callback(live, manifest.run_id, lvl),
+        timeout_s=_level_watchdog_s(spec.sweep.duration_s))
     lvl.exit_code = rc
     lvl.finished_utc = utc_now_iso()
     if spec.capture.bgwriter_stats:
@@ -678,6 +713,7 @@ def _soak_supervisor(
     seg = relaunches = total_intervals = 0
     consecutive_short = consecutive_zero_sample = 0
     prev_rate_idx = -1
+    disk_warned: dict = {}
     last_excerpt = ""
 
     # Shared-clock anchor for the live per-second writer. Timeline events are NOT
@@ -718,6 +754,7 @@ def _soak_supervisor(
                 seg_time = max(1, min(remaining,
                                       (idx + 1) * soak.step_duration_s - elapsed))
             seg += 1
+            _disk_guard(run_dir, logger, disk_warned)
             if soak.rate_steps and idx != prev_rate_idx:
                 # planned step transition, not a crash — stamp it for the report
                 _append_event(run_dir, "note",
@@ -961,7 +998,9 @@ def _sweep(
     done = len(manifest.levels) - len(pending)
     if done:
         logger.info("resume: %d level(s) already completed, %d remaining", done, len(pending))
+    warned: dict = {}
     for i, lvl in enumerate(pending):
+        _disk_guard(run_dir, logger, warned)
         _execute_level(spec, password, run_dir, manifest, lvl, logger, live=live)
         if i < len(pending) - 1 and spec.sweep.cooldown_s > 0:
             logger.info("cooldown %ds ...", spec.sweep.cooldown_s)
@@ -1112,7 +1151,8 @@ def _execute_pgbench_level(
         select_only=(lvl.seg == "pgbench_select"))
     logger.info("level %s: %s", lvl.key, cmd.display())
     rc = sysbench.run_streaming(cmd, sysbench.child_env(spec, password),
-                                run_dir / raw_rel, logger)
+                                run_dir / raw_rel, logger,
+                                timeout_s=_level_watchdog_s(spec.suite.duration_s))
     lvl.exit_code = rc
     lvl.finished_utc = utc_now_iso()
     if spec.capture.io_stats:
@@ -1210,7 +1250,9 @@ def cmd_suite(spec_path: Path, results_dir: Path, dry_run: bool = False,
     pgbench_ready = False
     try:
         pending = manifest.pending_levels()
+        disk_warned: dict = {}
         for i, lvl in enumerate(pending):
+            _disk_guard(run_dir, logger, disk_warned)
             _append_event(run_dir, "note", f"segment {lvl.seg} c{lvl.threads}",
                           "suite cell start", "auto")
             if lvl.seg.startswith("pgbench"):
@@ -1219,7 +1261,8 @@ def cmd_suite(spec_path: Path, results_dir: Path, dry_run: bool = False,
                     logger.info("pgbench init: %s", init.display())
                     rc = sysbench.run_streaming(
                         init, sysbench.child_env(spec, password),
-                        run_dir / "raw" / "pgbench_init.log", logger)
+                        run_dir / "raw" / "pgbench_init.log", logger,
+                        timeout_s=7200)
                     if rc != 0:
                         raise RunError(f"pgbench -i failed (exit {rc}) — see "
                                        "raw/pgbench_init.log")

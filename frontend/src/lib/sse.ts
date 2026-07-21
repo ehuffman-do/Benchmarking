@@ -23,7 +23,28 @@ export interface SampleBatch {
   file: string;
   header: string;
   offset: number;
+  reset?: boolean;   // first batch of a (re)connected stream: rebuild buffers
   rows: string[];
+}
+
+// Rolling in-memory cap for the live charts: the browser keeps the most
+// recent window; the full series always lives in the CSVs and the report.
+export const LIVE_POINT_CAP = 21600;
+
+export function trimSeries(s: Series): void {
+  const over = s.t.length - LIVE_POINT_CAP;
+  if (over <= 0) return;
+  for (const k of Object.keys(s) as (keyof Series)[]) {
+    (s[k] as number[]).splice(0, over);
+  }
+}
+
+export function trimPg(s: PgSeries): void {
+  const over = s.t.length - LIVE_POINT_CAP;
+  if (over <= 0) return;
+  for (const k of Object.keys(s) as (keyof PgSeries)[]) {
+    (s[k] as number[]).splice(0, over);
+  }
 }
 
 export interface StreamHandlers {
