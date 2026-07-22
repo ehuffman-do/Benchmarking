@@ -16,6 +16,13 @@ every ~30–45 minutes at any load level. Root-causing surfaced three distinct p
 
 > **Images** live in `img/longevity/`
 
+Graphs:
+PMM [Snapshot](https://64.227.81.160/graph/dashboard/snapshot/AvUhHmzZ2NHPY6wxKRLNl1CngWFAwhpn?orgId=0&from=2026-07-21T21:33:35.548Z&to=2026-07-22T21:33:35.548Z&timezone=browser&var-interval=$__auto&var-region=$__all&var-node_type=$__all&var-environment=$__all&var-node_name=$__all&var-service_name=$__all&var-database=$__all&var-service_type=$__all&var-cluster=$__all&var-replication_set=$__all&var-username=$__all&var-schema=$__all) covering both failed and successful tests
+
+Harness Runs: Working on Way to group and present these
+
+Insights: [link](https://cloud.digitalocean.com/api/v1/insights/cartographer/dashboard/script/dbaas-percona-postgres-overview.js?theme=dark&from=now-24h&to=now&idate=true&hideTimeControls=true&service=ehuff-long-a-adv-pg-sfo2&host_id=ehuff-long-a-adv-pg-sfo2&dbaas_uuid=62f3e0e7-a515-4c7a-9151-d7ced74356be&contextId=62d6a306-5803-4560-ab6e-c4e4254883db) probably only works on DO vpn 
+
 ---
 
 ## Finding 1 — Database pods ran as BestEffort: node-pressure eviction loop
