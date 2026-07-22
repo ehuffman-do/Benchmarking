@@ -52,6 +52,12 @@ TOKEN_ENV = "PGB_PMM_TOKEN"
 
 PAIRINGS = {"pgstatmonitor": "pg_stat_monitor", "pgstatements": "pg_stat_statements"}
 
+# The PGO CRD's spec.pmm.querySource enum ("pgstatstatements") differs from
+# pmm-admin's --query-source vocabulary ("pgstatements"), which is what the
+# QAN agent names and prerun checks below use. Translate only at the CR patch.
+CR_QUERY_SOURCE = {"pgstatmonitor": "pgstatmonitor",
+                   "pgstatements": "pgstatstatements"}
+
 
 def _cfg(params: dict[str, Any]) -> dict[str, Any]:
     """Normalize the pmm params with the reference script's defaults."""
@@ -610,7 +616,8 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
             return {"spec": {
                 "pmm": {"enabled": True, "image": cfg["client_image"],
                         "imagePullPolicy": "IfNotPresent",
-                        "querySource": cfg["query_source"],
+                        "querySource": CR_QUERY_SOURCE.get(
+                            cfg["query_source"], cfg["query_source"]),
                         "secret": secret_name, "serverHost": cfg["server_host"]},
                 "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {
                     "shared_preload_libraries": spl}}}}}}
