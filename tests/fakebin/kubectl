@@ -84,7 +84,7 @@ def default_state():
                         "full": "0 0 * * *", "differential": "0 */6 * * *",
                         "incremental": "0 * * * *"}}]}},
             }},
-        "pending_restart": [],
+        "pending_restart": [], "roll_until": 0,
         "extensions": ["pgaudit"], "pmm_roll": {}, "pmm_secret": "",
     }
 
@@ -163,6 +163,20 @@ def maybe_elect(st):
         save(st)
 
 
+def rolling(st):
+    """Is the operator's rolling restart (FAKE_KUBE_ROLL_OUTAGE_S) in flight?"""
+    return st.get("roll_until", 0) and now() < st["roll_until"]
+
+
+def settle_roll(st):
+    """Finish a simulated rolling restart: leader back, pending flags clear."""
+    if st.get("roll_until", 0) and now() >= st["roll_until"]:
+        st["roll_until"] = 0
+        st["pending_restart"] = []
+        st["tl"] += 1
+        save(st)
+
+
 def out(s=""):
     sys.stdout.write(s if s.endswith("\n") or not s else s + "\n")
 
@@ -215,23 +229,41 @@ def pod_json(st, name, kind):
     inst = next((i for i in st["instances"] if i["name"] == name), None)
     node = inst["node"] if inst else "node-9"
     ip = inst["ip"] if inst else "10.244.1.9"
-    starting = (kind == "instance" and name == st["leader"]
-                and leader_state(st) == "starting")
+    starting = (kind == "instance"
+                and ((name == st["leader"] and leader_state(st) == "starting")
+                     or rolling(st)))
     ready = alive and not starting
     # UID changes when the pod is recreated: the PMM roll and every delete.
     uid = f"uid-{name}-{'pmm' if rolled else 'base'}-{int(st['deleted'].get(name, 0))}"
     volumes = ([{"name": "postgres-data",
                  "persistentVolumeClaim": {"claimName": f"{name}-pgdata"}}]
                if kind == "instance" else [])
+    statuses = []
+    for c in containers:
+        cs = {"name": c["name"], "ready": ready, "restartCount": 0}
+        # FAKE_KUBE_OOM: the database container was OOM-killed recently —
+        # exercises the health module's pod_oomkilled finding.
+        if (os.environ.get("FAKE_KUBE_OOM") and kind == "instance"
+                and c["name"] == "database"):
+            cs["restartCount"] = 4
+            cs["lastState"] = {"terminated": {
+                "reason": "OOMKilled", "exitCode": 137,
+                "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime(now() - 120))}}
+        statuses.append(cs)
+    limits = ({"memory": os.environ["FAKE_KUBE_MEM_LIMIT"]}
+              if os.environ.get("FAKE_KUBE_MEM_LIMIT") else {})
+    if limits:
+        for c in containers:
+            if c["name"] == "database":
+                c["resources"] = {"limits": dict(limits)}
     return {
         "metadata": {"name": name, "namespace": "percona", "uid": uid,
                      "labels": labels},
         "spec": {"nodeName": node, "containers": containers,
                  "volumes": volumes},
         "status": {"phase": "Running" if alive else "Pending", "podIP": ip,
-                   "containerStatuses": [{"name": c["name"], "ready": ready,
-                                          "restartCount": 0}
-                                         for c in containers]},
+                   "containerStatuses": statuses},
     }
 
 
@@ -252,6 +284,15 @@ def patronictl_list(st):
         if not pod_alive(st, i["name"]):
             continue
         is_leader = i["name"] == st["leader"]
+        if rolling(st):
+            # A restart-required change is rolling through: no leader,
+            # members restarting — the state the verify poller must survive.
+            m = {"Cluster": f"{st['cluster']}-ha", "Member": i["name"],
+                 "Host": i["ip"], "Role": "Replica", "State": "start failed"
+                 if os.environ.get("FAKE_KUBE_FATAL_LOG") else "starting",
+                 "TL": st["tl"]}
+            members.append(m)
+            continue
         m = {"Cluster": f"{st['cluster']}-ha", "Member": i["name"], "Host": i["ip"],
              "Role": "Leader" if is_leader else "Replica",
              "State": leader_state(st) if is_leader else "streaming",
@@ -372,6 +413,12 @@ PG_CATALOG = {
     "random_page_cost": ("4", None, "real", "0", "1.79769e+308", None,
                          "user", "Query Tuning / Planner Cost Constants",
                          "Sets the planner's estimate of the cost of a nonsequentially fetched disk page."),
+    "huge_pages": ("try", None, "enum", None, None, ["off", "on", "try"],
+                   "postmaster", "Resource Usage / Memory",
+                   "Use of huge pages on Linux or Windows."),
+    "shared_preload_libraries": ("pgaudit", None, "string", None, None, None,
+                                 "postmaster", "Client Connection Defaults / Shared Library Preloading",
+                                 "Lists shared libraries to preload into server."),
     "archive_command": ("pgbackrest --stanza=db archive-push \"%p\"", None,
                         "string", None, None, None,
                         "sighup", "Write-Ahead Log / Archiving",
@@ -387,6 +434,31 @@ PG_CATALOG = {
 DIAG_SEP = "\x1f"
 
 
+_UNIT_FACTORS = {"B": 1, "kB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3,
+                 "TB": 1024 ** 4, "ms": 1, "s": 1000, "min": 60000,
+                 "h": 3600000, "d": 86400000}
+
+
+def normalize_setting(raw, unit):
+    """Like the real server: pg_settings.setting is the base-unit NUMBER even
+    when the config wrote '8GB' or '900s'."""
+    import re as _re
+    s = str(raw)
+    if not unit:
+        return s
+    m = _re.match(r"^(\d+(?:\.\d+)?)\s*([A-Za-z]+)$", s)
+    if not m:
+        return s
+    um = _re.match(r"^(\d+)?\s*([A-Za-z]+)$", str(unit))
+    if not um:
+        return s
+    base = int(um.group(1) or 1) * _UNIT_FACTORS.get(um.group(2), 0)
+    vfac = _UNIT_FACTORS.get(m.group(2), 0)
+    if not base or not vfac:
+        return s
+    return str(int(float(m.group(1)) * vfac / base))
+
+
 def pg_catalog_rows(st):
     """pg_settings rows (dicts) for the json_agg catalog query."""
     params = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]
@@ -394,7 +466,7 @@ def pg_catalog_rows(st):
     rows = []
     for name in sorted(PG_CATALOG):
         setting, unit, vartype, mn, mx, enums, context, cat, desc = PG_CATALOG[name]
-        live = str(params.get(name, setting))
+        live = normalize_setting(params.get(name, setting), unit)
         rows.append({
             "name": name, "setting": live, "unit": unit, "vartype": vartype,
             "min_val": mn, "max_val": mx, "enumvals": enums, "context": context,
@@ -711,21 +783,23 @@ def handle_exec(st, pod, argv):
     if argv[0] == "grep" and "/etc/pgbouncer" in joined:
         gl = (st["cr"]["spec"].get("proxy", {}).get("pgBouncer", {})
               .get("config", {}).get("global", {}))
-        hits = [f"{k} = {v}" for k, v in sorted(gl.items())]
-        if hits:
-            out("\n".join(hits))
-            return 0
-        return 1
+        # Real pgbouncer.ini: [databases] first, then [pgbouncer] globals —
+        # the section-aware verifier must skip the [databases] entries.
+        hits = ["[databases]", "defaultdb = host=cluster1-primary port=5432",
+                "[pgbouncer]"] + [f"{k} = {v}" for k, v in sorted(gl.items())]
+        out("\n".join(hits))
+        return 0
     if argv[0] == "grep" or (argv[0] == "bash" and "grep" in joined
                              and "pgbackrest" in joined):
         gl = st["cr"]["spec"]["backups"]["pgbackrest"].get("global", {})
-        hits = [f"/etc/pgbackrest/conf.d/~postgres-operator_server.conf:{k}={v}"
-                for k, v in sorted(gl.items())
-                if k in ("process-max", "archive-async", "spool-path")]
-        if hits:
-            out("\n".join(hits))
-            return 0
-        return 1
+        conf = "/etc/pgbackrest/conf.d/~postgres-operator_server.conf"
+        # Section-anchored render: a [db] stanza key must never satisfy a
+        # [global] check (and vice versa).
+        hits = [f"{conf}:[db]", f"{conf}:pg1-path=/pgdata/pg18",
+                f"{conf}:[global]"] + \
+               [f"{conf}:{k}={v}" for k, v in sorted(gl.items())]
+        out("\n".join(hits))
+        return 0
     if "archive_status" in joined:                # queue-depth sampler
         out(str(archive_queue_depth(st)))
         return 0
@@ -795,7 +869,17 @@ def handle_logs(st, pod, follow):
                  if pod == st["leader"] else
                  f"INFO: no action. I am ({pod}), a secondary, and following "
                  f"a leader ({st['leader']})"]
-        if st["killed_at"] and pod == st["leader"]:
+        if os.environ.get("FAKE_KUBE_FATAL_LOG") or rolling(st):
+            lines = [
+                "INFO: starting instance",
+                "FATAL:  could not map anonymous shared memory: Cannot "
+                "allocate memory",
+                "HINT:  This error usually means that PostgreSQL's request "
+                "for a shared memory segment exceeded available memory.",
+                "INFO: postmaster start failed",
+            ] if os.environ.get("FAKE_KUBE_FATAL_LOG") else \
+                ["INFO: restarting after config change", "INFO: starting instance"]
+        elif st["killed_at"] and pod == st["leader"]:
             lines = ["WARNING: Postgres is not running.",
                      "INFO: starting as readonly because i had the session lock",
                      "INFO: establishing a new patroni heartbeat connection to postgres",
@@ -841,6 +925,7 @@ def main():
     st = load()
     maybe_elect(st)
     settle_manual(st)
+    settle_roll(st)
     st = load()
     cmd = args[0]
 
@@ -1102,6 +1187,14 @@ def main():
                    .get("dynamicConfiguration", {}).get("postgresql", {})
                    .get("parameters", {}) or {})
         st["pending_restart"] = [p for p in touched if p in pend.split(",")]
+        # FAKE_KUBE_ROLL_OUTAGE_S: a restart-required patch makes the operator
+        # roll every pod — the cluster is leaderless (members restarting) for
+        # N seconds, then recovers with the pending flags cleared. This is the
+        # huge_pages-incident timeline in miniature.
+        roll_s = float(os.environ.get("FAKE_KUBE_ROLL_OUTAGE_S", "0"))
+        if touched and roll_s:
+            st["roll_until"] = now() + roll_s
+            st["pending_restart"] = sorted(touched)
         st["cr"]["metadata"]["generation"] += 1
         save(st)
         (STATE_DIR / "patches.log").open("a").write(json.dumps(patch) + "\n")

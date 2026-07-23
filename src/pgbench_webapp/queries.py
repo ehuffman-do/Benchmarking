@@ -279,7 +279,7 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 KUBE_TARGET_FIELDS = ("name", "kubeconfig_path", "kubeconfig_ref", "context", "namespace",
                       "cr_kind", "cr_name", "pguser_secret", "pguser_secret_key",
-                      "db_user", "db_name")
+                      "db_user", "db_name", "auto_health_s")
 
 
 def create_kube_target(conn: sqlite3.Connection, **fields: Any) -> int:

@@ -129,6 +129,8 @@ elif "show server_version" in low:
     print("16.4")
 elif "show max_connections" in low:
     print("500")
+elif "show shared_preload_libraries" in low:
+    print(os.environ.get("FAKE_PSQL_SPL", "pg_stat_statements"))
 elif "show search_path" in low:
     print('"$user", public')
 elif "show pool_mode" in low:

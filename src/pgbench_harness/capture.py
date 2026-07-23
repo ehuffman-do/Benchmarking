@@ -711,15 +711,33 @@ def preflight_steps(spec: Spec, password: str,
     except Exception as exc:  # noqa: BLE001
         yield ev("Pooler probe", "info", str(exc))
     try:
+        # Snapshotting the view is read-only and harmless — but the PRELOAD
+        # LIBRARY is not: pg_stat_monitor showed sustained memory growth that
+        # took down multi-hour tests (field report 2026-07-22). Surface a
+        # warning whenever it is loaded, independent of capture settings.
+        spl_advisory = ""
+        try:
+            spl = psql_query(spec, password, "SHOW shared_preload_libraries")
+            if "pg_stat_monitor" in (spl or ""):
+                spl_advisory = (" NOTE: pg_stat_monitor is in "
+                                "shared_preload_libraries — known memory-growth "
+                                "issue under sustained load (verified 2026-07 on "
+                                "long TPC-C runs); prefer pg_stat_statements "
+                                "for multi-hour tests.")
+        except Exception:  # noqa: BLE001 — advisory only
+            pass
         if detect_pg_stat_monitor(spec, password):
-            yield ev("pg_stat_monitor", "ok", "enabled (per-query latency/calls captured)")
+            yield ev("pg_stat_monitor", "warn" if spl_advisory else "ok",
+                     "enabled (per-query latency/calls captured)." + spl_advisory)
         else:
             ok, detail = enable_pg_stat_monitor(spec, password)
             if ok and detect_pg_stat_monitor(spec, password):
-                yield ev("pg_stat_monitor", "ok", "was disabled — enabled it now")
+                yield ev("pg_stat_monitor", "warn" if spl_advisory else "ok",
+                         "was disabled — enabled it now." + spl_advisory)
             else:
-                yield ev("pg_stat_monitor", "warn",
-                         f"not enabled and could not enable it ({detail})")
+                yield ev("pg_stat_monitor", "info",
+                         f"not enabled ({detail}) — per-query capture will "
+                         "come from pg_stat_statements if available")
     except Exception as exc:  # noqa: BLE001
         yield ev("pg_stat_monitor", "warn", str(exc))
     try:

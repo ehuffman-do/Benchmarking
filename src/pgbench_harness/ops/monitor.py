@@ -39,6 +39,7 @@ MONITOR_HEADER = ("epoch_s,leader,timeline,wal_bytes,ckpt_timed,ckpt_req,"
                   "archived_count,archive_failed,archive_queue,ready,total")
 REPL_HEADER = "epoch_s,replica,state,lag_bytes,lag_s"
 DISK_HEADER = "epoch_s,pod,pgdata_used,pgdata_use_pct"
+MEM_HEADER = "epoch_s,pod,working_set_bytes,mem_limit_bytes,restarts,oom_events"
 
 
 def _append(path: Path, header: str, row: str) -> None:
@@ -61,6 +62,68 @@ def _one(kube: Kube, pod: str, sql: str) -> list[str]:
     return []
 
 
+def _mem_to_bytes(v: str) -> str:
+    from pgbench_harness.ops.paramcheck import _mem_to_bytes as conv
+    b = conv(v)
+    return str(int(b)) if b else ""
+
+
+def sample_memory(kube: Kube, cr_name: str,
+                  prev: dict[str, tuple[int, int]]) -> tuple[list[str], list[str]]:
+    """Per-member memory/restart telemetry rows + OOM/restart event notes.
+
+    Sources: pod containerStatuses (restart count, lastState OOMKilled) and
+    kubectl top (working set; degrades to blank when metrics-server is
+    absent). *prev* carries (restarts, oom_count) per pod across cycles so a
+    counter INCREMENT emits an event — the automatic run marker that lets a
+    soak report correlate a throughput gap with the kill."""
+    rows: list[str] = []
+    notes: list[str] = []
+    ts = str(int(time.time()))
+    try:
+        items = kube.json(["get", "pods"]).get("items") or []
+    except KubeError:
+        return rows, notes
+    tops: dict[str, str] = {}
+    try:
+        res = kube.run(["top", "pods", "--no-headers"], timeout_s=15)
+        if res.ok:
+            for ln in res.stdout.splitlines():
+                parts = ln.split()
+                if len(parts) >= 3:
+                    tops[parts[0]] = _mem_to_bytes(parts[2])
+    except KubeError:
+        pass
+    for item in items:
+        name = (item.get("metadata") or {}).get("name", "")
+        if cr_name and not name.startswith(cr_name):
+            continue
+        cs = (item.get("status") or {}).get("containerStatuses") or []
+        restarts = sum(int(c.get("restartCount") or 0) for c in cs)
+        oom = sum(1 for c in cs
+                  if str(((c.get("lastState") or {}).get("terminated") or {})
+                         .get("reason") or "") == "OOMKilled"
+                  or int(((c.get("lastState") or {}).get("terminated") or {})
+                         .get("exitCode") or 0) == 137)
+        limit = ""
+        for c in ((item.get("spec") or {}).get("containers") or []):
+            lim = (((c.get("resources") or {}).get("limits") or {})
+                   .get("memory"))
+            if lim and c.get("name") in ("database", "pgbouncer", "pgbackrest"):
+                limit = _mem_to_bytes(str(lim))
+                break
+        rows.append(f"{ts},{name},{tops.get(name, '')},{limit},{restarts},{oom}")
+        if name in prev:
+            p_restarts, p_oom = prev[name]
+            if restarts > p_restarts:
+                notes.append(f"{name}: restart count {p_restarts} -> {restarts}"
+                             + (" (OOMKilled)" if oom > p_oom else ""))
+            elif oom > p_oom:
+                notes.append(f"{name}: container OOM-killed")
+        prev[name] = (restarts, oom)
+    return rows, notes
+
+
 def run_monitor(spec: OpsSpec, results_dir: Path) -> int:
     t = spec.target
     params = spec.params
@@ -76,6 +139,7 @@ def run_monitor(spec: OpsSpec, results_dir: Path) -> int:
     started = time.monotonic()
     cycles = 0
     ckpt_sql = CKPT_SQL_17
+    mem_prev: dict[str, tuple[int, int]] = {}
     run.event("monitor", "telemetry monitor started",
               f"interval {interval_s:.0f}s")
     try:
@@ -144,6 +208,15 @@ def run_monitor(spec: OpsSpec, results_dir: Path) -> int:
                                     f"{ts},{pod},{used},{pct}")
                     except KubeError:
                         continue
+            # Memory/restart telemetry runs even when there is no leader —
+            # an OOM crash-loop is exactly when the leader view is gone.
+            mem_rows, oom_notes = sample_memory(kube, t.cr_name, mem_prev)
+            for mr in mem_rows:
+                _append(parsed / "memory.csv", MEM_HEADER, mr)
+            for note in oom_notes:
+                # A run event the instant a restart/OOM appears: soak reports
+                # get an automatic marker to correlate with throughput gaps.
+                run.event("oom", "container restart/OOM detected", note)
             _append(parsed / "monitor.csv", MONITOR_HEADER,
                     f"{ts},{leader},{timeline if timeline is not None else ''},"
                     f"{row['wal']},{row['ckpt_t']},{row['ckpt_r']},"

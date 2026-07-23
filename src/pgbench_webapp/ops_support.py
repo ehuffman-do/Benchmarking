@@ -32,6 +32,7 @@ OPS_KINDS: dict[str, str] = {
     "ops_backup": "backup",
     "ops_scenario": "scenario",
     "ops_monitor": "monitor",
+    "ops_logs": "logs",
     "ops_pg_params": "pg-params",
     "ops_diag": "diag",
     "ops_health": "health",
@@ -41,8 +42,8 @@ OPS_KINDS: dict[str, str] = {
     "ops_pmm_disable": "pmm-disable",
 }
 RUN_DIR_KINDS = ("ops_cr_apply", "ops_backup", "ops_scenario", "ops_monitor",
-                 "ops_diag", "ops_operate", "ops_pmm_enable", "ops_pmm_status",
-                 "ops_pmm_disable")
+                 "ops_logs", "ops_diag", "ops_operate", "ops_pmm_enable",
+                 "ops_pmm_status", "ops_pmm_disable")
 
 SUMMARY_MARKER = "OPS_SUMMARY_JSON"
 TOPOLOGY_MARKER = "OPS_TOPOLOGY_JSON"
@@ -345,19 +346,71 @@ def _disk_trend_finding(history: list[sqlite3.Row],
             "action": {"type": "diag", "checks": ["pvc_usage", "slots"]}}
 
 
+def _mem_trend_finding(history: list[sqlite3.Row],
+                       now_mb: Optional[float]) -> Optional[dict[str, Any]]:
+    """Sustained monotonic growth of the max container working set — the
+    signature of a slow leak (pg_stat_monitor, 2026-07: killed a multi-hour
+    test before any threshold fired). Warn when the least-squares slope
+    exceeds ~100 MB/h across at least 6 samples and the latest sample is
+    near the top of the observed range."""
+    import time as _time
+    from datetime import datetime, timezone
+    pts: list[tuple[float, float]] = []
+    for row in reversed(history):        # oldest -> newest
+        try:
+            m = json.loads(row["metrics"] or "{}")
+            mb = m.get("mem_ws_mb_max")
+            if mb is None:
+                continue
+            ts = datetime.strptime(row["ts_utc"], "%Y-%m-%dT%H:%M:%SZ")
+            pts.append((ts.replace(tzinfo=timezone.utc).timestamp(), float(mb)))
+        except (ValueError, KeyError, TypeError):
+            continue
+    if now_mb is not None:
+        pts.append((_time.time(), float(now_mb)))
+    if len(pts) < 6:
+        return None
+    xs = [p[0] / 3600 for p in pts]      # hours
+    ys = [p[1] for p in pts]
+    n = len(pts)
+    mx, my = sum(xs) / n, sum(ys) / n
+    denom = sum((x - mx) ** 2 for x in xs)
+    if denom == 0:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom  # MB/h
+    if slope < 100 or ys[-1] < max(ys) * 0.95:
+        return None
+    return {"id": "mem_leak_suspect", "severity": "warn",
+            "title": "Container memory growing steadily",
+            "value": f"+{slope:.0f} MB/h over {n} samples "
+                     f"(now {ys[-1]:.0f} MB)",
+            "detail": "Sustained monotonic working-set growth is the "
+                      "signature of a slow leak — left alone it ends in an "
+                      "OOM kill mid-run.",
+            "remediation": "If pg_stat_monitor is in "
+                           "shared_preload_libraries, switch the query "
+                           "source to pg_stat_statements (known leak, "
+                           "2026-07); otherwise inspect long-lived backends "
+                           "and extension memory.",
+            "action": {"type": "diag", "checks": ["pods"]}}
+
+
 def _record_health(cfg: Config, conn: sqlite3.Connection, kt_id: int,
                    health: dict[str, Any]) -> None:
-    """Cache the health doc, append history, inject the trend finding, and
+    """Cache the health doc, append history, inject the trend findings, and
     fire a notification on a status transition."""
     prev = queries.list_health_history(conn, kt_id, limit=60)
     prev_status = prev[0]["status"] if prev else None
 
     metrics = health.get("metrics") or {}
-    trend = _disk_trend_finding(prev, metrics.get("disk_pct_max"))
-    if trend is not None:
+    synthetic = [t for t in (
+        _disk_trend_finding(prev, metrics.get("disk_pct_max")),
+        _mem_trend_finding(prev, metrics.get("mem_ws_mb_max"))) if t]
+    if synthetic:
+        drop = {t["id"] for t in synthetic}
         findings = [f for f in (health.get("findings") or [])
-                    if f.get("id") != "disk_trend"]
-        findings.insert(0, trend)
+                    if f.get("id") not in drop]
+        findings = synthetic + findings
         health["findings"] = findings
         worst = max((SEVERITY_ORDER.index(f["severity"])
                      if f.get("severity") in SEVERITY_ORDER else 0
