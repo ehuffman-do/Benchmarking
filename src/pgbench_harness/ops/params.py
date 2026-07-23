@@ -215,6 +215,32 @@ def run_pg_params(spec: OpsSpec) -> int:
     ver = kube.psql(leader, "SHOW server_version")
     if ver.ok:
         payload["pg_version"] = ver.stdout.strip()
+
+    # Locked-set drift audit: the PATRONI_LOCKED/OPERATOR_LOCKED sets were
+    # verified against Patroni's source at one point in time and drift with
+    # releases. Cross-check classification against the OBSERVED source on the
+    # live server: Patroni's force-set params surface as source='command line'
+    # (CMDLINE_OPTIONS), so a 'cr'-classified param showing 'command line' is
+    # a param Patroni actually owns — and a locked one showing a config-file
+    # source suggests the lock no longer applies. Warning only, never fatal.
+    drift = []
+    for p in payload["params"]:
+        src = str(p.get("source") or "")
+        if p["channel"] == "cr" and src == "command line":
+            drift.append(f"{p['name']} (classified 'cr' but source=command "
+                         "line — Patroni appears to force it)")
+        elif p["channel"] == "patroni-locked" \
+                and src in ("configuration file", "database", "user"):
+            drift.append(f"{p['name']} (classified patroni-locked but "
+                         f"source={src} — the lock may have been lifted)")
+    payload["channel_drift"] = drift
+    if drift:
+        _check("channel-drift", "warn",
+               "classification disagrees with observed pg_settings.source for "
+               + ", ".join(d.split(" ")[0] for d in drift[:6])
+               + (f" (+{len(drift) - 6} more)" if len(drift) > 6 else "")
+               + " — the locked sets may have drifted with a Patroni/operator "
+                 "release")
     n_mod = sum(1 for p in payload["params"]
                 if p["source"] not in ("default", None))
     n_pend = sum(1 for p in payload["params"] if p["pending_restart"])

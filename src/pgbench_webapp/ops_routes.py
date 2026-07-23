@@ -11,6 +11,7 @@ executes.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -206,6 +207,11 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
             ("cr_kind", "perconapgcluster"), ("cr_name", ""),
             ("pguser_secret", ""), ("pguser_secret_key", "password"),
             ("db_user", "doadmin"), ("db_name", "defaultdb"))}
+        # Auto-health defaults ON (15 min) so the registry badge reflects the
+        # CURRENT cluster, not the state at registration time — a frozen
+        # 'crit' badge against a recovered cluster misdirected an incident
+        # response (2026-07-23). 0 disables per target.
+        fields["auto_health_s"] = 900
         tid = queries.create_kube_target(conn, name=name, kubeconfig_path=path,
                                          kubeconfig_ref=ref, **fields)
         queries.audit(conn, user["username"], "kube_target_create", target=name,
@@ -585,6 +591,47 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
                         "crit": r["crit"], "warn": r["warn"], "metrics": metrics})
         return JSONResponse({"history": out})
 
+    @app.post("/api/kube-targets/{target_id}/logs")
+    def ops_logs_start(target_id: int, request: Request, payload: dict,
+                       conn: sqlite3.Connection = Depends(get_conn),
+                       user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """Start a log-follow op (the Logs tab backend). Read-only on the
+        cluster, so operator role and no confirmation; one per target at a
+        time so a re-tune of the selection replaces the previous follower."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        params = _params(payload)
+        srcs = params.get("sources")
+        if srcs is not None:
+            if not isinstance(srcs, list) or not all(
+                    isinstance(s, dict) and s.get("pod") for s in srcs):
+                raise HTTPException(400, "'sources' must be a list of "
+                                         "{pod, container} objects")
+        try:
+            tail = int(params.get("tail") or 1000)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "'tail' must be an integer")
+        if not 10 <= tail <= 20000:
+            raise HTTPException(400, "'tail' must be between 10 and 20000")
+        since = str(params.get("since") or "")
+        if since and not re.fullmatch(r"\d+[smh]", since):
+            raise HTTPException(400, "'since' must look like 15m / 1h / 90s")
+        job_id = _enqueue_ops(conn, kt, "logs", params,
+                              payload.get("label") or f"logs-{kt['name']}",
+                              user["username"], ("ops_logs",))
+        return JSONResponse({"job_id": job_id})
+
+    @app.get("/ops/runs/{op_run_id}/logs-stream")
+    def ops_logs_stream(op_run_id: str,
+                        user: sqlite3.Row = Depends(require("viewer"))) -> StreamingResponse:
+        """SSE tail of every raw/logs_*.log capture file in the run dir —
+        the browser-facing half of the Logs tab (the op writes, this reads)."""
+        run_dir = _op_run_dir(op_run_id)
+        return StreamingResponse(_logs_sse(run_dir),
+                                 media_type="text/event-stream")
+
     @app.post("/api/kube-targets/{target_id}/monitor")
     def ops_monitor_start(target_id: int, request: Request, payload: dict,
                           conn: sqlite3.Connection = Depends(get_conn),
@@ -725,6 +772,67 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
         if not p.exists():
             raise HTTPException(404, "no timeline for this run")
         return PlainTextResponse(p.read_text(encoding="utf-8"))
+
+
+def _logs_sse(run_dir: Path, max_ticks: int = 12 * 3600) -> Iterator[str]:
+    """Tail every ``raw/logs_*.log`` file with per-file offsets.
+
+    Events: ``hello`` (sources manifest from status.json), ``lines``
+    ({file, lines: [...]}) for each new complete-line chunk, ``done`` when
+    the run turns terminal. Only \\n-terminated lines are emitted so a line
+    read mid-append is never split across events."""
+    from pgbench_webapp.app import _event
+
+    raw = run_dir / "raw"
+    sent: dict[str, int] = {}
+    status_path = run_dir / "status.json"
+    sources: Any = None
+    if status_path.exists():
+        try:
+            sources = json.loads(status_path.read_text(encoding="utf-8")).get("sources")
+        except (OSError, ValueError):
+            sources = None
+    meta = read_meta(run_dir) or {}
+    yield _event("hello", {"op_run_id": run_dir.name,
+                           "status": meta.get("status", ""),
+                           "sources": sources})
+    for _ in range(max_ticks):
+        if sources is None and status_path.exists():
+            try:
+                sources = json.loads(status_path.read_text(encoding="utf-8")).get("sources")
+                if sources is not None:
+                    yield _event("sources", sources)
+            except (OSError, ValueError):
+                pass
+        if raw.is_dir():
+            for p in sorted(raw.glob("logs_*.log")):
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    continue
+                offset = sent.get(p.name, 0)
+                if size <= offset:
+                    continue
+                try:
+                    with open(p, "rb") as fh:
+                        fh.seek(offset)
+                        data = fh.read(min(size - offset, 512 * 1024))
+                except OSError:
+                    continue
+                nl = data.rfind(b"\n")
+                if nl < 0:
+                    continue
+                lines = data[:nl].decode("utf-8", "replace").split("\n")
+                sent[p.name] = offset + nl + 1
+                # bound each event so one chatty container can't starve others
+                for i in range(0, len(lines), 500):
+                    yield _event("lines", {"file": p.name,
+                                           "lines": lines[i:i + 500]})
+        meta = read_meta(run_dir) or meta
+        if meta.get("status") in OPS_TERMINAL:
+            yield _event("done", {"status": meta.get("status", "")})
+            return
+        time.sleep(1)
 
 
 def _ops_sse(run_dir: Path, max_ticks: int = 12 * 3600) -> Iterator[str]:

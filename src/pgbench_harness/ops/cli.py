@@ -35,6 +35,9 @@ def add_ops_parser(sub: argparse._SubParsersAction) -> None:
     spec_args(sc)
     mo = osub.add_parser("monitor", help="continuous cluster telemetry sampler")
     spec_args(mo)
+    lg = osub.add_parser("logs", help="follow pod/container logs into a run dir "
+                                      "(the console's live log viewer backend)")
+    spec_args(lg)
     spec_args(osub.add_parser("pg-params",
                               help="snapshot the full pg_settings parameter catalog"),
               results=False)
@@ -96,6 +99,9 @@ def cmd_ops(args: argparse.Namespace) -> int:
     if cmd == "monitor":
         from pgbench_harness.ops.monitor import run_monitor
         return run_monitor(spec, args.results_dir)
+    if cmd == "logs":
+        from pgbench_harness.ops.logs import run_logs
+        return run_logs(spec, args.results_dir)
     if cmd == "pg-params":
         from pgbench_harness.ops.params import run_pg_params
         return run_pg_params(spec)

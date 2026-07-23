@@ -258,6 +258,31 @@ export interface OpsStreamHandlers {
   onError?: () => void;
 }
 
+// ── live log viewer (logs op) ───────────────────────────────────────────
+
+export interface LogSource { pod: string; container: string; category: string; file: string }
+
+export interface LogsStreamHandlers {
+  onHello?: (h: { op_run_id: string; status: string; sources: LogSource[] | null }) => void;
+  onSources?: (s: LogSource[]) => void;
+  onLines?: (b: { file: string; lines: string[] }) => void;
+  onDone?: (d: { status: string }) => void;
+  onError?: () => void;
+}
+
+export function openLogsStream(opRunId: string, h: LogsStreamHandlers): EventSource {
+  const es = new EventSource(`/ops/runs/${encodeURIComponent(opRunId)}/logs-stream`);
+  es.addEventListener("hello", (e) => h.onHello?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("sources", (e) => h.onSources?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("lines", (e) => h.onLines?.(JSON.parse((e as MessageEvent).data)));
+  es.addEventListener("done", (e) => {
+    h.onDone?.(JSON.parse((e as MessageEvent).data));
+    es.close();
+  });
+  es.onerror = () => h.onError?.();
+  return es;
+}
+
 export function openOpsStream(opRunId: string, h: OpsStreamHandlers): EventSource {
   const es = new EventSource(`/ops/runs/${encodeURIComponent(opRunId)}/stream`);
   es.addEventListener("hello", (e) => h.onHello?.(JSON.parse((e as MessageEvent).data)));

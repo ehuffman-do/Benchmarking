@@ -42,6 +42,7 @@ THRESHOLDS: dict[str, float] = {
     "lag_mb_warn": 100.0,
     "disk_pct_warn": 80.0, "disk_pct_crit": 90.0,
     "pod_restarts_warn": 3,
+    "mem_pct_warn": 90.0,
     "backup_age_warn_s": 25 * 3600.0, "backup_age_crit_s": 49 * 3600.0,
 }
 
@@ -206,6 +207,25 @@ def evaluate_sql_signals(kube: Kube, leader: str, th: dict[str, float],
                 "verify with the cache-hit diagnostic per database.",
                 {"type": "diag", "checks": ["cache_hit"]})
 
+    # pg_stat_monitor loaded: known memory-growth issue under sustained load
+    # (field report 2026-07-22 — took down long-running tests; switching the
+    # query source to pg_stat_statements resolved it).
+    out.check()
+    res = kube.psql(leader, "SHOW shared_preload_libraries", timeout_s=20)
+    if res.ok and "pg_stat_monitor" in res.stdout:
+        out.add("spl_pg_stat_monitor", "warn",
+                "pg_stat_monitor is loaded",
+                "in shared_preload_libraries",
+                "pg_stat_monitor has a known memory-growth issue under "
+                "sustained load (verified 2026-07 on long TPC-C runs) — it "
+                "can OOM a member mid-test.",
+                "Prefer pg_stat_statements for multi-hour tests: re-register "
+                "the PMM query source as pgstatements, CREATE EXTENSION "
+                "pg_stat_statements, then remove pg_stat_monitor from "
+                "shared_preload_libraries (restart required) and DROP the "
+                "extension.",
+                {"type": "params", "filter": "shared_preload_libraries"})
+
     # Parameters awaiting a restart.
     out.check()
     v = _q(kube, leader, "/*health:pending*/ SELECT count(*) "
@@ -270,6 +290,8 @@ def evaluate_kube(kube: Kube, cr_name: str, instances: list[str],
     except KubeError as exc:
         out.add("pods", "info", "Pod state unknown", "query failed", str(exc)[:200])
         items = []
+    oom_events = 0
+    mem_limits: dict[str, float] = {}
     for item in items:
         name = (item.get("metadata") or {}).get("name", "")
         if cr_name and not name.startswith(cr_name):
@@ -278,6 +300,34 @@ def evaluate_kube(kube: Kube, cr_name: str, instances: list[str],
         phase = status.get("phase", "")
         cs = status.get("containerStatuses") or []
         restarts = sum(int(c.get("restartCount") or 0) for c in cs)
+        # cgroup OOM kill: the kernel killed a process — container status
+        # carries lastState.terminated.reason=OOMKilled / exitCode 137. This
+        # is the pg_stat_monitor-leak signature (distinct from the startup
+        # allocation failure below, which keeps the container running).
+        for c in cs:
+            term = ((c.get("lastState") or {}).get("terminated") or {})
+            if (str(term.get("reason") or "") == "OOMKilled"
+                    or int(term.get("exitCode") or 0) == 137):
+                oom_events += 1
+                out.add(f"oom_{name}_{c.get('name')}", "crit",
+                        f"Container OOM-killed: {name}/{c.get('name')}",
+                        f"OOMKilled at {term.get('finishedAt') or '?'} "
+                        f"({restarts} restarts)",
+                        "The kernel killed the process for exceeding its "
+                        "memory limit — under load this repeats and takes "
+                        "long runs down.",
+                        "Check memory limits vs shared_buffers/work_mem; if "
+                        "pg_stat_monitor is loaded, suspect its known "
+                        "memory-growth issue and switch to pg_stat_statements.",
+                        {"type": "diag", "checks": ["pods", "events_warnings"]})
+        for c in ((item.get("spec") or {}).get("containers") or []):
+            lim = (((c.get("resources") or {}).get("limits") or {})
+                   .get("memory"))
+            if lim and c.get("name") == "database":
+                from pgbench_harness.ops.paramcheck import _mem_to_bytes
+                b = _mem_to_bytes(lim)
+                if b:
+                    mem_limits[name] = b
         if phase not in ("Running", "Succeeded"):
             out.add(f"pod_{name}", "crit", f"Pod {name} is {phase}", phase,
                     "A cluster pod is not running.",
@@ -292,6 +342,65 @@ def evaluate_kube(kube: Kube, cr_name: str, instances: list[str],
                     "kubectl describe the pod; check memory limits vs "
                     "shared_buffers/work_mem.",
                     {"type": "diag", "checks": ["pods", "events_warnings"]})
+    out.metrics["oom_events"] = float(oom_events)
+
+    # Allocation failure inside PostgreSQL (huge_pages-incident signature):
+    # the container keeps running while Patroni loops on a postmaster that
+    # cannot map shared memory — invisible to OOMKilled checks.
+    out.check()
+    for pod in instances:
+        try:
+            res = kube.run(["logs", pod, "-c", "database", "--tail=120"],
+                           timeout_s=20)
+        except KubeError:
+            continue
+        if not res.ok:
+            continue
+        hits = [ln.strip()[:240] for ln in res.stdout.splitlines()
+                if ("Cannot allocate memory" in ln
+                    or "out of memory" in ln.lower())]
+        if hits:
+            out.add(f"alloc_{pod}", "crit",
+                    f"Memory allocation failure on {pod}",
+                    hits[-1][:120],
+                    "PostgreSQL cannot allocate/map memory — with a "
+                    "shared-memory failure the postmaster never starts and "
+                    "the member crash-loops.",
+                    "Check huge_pages/hugepages-2Mi resources and "
+                    "shared_buffers vs the container memory limit.",
+                    {"type": "diag", "checks": ["pods", "events_warnings"]})
+
+    # Memory pressure: working set vs limit (best-effort — metrics-server may
+    # be absent; degrade silently). Also feeds the leak-trend history.
+    out.check()
+    try:
+        res = kube.run(["top", "pods", "--no-headers"], timeout_s=20)
+        rows = res.stdout.splitlines() if res.ok else []
+    except KubeError:
+        rows = []
+    from pgbench_harness.ops.paramcheck import _mem_to_bytes
+    ws_max = 0.0
+    for ln in rows:
+        parts = ln.split()
+        if len(parts) < 3 or (cr_name and not parts[0].startswith(cr_name)):
+            continue
+        ws = _mem_to_bytes(parts[2])
+        if not ws:
+            continue
+        ws_max = max(ws_max, ws)
+        lim = mem_limits.get(parts[0])
+        if lim and ws / lim * 100 >= th["mem_pct_warn"]:
+            out.add(f"mem_{parts[0]}", "warn",
+                    f"Memory pressure on {parts[0]}",
+                    f"{ws / 1024 ** 2:.0f} MiB of {lim / 1024 ** 2:.0f} MiB "
+                    f"limit ({ws / lim * 100:.0f}%)",
+                    "The working set is close to the container limit — the "
+                    "next allocation spike gets the container OOM-killed.",
+                    "Lower work_mem/connection count or raise the limit; if "
+                    "pg_stat_monitor is loaded, suspect its memory growth.",
+                    {"type": "diag", "checks": ["pods"]})
+    if ws_max:
+        out.metrics["mem_ws_mb_max"] = round(ws_max / 1024 ** 2, 1)
 
     # Disk headroom on every instance pod.
     out.check()

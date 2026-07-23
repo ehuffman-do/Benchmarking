@@ -69,6 +69,18 @@ class OpsRun:
     def save_meta(self) -> None:
         atomic_write_json(self.run_dir / "meta.json", self.meta)
 
+    def headline_update(self, **fields: Any) -> None:
+        """Persist headline fields NOW, before the run is terminal.
+
+        Field lesson (huge_pages incident): applied-change accounting written
+        only at finalize time vanished when verify crashed — the summary card
+        showed 'Changed 0' for a run whose own log said it patched, and
+        rollback had no source diff. The moment a patch lands, what was
+        applied must be durable in meta.json regardless of how verification
+        ends."""
+        self.meta["headline"].update(fields)
+        self.save_meta()
+
     def finalize(self, status: str, headline: Optional[dict[str, Any]] = None,
                  error: str = "") -> None:
         self.meta["status"] = status

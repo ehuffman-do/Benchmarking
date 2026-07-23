@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import type { HealthDoc, HealthFinding, Job, KubeTarget, Me, OpsRun, Run, Topology } from "../types";
 import { openJobStream, CheckEvent } from "../lib/sse";
-import { CheckList } from "./ClusterOps";
+import { CheckList, relTime } from "./ClusterOps";
 import { Crumbs } from "../components/Crumbs";
 
 const SEV_BADGE: Record<string, string> = {
@@ -105,7 +105,9 @@ export function KubeTargetView({ me }: { me: Me }) {
   const [monInterval, setMonInterval] = useState(60);
   const [pmmHost, setPmmHost] = useState(
     () => localStorage.getItem(`pmm-host-${targetId}`) ?? "");
-  const [pmmSource, setPmmSource] = useState<"pgstatmonitor" | "pgstatements">("pgstatmonitor");
+  // pg_stat_statements is the default query source: pg_stat_monitor has a
+  // known memory-growth issue under sustained load (field report 2026-07).
+  const [pmmSource, setPmmSource] = useState<"pgstatmonitor" | "pgstatements">("pgstatements");
 
   const load = useCallback(() => {
     api.get<KubeTarget>(`/api/kube-targets/${targetId}`).then(setKt).catch((e) => setErr(e.message));
@@ -202,6 +204,7 @@ export function KubeTargetView({ me }: { me: Me }) {
         <Link className="btn primary" to={`/ops/targets/${targetId}/operate`}>Operations</Link>{" "}
         <Link className="btn" to={`/ops/targets/${targetId}/params`}>Parameter map</Link>{" "}
         <Link className="btn" to={`/ops/targets/${targetId}/diag`}>Diagnostics</Link>{" "}
+        <Link className="btn" to={`/ops/targets/${targetId}/logs`}>Logs</Link>{" "}
         <Link className="btn" to="/ops">← targets</Link>
       </div>
 
@@ -253,7 +256,8 @@ export function KubeTargetView({ me }: { me: Me }) {
           <h2>Health
             {health && <span className={`badge ${SEV_BADGE[health.status] ?? "ok"}`} style={{ marginLeft: 8 }}>
               {health.status === "ok" ? "✓ healthy" : health.status}</span>}
-            {healthUtc && <span className="subtle mono" style={{ marginLeft: 8 }}>as of {healthUtc}</span>}
+            {healthUtc && <span className="subtle mono" style={{ marginLeft: 8 }}
+                                title={healthUtc}>checked {relTime(healthUtc)}</span>}
           </h2>
           <div className="spacer" />
           {isAdmin && (
@@ -589,10 +593,22 @@ export function KubeTargetView({ me }: { me: Me }) {
                        }} /></div>
               <div className="field"><label>Query source (extension is paired automatically)</label>
                 <select value={pmmSource} onChange={(e) => setPmmSource(e.target.value as typeof pmmSource)}>
-                  <option value="pgstatmonitor">pg_stat_monitor (richer QAN — recommended)</option>
-                  <option value="pgstatements">pg_stat_statements (built-in)</option>
+                  <option value="pgstatements">pg_stat_statements (built-in — recommended)</option>
+                  <option value="pgstatmonitor">pg_stat_monitor (richer QAN — ⚠ memory-growth issue)</option>
                 </select></div>
             </div>
+            {pmmSource === "pgstatmonitor" && (
+              <p className="subtle" style={{ marginTop: 0 }}>
+                ⚠ <strong>pg_stat_monitor has a known memory-growth issue under sustained
+                load</strong> (verified 2026-07 on long TPC-C runs — it took down multi-hour
+                tests). Prefer pg_stat_statements for anything longer than an hour. Already
+                running pg_stat_monitor? Switch by re-enabling PMM with pg_stat_statements
+                selected: the agent query source is re-registered and the extension created;
+                then remove <code>pg_stat_monitor</code> from{" "}
+                <code>shared_preload_libraries</code> in the parameter map (restart-required)
+                and <code>DROP EXTENSION pg_stat_monitor</code>.
+              </p>
+            )}
             <button disabled={!pmmHost.trim()} onClick={() =>
               launch("pmm/status", { params: pmmParams })}>
               Check status (read-only)</button>{" "}
@@ -686,6 +702,7 @@ export function OpsRunsTable({ runs, selectable, selected, onToggle }: {
     if (r.kind === "cr-apply") {
       const n = h.changed ? Object.keys(h.changed).length : 0;
       return [h.action, h.dry_run ? "dry-run" : "", `${n} changed`,
+              h.outcome ? String(h.outcome) : "",
               (h.pending_restart?.length ?? 0) > 0 ? "⚠ pending_restart" : ""].filter(Boolean).join(" · ");
     }
     if (r.kind === "monitor") return h.cycles ? `${h.cycles} cycles` : "";

@@ -68,6 +68,26 @@ the harness never writes it to specs, logs, reports, or run artifacts
 (dry-run renders it as `<token>`). If a PMM run aborts with
 "`PGB_PMM_TOKEN` is not set", this file is the place to fix.
 
+### PMM query source: pg_stat_statements is the default
+
+`pg_stat_monitor` has a known memory-growth issue under sustained load
+(field-verified 2026-07 on long TPC-C runs — it took down multi-hour tests).
+The harness therefore defaults every PMM enable to
+`query_source=pgstatements` / `pg_stat_statements`; pg_stat_monitor stays
+selectable for short, QAN-rich sessions, and health checks raise a warning
+whenever it appears in `shared_preload_libraries`.
+
+Migrating a cluster that is already running PMM with pg_stat_monitor:
+
+1. Re-run **Enable PMM** with `pg_stat_statements` selected — the pmm-agent
+   query source is re-registered and `CREATE EXTENSION IF NOT EXISTS
+   pg_stat_statements` runs on the primary (idempotent; pods roll once,
+   HA-preserving).
+2. In the parameter map, edit `shared_preload_libraries` to drop
+   `pg_stat_monitor` (restart-required — the usual pending-restart /
+   rollout-watch flow applies).
+3. After the roll, `DROP EXTENSION pg_stat_monitor;` on the primary.
+
 ---
 
 ## 2. Fresh install

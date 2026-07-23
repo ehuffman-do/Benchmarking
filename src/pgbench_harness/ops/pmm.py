@@ -59,8 +59,11 @@ def _cfg(params: dict[str, Any]) -> dict[str, Any]:
         "server_host": str(params.get("server_host") or ""),
         "client_image": str(params.get("client_image")
                             or "docker.io/percona/pmm-client:3.8.1"),
-        "query_source": str(params.get("query_source") or "pgstatmonitor"),
-        "extension": str(params.get("extension") or "pg_stat_monitor"),
+        # Default flipped to pg_stat_statements (2026-07): pg_stat_monitor
+        # showed sustained memory growth on long-running tests in the field —
+        # it stays selectable, but multi-hour tests should not default onto it.
+        "query_source": str(params.get("query_source") or "pgstatements"),
+        "extension": str(params.get("extension") or "pg_stat_statements"),
         # empty = auto-detect the cluster's existing libraries and preserve them
         "base_libs": str(params.get("base_libs") or ""),
         "database": str(params.get("database") or "postgres"),

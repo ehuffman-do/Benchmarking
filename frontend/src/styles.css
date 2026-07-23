@@ -302,6 +302,37 @@ label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px
 .filters { display: flex; gap: 8px; margin-bottom: 16px; }
 .filters input { flex: 1; }
 
+/* ── cluster registration (full-width, grouped steps) ── */
+.reg-steps { display: grid; grid-template-columns: repeat(3, minmax(260px, 1fr));
+  gap: 16px; margin-bottom: 12px; }
+@media (max-width: 1100px) { .reg-steps { grid-template-columns: 1fr; } }
+.reg-step { border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 12px 14px 6px; margin: 0; min-width: 0; }
+.reg-step legend { font-size: 11.5px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--muted); padding: 0 6px; }
+.reg-step input, .reg-step select, .reg-step textarea { width: 100%; min-width: 0; }
+.field-help { margin: 4px 0 0; font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+.field-warn { margin: 4px 0 0; font-size: 11.5px; color: var(--warn); line-height: 1.45; }
+.req { color: var(--bad); }
+
+/* ── live log viewer ── */
+.log-sources { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.log-source-group { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 10px; min-width: 0; }
+.log-source-title { font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.log-source { display: flex; align-items: center; gap: 6px; font-size: 12px;
+  padding: 2px 0; overflow: hidden; white-space: nowrap; }
+.chip { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface-2); opacity: 0.45; }
+.chip.chip-on { opacity: 1; border-color: var(--line-strong); }
+.log-box { background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); height: 460px; overflow: auto; padding: 8px 10px;
+  font-size: 12px; line-height: 1.5; }
+.log-line { display: flex; gap: 8px; white-space: pre-wrap; word-break: break-word; }
+.log-ts { color: var(--muted); flex: none; }
+.log-src { color: var(--muted); flex: none; width: 170px; overflow: hidden;
+  text-overflow: ellipsis; }
+
 /* ── misc ── */
 .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
 .toolbar .spacer { margin-left: auto; }

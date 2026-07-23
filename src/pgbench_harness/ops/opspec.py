@@ -15,7 +15,7 @@ from typing import Any
 from pgbench_harness.errors import SpecError
 
 OPS_KINDS = ("validate", "discover", "cr-apply", "backup", "scenario", "monitor",
-             "pg-params", "diag", "health", "operate",
+             "pg-params", "diag", "health", "operate", "logs",
              "pmm-enable", "pmm-status", "pmm-disable")
 
 OPERATE_OPERATIONS = ("restart", "switchover", "failover", "scale", "resize",
@@ -134,11 +134,14 @@ def parse_ops_spec(doc: Any) -> OpsSpec:
         if not str(params.get("server_host") or "").strip():
             raise SpecError(f"ops spec: {op} needs params.server_host "
                             "(the PMM server address)")
-        qs = str(params.get("query_source") or "pgstatmonitor")
+        # pg_stat_statements is the default: pg_stat_monitor has a known
+        # memory-growth issue under sustained load (field report 2026-07-22 —
+        # it brought down long-running tests until the source was switched).
+        qs = str(params.get("query_source") or "pgstatements")
         if qs not in ("pgstatmonitor", "pgstatements"):
             raise SpecError("ops spec: pmm query_source must be "
                             f"pgstatmonitor|pgstatements (got '{qs}')")
-        ext = str(params.get("extension") or "pg_stat_monitor")
+        ext = str(params.get("extension") or "pg_stat_statements")
         if ext not in ("pg_stat_monitor", "pg_stat_statements"):
             raise SpecError("ops spec: pmm extension must be "
                             f"pg_stat_monitor|pg_stat_statements (got '{ext}')")
