@@ -1482,10 +1482,28 @@ def test_pmm_defaults_flipped_to_pg_stat_statements():
                            "target": {"name": "t", "cr_name": "c"},
                            "params": {"server_host": "pmm.example.com"}})
     assert spec.params.get("query_source") in (None, "pgstatements")
-    from pgbench_harness.ops.pmm import _cfg
+    from pgbench_harness.ops.pmm import _cfg, _CR_QUERY_SOURCE
     cfg = _cfg({"server_host": "x"})
     assert cfg["query_source"] == "pgstatements"
     assert cfg["extension"] == "pg_stat_statements"
+    # the CR field must use the operator's enum spelling, not the agent value
+    assert _CR_QUERY_SOURCE["pgstatements"] == "pgstatstatements"
+    assert _CR_QUERY_SOURCE["pgstatmonitor"] == "pgstatmonitor"
+
+
+def test_pmm_enable_rejects_bad_query_source_at_cr(pmmops, monkeypatch):
+    """Regression for the reported failure: the operator CR enum spells
+    pg_stat_statements 'pgstatstatements'; writing the agent value
+    'pgstatements' straight into spec.pmm.querySource made the operator reject
+    the patch. The enable must write the operator spelling and succeed."""
+    from pgbench_harness.ops.pmm import run_pmm_enable
+    assert run_pmm_enable(_pmm_ops_spec("pmm-enable"), pmmops) == 0
+    st = _fake_state()
+    assert st["cr"]["spec"]["pmm"]["querySource"] == "pgstatstatements"
+    # and the QAN agent / extension still resolve to the statements pairing
+    run_dir = _only_pmm_run_dir(pmmops, "pmm-enable")
+    val = json.loads((run_dir / "validation.json").read_text())
+    assert val["query_source"] == "pgstatements"    # agent value unchanged
 
 
 # ── Phase 3: backups ──
@@ -2404,8 +2422,10 @@ def test_pmm_enable_end_to_end_with_inventory_confirmation(pmmops):
     st = _fake_state()
     assert st["cr"]["spec"]["pmm"]["enabled"] is True
     # default query source is pg_stat_statements (pg_stat_monitor memory leak,
-    # field report 2026-07)
-    assert st["cr"]["spec"]["pmm"]["querySource"] == "pgstatements"
+    # field report 2026-07). The CR field uses the operator's enum spelling
+    # 'pgstatstatements' (translated from the agent value 'pgstatements') —
+    # writing the agent value straight in made the operator reject the patch.
+    assert st["cr"]["spec"]["pmm"]["querySource"] == "pgstatstatements"
     assert st["pmm_secret"] == "cluster1-pmm-secret"
     assert "pg_stat_statements" in st["extensions"]
     spl = (st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]

@@ -189,11 +189,22 @@ def pmm_rolled(st, name):
     return now() >= st.get("pmm_roll", {}).get(name, 0)
 
 
+# The Percona CR enum -> pmm-agent --query-source / QAN agent value. The
+# operator spells pg_stat_statements 'pgstatstatements' in the CR but the agent
+# uses 'pgstatements'; pg_stat_monitor is the same on both sides.
+PMM_CR_QUERY_SOURCES = ("pgstatmonitor", "pgstatstatements")
+
+
+def agent_query_source(cr_value):
+    return {"pgstatstatements": "pgstatements",
+            "pgstatmonitor": "pgstatmonitor"}.get(cr_value, cr_value)
+
+
 def pmm_client_container(st):
     """The sidecar the operator injects, with the env the verifier inspects
     (PMM3 markers: --query-source in the prerun, non-/pmm2/ config path)."""
     pmm = st["cr"]["spec"].get("pmm") or {}
-    qs = pmm.get("querySource", "pgstatmonitor")
+    qs = agent_query_source(pmm.get("querySource", "pgstatmonitor"))
     return {"name": "pmm-client", "image": pmm.get("image", ""),
             "envFrom": [{"secretRef": {"name": pmm.get("secret", "")}}],
             "env": [
@@ -882,7 +893,7 @@ def handle_pmm_logs(st, pod):
     """pmm-client sidecar logs: the QAN agent line appears once the pod has
     rolled AND the paired extension exists (FAKE_KUBE_NO_QAN suppresses it)."""
     pmm = st["cr"]["spec"].get("pmm") or {}
-    qs = pmm.get("querySource", "pgstatmonitor")
+    qs = agent_query_source(pmm.get("querySource", "pgstatmonitor"))
     ext = {"pgstatmonitor": "pg_stat_monitor",
            "pgstatements": "pg_stat_statements"}.get(qs, "pg_stat_monitor")
     ts = time.strftime("%Y-%m-%dT%H:%M:%S") + ",000Z"
@@ -1208,6 +1219,18 @@ def main():
             (STATE_DIR / "patches.log").open("a").write(json.dumps(patch) + "\n")
             out(f"{CR_KIND}.pgv2.percona.com/{st['cluster']} patched")
             return 0
+
+        # Operator CRD validation: reject an unsupported spec.pmm.querySource,
+        # exactly like the real PerconaPGCluster admission webhook (this is the
+        # check that caught writing the agent value 'pgstatements' — which the
+        # operator does not accept — into the CR field).
+        qsv = ((patch.get("spec") or {}).get("pmm") or {}).get("querySource")
+        if qsv is not None and qsv not in PMM_CR_QUERY_SOURCES:
+            sys.stderr.write(
+                f'The PerconaPGCluster "{st["cluster"]}" is invalid: '
+                f'* spec.pmm.querySource: Unsupported value: "{qsv}": '
+                f'supported values: "pgstatmonitor", "pgstatstatements"\n')
+            return 1
 
         def deep_merge(dst, src):
             for k, v in src.items():
