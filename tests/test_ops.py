@@ -1692,6 +1692,90 @@ def _fire_scenario(client, tid, case, extra=None, confirm="cluster1"):
                        auth=("admin", "apw"))
 
 
+def test_scenario_in_cluster_helper_dual_path(opsweb, monkeypatch):
+    """M2: the in-cluster helper pod runs dual-path probes (pgbouncer + ha),
+    survives the failover (real cluster DNS, not a port-forward), and is torn
+    down at the end."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_C1_ELECT", "1")
+    monkeypatch.setenv("FAKE_KUBE_ELECT_S", "2")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "3")
+    tid = _ready_target(client, cfg)
+    # no probe.mode -> pod-delete defaults to the in-cluster helper
+    r = _fire_scenario(client, tid, "pod-delete",
+                       extra={"settle_s": 8, "probe": {"hz": 5}})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    assert run["status"] == "complete", run
+    run_dir = cfg.results_dir / "ops" / run["op_run_id"]
+    # both probe paths captured
+    assert (run_dir / "raw" / "probe.log").exists()          # pgbouncer (authoritative)
+    assert (run_dir / "raw" / "probe_ha.log").exists()       # direct-to-primary
+    assert "OK " in (run_dir / "raw" / "probe.log").read_text()
+    events = (run_dir / "events.jsonl").read_text()
+    assert "in-cluster helper probes started" in events
+    # the stitcher reports per-path downtime
+    stitched = json.loads((run_dir / "stitched.json").read_text())
+    assert "per_path" in stitched["probe"]
+    assert "ha" in stitched["probe"]["per_path"]
+    # helper pod was deleted (torn down)
+    st = json.loads((Path(os.environ["FAKE_KUBE_STATE"]) / "state.json").read_text())
+    helper_deleted = [n for n in st.get("deleted", {}) if n.startswith("pgb-probe-")]
+    assert helper_deleted, "helper pod should have been torn down"
+
+
+def test_scenario_helper_probe_never_puts_password_in_argv(opsweb, monkeypatch):
+    """Bug-bash: the in-cluster helper probe must pass the DB password via
+    STDIN, never in the kubectl-exec argv (worker/pod process tables)."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_C1_ELECT", "1")
+    monkeypatch.setenv("FAKE_KUBE_ELECT_S", "2")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "3")
+    tid = _ready_target(client, cfg)
+    r = _fire_scenario(client, tid, "pod-delete",
+                       extra={"settle_s": 6, "probe": {"hz": 5}})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    # nothing the harness wrote may contain the fake pguser password
+    pw = os.environ.get("FAKE_KUBE_PGPASS", "k8s-secret-pw-fake")
+    for p in (cfg.results_dir / "ops" / run["op_run_id"]).rglob("*"):
+        if p.is_file():
+            assert pw not in p.read_text(errors="replace"), p
+
+
+def test_health_sigkill_is_not_oom(opsweb, monkeypatch):
+    """Bug-bash: a container that exited 137 (SIGKILL from a failover/crash
+    test) with reason!=OOMKilled must NOT be reported as an OOM kill."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    monkeypatch.setenv("FAKE_KUBE_SIGKILL", "1")   # exit 137, reason 'Error'
+    client.post(f"/api/kube-targets/{tid}/health", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    doc = client.get(f"/api/kube-targets/{tid}/health",
+                     auth=("viewer", "vpw")).json()["health"]
+    assert not any(f["id"].startswith("oom_") for f in doc["findings"])
+    assert doc["metrics"].get("oom_events", 0) == 0
+
+
+def test_cr_snapshots_route_survives_corrupt_snapshot(opsweb):
+    """Bug-bash: a cr_snapshot.json that is valid JSON but not an object must
+    not 500 the snapshot browser or the diff-preview route."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    client.post(f"/api/kube-targets/{tid}/cr-snapshot", json={}, auth=("op", "oppw"))
+    _drain_queue(cfg)
+    snap = _last_ops_run(client, "cr-apply")
+    # corrupt the snapshot to a JSON array
+    (cfg.results_dir / "ops" / snap["op_run_id"] / "cr_snapshot.json").write_text('["not", "a", "cr"]')
+    r = client.get(f"/api/kube-targets/{tid}/cr-snapshots", auth=("viewer", "vpw"))
+    assert r.status_code == 200, r.text
+    r = client.get(f"/api/ops/runs/{snap['op_run_id']}/cr-snapshot-diff",
+                   auth=("viewer", "vpw"))
+    assert r.status_code == 200, r.text
+
+
 def test_scenario_case_b_pgkill_restart_in_place(opsweb):
     """Case B: kill -9 the postmaster. Patroni restarts Postgres in place —
     NOT a failover. Classification must say so (leader name unchanged)."""

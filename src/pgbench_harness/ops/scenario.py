@@ -136,6 +136,128 @@ class ProbeThread(threading.Thread):
         self.stop_event.set()
 
 
+class HelperPod:
+    """A short-lived pod INSIDE the cluster that runs the write probes.
+
+    Field lesson (case-c-failover.sh): a port-forward from the worker does
+    NOT re-resolve to the promoted primary after a failover — it measures the
+    tunnel, not the cluster. An in-cluster helper pod using real cluster DNS
+    survives the leader dying and reconnects to the new primary, so it
+    measures the customer's actual reconnect experience. The pod is torn down
+    at the end unless keep=True."""
+
+    def __init__(self, kube: Kube, run: OpsRun, image: str) -> None:
+        self.kube = kube
+        self.run_ref = run
+        self.image = image
+        self.name = f"pgb-probe-{run.op_run_id[-8:]}"
+        self.ready = False
+
+    def launch(self, timeout_s: float = 60) -> bool:
+        try:
+            self.kube.run(["run", self.name, f"--image={self.image}",
+                           "--restart=Never", "--command", "--",
+                           "sleep", "36000"], timeout_s=30, check=True)
+        except KubeError as exc:
+            self.run_ref.event("probe", "helper pod launch failed", str(exc)[:200])
+            return False
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                phase = (self.kube.json(["get", "pod", self.name])
+                         .get("status", {}).get("phase", ""))
+            except KubeError:
+                phase = ""
+            if phase == "Running":
+                self.ready = True
+                return True
+            time.sleep(2)
+        # Never Running in time: the pod (Pending/ImagePullBackOff) still
+        # exists — reap it so a failed launch can't leak a pod that run_scenario
+        # will never see again (it sets helper=None on a False return).
+        self.run_ref.event("probe", "helper pod not Running in time",
+                           "check image pull / scheduling")
+        self.teardown()
+        return False
+
+    def teardown(self) -> None:
+        try:
+            self.kube.run(["delete", "pod", self.name, "--wait=false"],
+                          timeout_s=20)
+        except KubeError:
+            pass
+
+
+class HelperProbeThread(threading.Thread):
+    """~5 Hz write probe from the helper pod to ONE service path (ha or
+    pgbouncer). Writes OK/FAIL lines in the shared probe.log format so the
+    stitcher reads every path uniformly."""
+
+    def __init__(self, kube: Kube, run: OpsRun, helper: str, label: str,
+                 host: str, port: int, db: str, user: str, pw: str,
+                 sslmode: str, hz: float, out_name: str) -> None:
+        super().__init__(name=f"probe-{label}", daemon=True)
+        self.kube = kube
+        self.helper = helper
+        self.label = label
+        self.path = run.run_dir / "raw" / out_name
+        self.hz = hz
+        self.period = 1.0 / max(0.5, hz)
+        self.stop_event = threading.Event()
+        self.consecutive_ok = 0
+        # conninfo passed as one arg to psql inside the pod; connect_timeout
+        # keeps a dead path from stalling the whole tick.
+        self.conninfo = " ".join(f"{k}={_libpq_quote(v)}" for k, v in (
+            ("host", host), ("port", str(port)), ("dbname", db),
+            ("user", user), ("sslmode", sslmode), ("connect_timeout", "2")))
+        self.pw = pw
+
+    # The password reaches psql via STDIN, never argv: `$(cat)` reads it from
+    # the piped stdin and command substitution strips the trailing newline, so
+    # the secret never appears in the kubectl-exec argv (worker process table)
+    # nor in the pod's process table — only ProbeThread's env-var contract,
+    # applied to the in-cluster path.
+    _PROBE_SH = ('PGPASSWORD="$(cat)" psql "$1" -X -q -A -t -c "$2" -c "$3"')
+
+    def tick(self) -> None:
+        local = _now_iso_ms()
+        argv = ["sh", "-c", self._PROBE_SH, "probe", self.conninfo,
+                PROBE_WRITE_SQL, PROBE_SELECT_SQL]
+        try:
+            res = self.kube.exec(self.helper, "", argv, timeout_s=4,
+                                 input_text=self.pw)
+        except KubeError:
+            self._log(f"FAIL {local} exec-error")
+            self.consecutive_ok = 0
+            return
+        if res.ok and res.stdout.strip():
+            parts = res.stdout.strip().splitlines()[-1].split("|")
+            db_ts = parts[0] if parts else ""
+            rec = parts[1] if len(parts) > 1 else ""
+            addr = parts[2] if len(parts) > 2 else ""
+            self._log(f"OK {local} {db_ts.replace(' ', 'T')} {rec} {addr}")
+            self.consecutive_ok += 1
+        else:
+            reason = (res.stderr or res.stdout).strip().splitlines()
+            self._log(f"FAIL {local} {reason[0][:160] if reason else 'no output'}")
+            self.consecutive_ok = 0
+
+    def _log(self, line: str) -> None:
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+    def run(self) -> None:  # noqa: A003
+        while not self.stop_event.is_set():
+            started = time.monotonic()
+            self.tick()
+            delay = self.period - (time.monotonic() - started)
+            if delay > 0:
+                self.stop_event.wait(delay)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+
 class LogStream(threading.Thread):
     """kubectl logs -f for one pod/container, auto-reattaching when the pod
     dies (log streams die with the pod they follow — which is the event
@@ -347,6 +469,7 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
     threads: list[Any] = []
     events_proc: Optional[subprocess.Popen] = None
     events_fh: Optional[IO[str]] = None
+    helper: Optional[HelperPod] = None       # hoisted for the finally cleanup
     try:
         instances, leader, view = resolve_leader(kube, t.cr_name)
         leader_pod_doc = kube.json(["get", "pod", leader])
@@ -390,7 +513,16 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
 
         probe: Optional[ProbeThread] = None
         pf: Optional[PortForward] = None
-        probe_mode = str(probe_cfg.get("mode") or "port-forward")
+        probe_threads: list[HelperProbeThread] = []
+        # Default to the in-cluster helper for failover cases: a port-forward
+        # can't re-resolve to a promoted primary (case-c-failover.sh). Legacy
+        # port-forward / direct remain available for explicit opt-in.
+        probe_mode = str(probe_cfg.get("mode")
+                         or ("helper" if case in ("pod-delete", "node-loss",
+                                                  "switchover", "pgkill")
+                             else "port-forward"))
+        hz = float(probe_cfg.get("hz", 5))
+        sslmode = str(probe_cfg.get("sslmode", "require"))
         if probe_mode != "off":
             pw = ""
             try:
@@ -400,6 +532,32 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
                 run.event("probe", "probe disabled: cannot read pguser secret",
                           str(exc)[:200])
                 probe_mode = "off"
+        if probe_mode == "helper":
+            image = str(probe_cfg.get("helper_image")
+                        or "percona/percona-distribution-postgresql:16")
+            helper = HelperPod(kube, run, image)
+            if not helper.launch():
+                run.event("probe", "falling back: helper unavailable",
+                          "no in-cluster probe this run")
+                helper = None
+                probe_mode = "off"
+            else:
+                # dual-path: -pgbouncer (customer path, authoritative probe.log)
+                # and -ha (direct-to-primary) probed in parallel, independent.
+                ha_host = str(probe_cfg.get("ha_host") or f"{t.cr_name}-ha")
+                pgb_host = str(probe_cfg.get("pgb_host") or f"{t.cr_name}-pgbouncer")
+                port = int(probe_cfg.get("port", 5432))
+                paths = [("pgbouncer", pgb_host, "probe.log"),
+                         ("ha", ha_host, "probe_ha.log")]
+                for label, host, out_name in paths:
+                    hp = HelperProbeThread(
+                        kube, run, helper.name, label, host, port, t.db_name,
+                        t.db_user, pw, sslmode, hz, out_name)
+                    probe_threads.append(hp)
+                    threads.append(hp)
+                run.event("probe", "in-cluster helper probes started",
+                          f"pod {helper.name}: dual-path (pgbouncer + ha)")
+        elif probe_mode != "off":
             if probe_mode == "port-forward":
                 local_port = int(probe_cfg.get("local_port", 15432))
                 pf = PortForward(kube, run, f"{t.cr_name}-pgbouncer", local_port)
@@ -408,17 +566,14 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
             else:
                 host = str(probe_cfg.get("host") or f"{t.cr_name}-pgbouncer")
                 port = int(probe_cfg.get("port", 5432))
-            if probe_mode != "off":
-                conninfo = " ".join(f"{k}={_libpq_quote(v)}" for k, v in (
-                    ("host", host), ("port", str(port)), ("user", t.db_user),
-                    ("dbname", t.db_name),
-                    ("sslmode", str(probe_cfg.get("sslmode", "require"))),
-                    ("connect_timeout", "2")))
-                env = dict(os.environ)
-                env["PGPASSWORD"] = pw          # child env only, never argv/logs
-                probe = ProbeThread(run, conninfo, env,
-                                    float(probe_cfg.get("hz", 5)))
-                threads.append(probe)
+            conninfo = " ".join(f"{k}={_libpq_quote(v)}" for k, v in (
+                ("host", host), ("port", str(port)), ("user", t.db_user),
+                ("dbname", t.db_name), ("sslmode", sslmode),
+                ("connect_timeout", "2")))
+            env = dict(os.environ)
+            env["PGPASSWORD"] = pw              # child env only, never argv/logs
+            probe = ProbeThread(run, conninfo, env, hz)
+            threads.append(probe)
 
         for th in threads:
             th.start()
@@ -447,8 +602,14 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
         deadline = time.monotonic() + settle_s
         while time.monotonic() < deadline:
             time.sleep(1)
+            # "held" = the customer path (pgbouncer probe / legacy probe) has
+            # been continuously OK for the hold window.
+            probes_ok = [p.consecutive_ok for p in probe_threads
+                         if p.label == "pgbouncer"]
             if probe is not None:
-                held = probe.consecutive_ok >= hold_s * float(probe_cfg.get("hz", 5))
+                held = probe.consecutive_ok >= hold_s * hz
+            elif probes_ok:
+                held = probes_ok[0] >= hold_s * hz
             else:
                 held = True
             sample = watch.last_sample()
@@ -467,6 +628,8 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
         events_proc, events_fh = None, None
         for th in threads:
             th.join(timeout=8)
+        if helper is not None and not probe_cfg.get("keep_helper"):
+            helper.teardown()
         run.event("capture", "capture streams stopped", "")
 
         # ── stitch + report ──
@@ -533,6 +696,13 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
             except Exception:  # noqa: BLE001
                 pass
         _stop_events(events_proc, events_fh)
+        # The helper pod is owned by no thread — reap it even on a crash path
+        # (unless the operator asked to keep it for debugging).
+        if helper is not None and not probe_cfg.get("keep_helper"):
+            try:
+                helper.teardown()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _stop_events(proc: "Optional[subprocess.Popen]", fh: "Optional[IO[str]]") -> None:

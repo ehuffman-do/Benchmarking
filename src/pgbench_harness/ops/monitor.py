@@ -100,11 +100,12 @@ def sample_memory(kube: Kube, cr_name: str,
             continue
         cs = (item.get("status") or {}).get("containerStatuses") or []
         restarts = sum(int(c.get("restartCount") or 0) for c in cs)
+        # Count only true OOM kills (reason=OOMKilled). exitCode 137 alone is
+        # any SIGKILL — an intentional failover/crash-test kill would inflate
+        # this and fire a phantom run event.
         oom = sum(1 for c in cs
                   if str(((c.get("lastState") or {}).get("terminated") or {})
-                         .get("reason") or "") == "OOMKilled"
-                  or int(((c.get("lastState") or {}).get("terminated") or {})
-                         .get("exitCode") or 0) == 137)
+                         .get("reason") or "") == "OOMKilled")
         limit = ""
         for c in ((item.get("spec") or {}).get("containers") or []):
             lim = (((c.get("resources") or {}).get("limits") or {})
@@ -166,8 +167,15 @@ def run_monitor(spec: OpsSpec, results_dir: Path) -> int:
                 row["wal"] = cells[0] if cells else ""
                 cells = _one(kube, leader, ckpt_sql)
                 if not cells and ckpt_sql == CKPT_SQL_17:
-                    ckpt_sql = CKPT_SQL_OLD          # pre-17 fallback, once
-                    cells = _one(kube, leader, ckpt_sql)
+                    # Try the pre-17 shape, but only switch PERMANENTLY if it
+                    # actually returns data (proving a genuinely pre-17 server).
+                    # A transient empty result on PG17 must NOT latch us onto
+                    # pg_stat_bgwriter (whose columns don't exist there), which
+                    # would blank every subsequent checkpoint sample.
+                    old_cells = _one(kube, leader, CKPT_SQL_OLD)
+                    if old_cells:
+                        ckpt_sql = CKPT_SQL_OLD
+                        cells = old_cells
                 if len(cells) >= 2:
                     row["ckpt_t"], row["ckpt_r"] = cells[0], cells[1]
                 cells = _one(kube, leader, ARCHIVER_SQL)

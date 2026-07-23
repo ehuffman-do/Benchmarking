@@ -171,6 +171,70 @@ def test_reattach_converges_job_after_child_exit(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_orphaned_prepare_converges_from_job_log(tmp_path, monkeypatch):
+    """The reported bug: a multi-hour dataset PREPARE orphaned by a worker
+    restart stayed 'running' forever (prepare was omitted from the re-attach
+    kinds), so the UI never updated and the target could not be deleted. It
+    must now converge — a successful load reads 'done' from its job log."""
+    monkeypatch.setenv("PGBENCH_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("PGBENCH_DB", str(tmp_path / "data" / "pgbench.db"))
+    from pgbench_webapp import queries, worker
+    from pgbench_webapp.config import load_config
+    from pgbench_webapp.db import connect, ensure_dirs, migrate
+    cfg = load_config()
+    ensure_dirs(cfg)
+    migrate(cfg.db_path)
+    conn = connect(cfg.db_path)
+    # a finished prepare's job log (no run dir) with the success marker
+    (cfg.data_dir / "jobs").mkdir(parents=True, exist_ok=True)
+    job_id = queries.enqueue_job(conn, "prepare", "spec: {}", None, "tester")
+    (cfg.data_dir / "jobs" / f"job_{job_id}.out").write_text(
+        "03:30:38 INFO database sbtest does not exist; creating it\n"
+        "04:20:11 INFO dataset ready: 10 tables, scale 300\n"
+        "04:20:11 INFO load metrics: 30,000,000 rows in 49m ...\n")
+    queries.update_job(conn, job_id, state="running", pid=99999999)  # dead pid
+    worker.reconcile_startup(cfg, conn)
+    job = queries.get_job(conn, job_id)
+    assert job["state"] == "done", job["error"]    # not stuck 'running'/'failed'
+    # a prepare that ERRORED converges to failed with a clear note
+    fail_id = queries.enqueue_job(conn, "prepare", "spec: {}", None, "tester")
+    (cfg.data_dir / "jobs" / f"job_{fail_id}.out").write_text(
+        "03:30:38 INFO preparing dataset\n"
+        "FATAL: sysbench prepare exited with code 1\n")
+    queries.update_job(conn, fail_id, state="running", pid=99999998)
+    worker.reconcile_startup(cfg, conn)
+    assert queries.get_job(conn, fail_id)["state"] == "failed"
+    conn.close()
+
+
+def test_streaming_heartbeat_skips_blank_lines(tmp_path):
+    """The prepare log showed bare 'INFO' lines with no message: the heartbeat
+    logged the raw current line, and sysbench prints blank separators. It must
+    heartbeat the last NON-BLANK line with a progress count instead."""
+    import logging
+    from pgbench_harness import sysbench
+    # a command that prints a real line then blanks, tripping the heartbeat on
+    # a blank line (heartbeat_every=2 -> fires on the 2nd line, which is blank)
+    cmd = sysbench.SysbenchCommand(
+        argv=("bash", "-c", "printf 'Creating table sbtest1\\n\\n\\n\\n'"),
+        cwd=str(tmp_path))
+    records = []
+
+    class Cap(logging.Handler):
+        def emit(self, r): records.append(r.getMessage())
+
+    logger = logging.getLogger("hb-test")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(Cap())
+    rc = sysbench.run_streaming(cmd, {}, tmp_path / "out.log", logger,
+                                heartbeat_every=2, time_heartbeat_s=0)
+    assert rc == 0
+    hbs = [m for m in records if m.startswith("progress:")]
+    assert hbs, "no progress heartbeat emitted"
+    # every heartbeat carries the last real line, never a bare/empty message
+    assert all("Creating table sbtest1" in m for m in hbs), hbs
+
+
 def test_reconcile_startup_leaves_alive_orphans_running(tmp_path, monkeypatch):
     """A pid that is STILL ALIVE at worker startup must not be marked failed
     (that was the pre-KillMode behavior for crashed workers) — it gets a

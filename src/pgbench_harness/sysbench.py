@@ -172,6 +172,7 @@ def run_streaming(
     on_line: Optional[Callable[[str], None]] = None,
     timeout_s: Optional[float] = None,
     kill_grace_s: float = 10.0,
+    time_heartbeat_s: float = 30.0,
 ) -> int:
     """Run *cmd*, teeing stdout+stderr line-buffered to *log_path* live.
 
@@ -211,6 +212,16 @@ def run_streaming(
             daemon=True)
         watchdog.start()
     lines_seen = 0
+    last_nonblank = ""
+    # Time-based liveness heartbeat: sysbench's dataset load inserts millions
+    # of rows SILENTLY (no stdout for minutes), so a line-count heartbeat
+    # alone leaves the UI frozen and looking hung. This ticks on wall-clock
+    # regardless of output so a long load always shows it is alive.
+    progress = {"lines": 0, "last": ""}
+    hb = threading.Thread(target=_time_heartbeat,
+                          args=(done, logger, progress, float(time_heartbeat_s)),
+                          daemon=True)
+    hb.start()
     try:
         with open(log_path, "w", encoding="utf-8") as log:
             assert proc.stdout is not None
@@ -224,8 +235,18 @@ def run_streaming(
                     except Exception:  # noqa: BLE001  a live-tap error must never kill the run
                         pass
                 lines_seen += 1
+                stripped = redact(line.rstrip())
+                if stripped:
+                    last_nonblank = stripped
+                    progress["last"] = last_nonblank
+                progress["lines"] = lines_seen
                 if lines_seen % heartbeat_every == 0:
-                    logger.info("    %s", redact(line.rstrip()))
+                    # Heartbeat the last NON-BLANK line with a running count —
+                    # sysbench prints blank separator lines between tables, so
+                    # logging the raw current line produced useless empty
+                    # "INFO" heartbeats (no progress signal) during a load.
+                    logger.info("progress: %d lines%s", lines_seen,
+                                f" — {last_nonblank}" if last_nonblank else "")
         rc = proc.wait()
     except BaseException:
         # a harness-side failure in the tee loop (ENOSPC on log.write being
@@ -246,6 +267,26 @@ def run_streaming(
             log.write(f"FATAL: harness watchdog killed the load generator after "
                       f"{timeout_s:.0f}s (hung or silent child)\n")
     return rc
+
+
+def _time_heartbeat(done: threading.Event, logger: logging.Logger,
+                    progress: dict, every_s: float) -> None:
+    """Emit a wall-clock liveness line every *every_s* until *done*.
+
+    A dataset load can insert for many minutes with no stdout; without this
+    the harness log (and the UI tailing it) goes silent and looks hung. The
+    line carries elapsed time, lines seen so far, and the last real output so
+    the operator can see it is progressing."""
+    import time as _time
+    start = _time.monotonic()
+    if every_s <= 0:
+        return
+    while not done.wait(every_s):
+        elapsed = int(_time.monotonic() - start)
+        last = progress.get("last") or ""
+        logger.info("still working: %dm%02ds elapsed, %d lines%s",
+                    elapsed // 60, elapsed % 60, progress.get("lines", 0),
+                    f" — {last}" if last else "")
 
 
 def _kill_after_timeout(

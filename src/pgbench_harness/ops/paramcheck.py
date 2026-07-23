@@ -89,12 +89,18 @@ def normalize_value(value: Any, unit: Optional[str], vartype: Optional[str]) -> 
     vt = (vartype or "").lower()
     if vt == "bool":
         low = sv.lower()
-        for spelling in _BOOL_TRUE:
-            if spelling.startswith(low) and low:
-                return "on"
-        for spelling in _BOOL_FALSE:
-            if spelling.startswith(low) and low:
-                return "off"
+        if not low:
+            return sv
+        # PostgreSQL rejects a prefix that is ambiguous between on/off — most
+        # notably a bare "o", which is a prefix of BOTH "on" and "off". Only
+        # accept a prefix that matches exactly one side, matching PG's parser
+        # (so the guardrail never passes a value PG will reject).
+        true_m = [s for s in _BOOL_TRUE if s.startswith(low)]
+        false_m = [s for s in _BOOL_FALSE if s.startswith(low)]
+        if true_m and not false_m:
+            return "on"
+        if false_m and not true_m:
+            return "off"
         return sv
     if vt in ("integer", "int64", "real"):
         parsed = parse_value_with_unit(sv, unit or "")

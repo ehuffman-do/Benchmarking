@@ -796,8 +796,13 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
             if not kt["schedules_snapshot"]:
                 raise HTTPException(400, "no schedules snapshot recorded — nothing to restore")
             params["snapshot"] = json.loads(kt["schedules_snapshot"])
+        # This patches the CR (backups.pgbackrest.repos[].schedules), so it is
+        # destructive and must share the per-target mutex — otherwise a pause
+        # could interleave with a concurrent cr-apply/pmm/backup patch and one
+        # merge would clobber the other.
         job_id = _enqueue_ops(conn, kt, "cr-apply", params,
-                              f"{action}-schedules-{kt['name']}", user["username"])
+                              f"{action}-schedules-{kt['name']}", user["username"],
+                              DESTRUCTIVE_KINDS)
         return JSONResponse({"job_id": job_id})
 
     # ── op runs: index, artifacts, live stream ──

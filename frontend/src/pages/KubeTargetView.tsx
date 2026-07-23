@@ -54,15 +54,6 @@ function seriesFromCsv(text: string, valueOf: (cols: string[], f: string[]) => n
   return [...byEpoch.values()].slice(-maxPts);
 }
 
-const PATRONI_BUNDLE = JSON.stringify({
-  max_wal_size: "49152", min_wal_size: "2048", archive_timeout: "300",
-  wal_keep_size: "2048", checkpoint_timeout: "900",
-  checkpoint_completion_target: "0.9",
-}, null, 2);
-const PGBACKREST_BUNDLE = JSON.stringify({
-  "process-max": "4", "archive-async": "y", "spool-path": "/pgdata",
-}, null, 2);
-
 const CASES = [
   ["switchover", "Case A — graceful switchover (patronictl --force). Ref: ~4.6s, TL+1"],
   ["pgkill", "Case B — kill -9 the postmaster. Ref: restart in place, ~12–16s, no TL change"],
@@ -91,9 +82,6 @@ export function KubeTargetView({ me }: { me: Me }) {
   const canOp = me.role !== "viewer";
 
   // launcher state
-  const [crAction, setCrAction] = useState<"patroni_params" | "pgbackrest_global">("patroni_params");
-  const [crParams, setCrParams] = useState(PATRONI_BUNDLE);
-  const [prepReset, setPrepReset] = useState(false);
   const [bkType, setBkType] = useState("full");
   const [bkPath, setBkPath] = useState("direct");
   const [bkSource, setBkSource] = useState("leader");
@@ -160,10 +148,6 @@ export function KubeTargetView({ me }: { me: Me }) {
     }
   }
 
-  function parsedCrParams(): Record<string, string> | null {
-    try { return JSON.parse(crParams); } catch { return null; }
-  }
-
   // Sparklines feed from the newest monitor run's parsed CSVs (live or done).
   useEffect(() => {
     const mon = runs.find((r) => r.kind === "monitor");
@@ -211,6 +195,17 @@ export function KubeTargetView({ me }: { me: Me }) {
         <Link className="btn" to="/ops">← targets</Link>
       </div>
 
+      {/* In-page section nav — the target page is a long scroll of cards;
+          these anchor-jump to each so it's navigable without scrubbing. */}
+      <nav className="section-nav">
+        {[["health", "Health"], ["topology", "Topology"],
+          ...(isAdmin ? [["operations", "Operations"]] : []),
+          ["snapshots", "CR snapshots"], ["monitor", "Monitor"],
+          ["pmm", "PMM"], ["runs", "Op runs"]].map(([id, label]) => (
+          <a key={id} href={`#${id}`} className="section-nav-link">{label}</a>
+        ))}
+      </nav>
+
       <div className="kpi-row" style={{ marginBottom: 16 }}>
         <div className="kpi"><div className="label">Leader</div>
           <div className="value" style={{ fontSize: 15 }}>
@@ -254,7 +249,7 @@ export function KubeTargetView({ me }: { me: Me }) {
         </div>
       )}
 
-      <div className="card">
+      <div id="health" className="card">
         <div className="card-head">
           <h2>Health
             {health && <span className={`badge ${SEV_BADGE[health.status] ?? "ok"}`} style={{ marginLeft: 8 }}>
@@ -318,7 +313,7 @@ export function KubeTargetView({ me }: { me: Me }) {
         )}
       </div>
 
-      <div className="card" style={{ marginTop: 16 }}>
+      <div id="topology" className="card" style={{ marginTop: 16 }}>
         <div className="card-head">
           <h2>Topology {topoUtc ? <span className="subtle mono">as of {topoUtc}</span> : null}</h2>
           <div className="spacer" />
@@ -398,7 +393,7 @@ export function KubeTargetView({ me }: { me: Me }) {
       </div>
 
       {isAdmin && (
-        <div className="card" style={{ marginTop: 16 }}>
+        <div id="operations" className="card" style={{ marginTop: 16 }}>
           <div className="card-head"><h2>Operations</h2>
             <span className="subtle">destructive actions require typing the cluster name:&nbsp;</span>
             <input value={confirm} onChange={(e) => setConfirm(e.target.value)}
@@ -407,36 +402,15 @@ export function KubeTargetView({ me }: { me: Me }) {
           <div className="grid2">
             <div>
               <h3 className="section-label">CR configuration</h3>
-              <div className="field"><label>Bundle</label>
-                <select value={crAction} onChange={(e) => {
-                  const v = e.target.value as typeof crAction;
-                  setCrAction(v);
-                  setCrParams(v === "patroni_params" ? PATRONI_BUNDLE : PGBACKREST_BUNDLE);
-                }}>
-                  <option value="patroni_params">Patroni dynamicConfiguration parameters</option>
-                  <option value="pgbackrest_global">pgBackRest global options</option>
-                </select></div>
-              <div className="field"><label>Parameters (JSON, editable)</label>
-                <textarea rows={8} className="mono" style={{ width: "100%" }}
-                          value={crParams} onChange={(e) => setCrParams(e.target.value)} /></div>
-              {crAction === "patroni_params" && (
-                <div className="field"><label>
-                  <input type="checkbox" checked={prepReset} onChange={(e) => setPrepReset(e.target.checked)} />
-                  &nbsp;prep: reset checkpointer stats after verify</label></div>
-              )}
-              <button onClick={() => {
-                const p = parsedCrParams();
-                if (!p) { setErr("parameters are not valid JSON"); return; }
-                launch("cr-apply", { params: { action: crAction, dry_run: true,
-                  [crAction === "patroni_params" ? "parameters" : "global"]: p } });
-              }}>Dry-run (show patch + diff)</button>{" "}
-              <button className="primary" onClick={() => {
-                const p = parsedCrParams();
-                if (!p) { setErr("parameters are not valid JSON"); return; }
-                launch("cr-apply", { confirm, params: { action: crAction,
-                  [crAction === "patroni_params" ? "parameters" : "global"]: p,
-                  prep: prepReset ? { reset_checkpointer: true } : {} } });
-              }}>Apply & verify</button>
+              <p className="subtle" style={{ marginTop: 0 }}>
+                Configuration changes go through the <strong>Parameter map</strong> — a
+                typed, validated, per-parameter surface where a bad name or out-of-range
+                value can&apos;t be staged, and the proven tuning bundles stage as one click
+                into that same validated flow. (The old raw-JSON editor was retired: two
+                apply paths to the same CR let a hand-typed value bypass validation.)
+              </p>
+              <Link className="btn primary" to={`/ops/targets/${targetId}/params`}>
+                Open the Parameter map</Link>
               <h3 className="section-label" style={{ marginTop: 24 }}>Backup schedules</h3>
               <p className="subtle">Pause the operator&apos;s schedules for a test window (snapshot kept;
                 the UI nags until restored).</p>
@@ -532,7 +506,7 @@ export function KubeTargetView({ me }: { me: Me }) {
       )}
 
       {canOp && (
-        <div className="card" style={{ marginTop: 16 }}>
+        <div id="snapshots" className="card" style={{ marginTop: 16 }}>
           <div className="card-head"><h2>CR snapshots</h2>
             <span className="subtle" style={{ fontSize: 12 }}>
               every apply/PMM/schedules op snapshots the CR before patching</span>
@@ -571,7 +545,7 @@ export function KubeTargetView({ me }: { me: Me }) {
       )}
 
       {canOp && (
-        <div className="card" style={{ marginTop: 16 }}>
+        <div id="monitor" className="card" style={{ marginTop: 16 }}>
           <div className="card-head"><h2>Telemetry monitor</h2>
             {activeMonitor && <span className="badge running">running (job {activeMonitor.id})</span>}
           </div>
@@ -603,7 +577,7 @@ export function KubeTargetView({ me }: { me: Me }) {
         const lastPmm = runs.find((r) => ["pmm-enable", "pmm-status", "pmm-disable"].includes(r.kind));
         const pmmParams = { server_host: pmmHost.trim(), query_source: pmmSource, extension: pmmExt };
         return (
-          <div className="card" style={{ marginTop: 16 }}>
+          <div id="pmm" className="card" style={{ marginTop: 16 }}>
             <div className="card-head"><h2>PMM monitoring</h2>
               {instPods.length > 0 && (
                 <span className={`badge ${pmmPods === instPods.length ? "ok" : pmmPods > 0 ? "running" : "failed"}`}>
@@ -716,7 +690,7 @@ export function KubeTargetView({ me }: { me: Me }) {
         </div>
       )}
 
-      <div className="card" style={{ marginTop: 16 }}>
+      <div id="runs" className="card" style={{ marginTop: 16 }}>
         <div className="card-head"><h2>Op runs on this target</h2>
           <div className="spacer" /><Link className="btn" to="/ops/runs">all ops runs →</Link></div>
         <OpsRunsTable runs={runs} />
