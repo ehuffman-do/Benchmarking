@@ -321,6 +321,33 @@ def stitch(run_dir: Path) -> Stitched:
         s.probe = {"client_downtime_ms": None,
                    "note": "no fire marker or no probe ticks"}
 
+    # ── per-path probe decomposition (dual-path helper: pgbouncer vs ha) ──
+    # Field lesson: the pgBouncer path carries a server_login_retry backoff
+    # tail the direct -ha path does not; report each path's downtime
+    # separately so the delta is visible, not averaged away.
+    per_path: dict[str, Any] = {}
+    for extra in sorted(raw.glob("probe_*.log")):
+        label = extra.stem.replace("probe_", "")
+        pt = parse_probe_log(extra)
+        if not pt or fire_ms is None:
+            continue
+        pf = min((t.local_ms for t in pt if not t.ok and t.local_ms >= fire_ms),
+                 default=None)
+        if pf is None:
+            per_path[label] = {"client_downtime_ms": 0}
+            continue
+        lob = max((t.local_ms for t in pt if t.ok and t.local_ms <= pf),
+                  default=None)
+        foa = min((t.local_ms for t in pt if t.ok and t.local_ms > pf),
+                  default=None)
+        per_path[label] = {
+            "client_downtime_ms": (foa - lob) if (foa and lob) else None,
+            "detection_ms": pf - fire_ms,
+            "first_ok_after_ms": foa,
+        }
+    if per_path:
+        s.probe["per_path"] = per_path
+
     # ── patroni: authoritative leader before/after + promote ──
     leader_before = fire.get("leader_before", "")
     tl_before = fire.get("tl_before")

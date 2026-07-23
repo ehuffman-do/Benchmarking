@@ -333,6 +333,16 @@ label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px
 .log-src { color: var(--muted); flex: none; width: 170px; overflow: hidden;
   text-overflow: ellipsis; }
 
+/* ── in-page section nav (target page) ── */
+.section-nav { position: sticky; top: 0; z-index: 5; display: flex; gap: 4px;
+  flex-wrap: wrap; padding: 8px 0; margin-bottom: 12px; background: var(--bg);
+  border-bottom: 1px solid var(--line); }
+.section-nav-link { font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  color: var(--ink-dim); text-decoration: none; border: 1px solid transparent; }
+.section-nav-link:hover { background: var(--surface-2); border-color: var(--line);
+  text-decoration: none; }
+[id] { scroll-margin-top: 52px; }   /* offset anchors under the sticky nav */
+
 /* ── misc ── */
 .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
 .toolbar .spacer { margin-left: auto; }

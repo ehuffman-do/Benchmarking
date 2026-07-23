@@ -351,19 +351,30 @@ def reconcile_startup(cfg: Config, conn: sqlite3.Connection) -> None:
         pid_start = (job["pid_start"] if "pid_start" in job.keys() else "") or ""
         alive = bool(pid) and _pid_is_our_child(int(pid), pid_start)
         if not alive:
-            # 'canceling' with a dead pid was a stop in flight -> canceled; a
-            # 'running' orphan crashed -> failed (and is resumable for sweeps).
-            terminal = "canceled" if job["state"] == "canceling" else "failed"
+            # Dead pid. Task jobs (no run dir) read their real outcome from the
+            # job log — a prepare that finished cleanly right as the worker
+            # restarted must not be mislabeled 'failed'. 'canceling' -> canceled;
+            # a 'running' benchmark orphan -> failed (resumable for sweeps).
+            if job["run_id"] is None and job["kind"] in (
+                    "prepare", "preflight", "doctor"):
+                terminal, err = _task_outcome_from_log(cfg, job["id"], job["state"])
+            else:
+                terminal = "canceled" if job["state"] == "canceling" else "failed"
+                err = ("stopped (worker restart)" if terminal == "canceled"
+                       else "interrupted (worker restart); resume from the run page")
             queries.update_job(conn, job["id"], state=terminal, pid=None,
-                               finished_utc=utc_now_iso(),
-                               error=("stopped (worker restart)" if terminal == "canceled"
-                                      else "interrupted (worker restart); resume from the run page"))
-        elif job["state"] == "running" and job["kind"] in (
-                "run", "soak", "suite", "device_probe"):
+                               finished_utc=utc_now_iso(), error=err)
+        elif job["state"] == "running":
             # The harness child SURVIVED the worker restart (KillMode=process;
             # it is its own process group). Re-attach: watch the pid and
             # converge the job + run when it finishes — a deploy mid-way
-            # through a week-long benchmark must not lose it.
+            # through a week-long benchmark, OR a multi-hour dataset PREPARE,
+            # must not be lost. Task kinds (prepare/preflight/doctor) produce
+            # no run dir, so their terminal state is read from the job log.
+            # (Field bug: prepare was omitted from this list, so an orphaned
+            # multi-hour prepare stayed 'running' forever with nothing
+            # watching it — the UI never updated and the target could not be
+            # deleted.)
             threading.Thread(target=_reattach_orphan,
                              args=(cfg, job["id"], int(pid), pid_start),
                              name=f"reattach-{job['id']}", daemon=True).start()
@@ -397,6 +408,36 @@ def _sweep_stale_kubeconfigs(cfg: Config, conn: sqlite3.Connection) -> None:
                 pass
 
 
+_TASK_OK_MARKERS = ("dataset ready:", "load metrics:", "preflight OK",
+                    "doctor: all checks passed", "environment OK")
+_TASK_FAIL_MARKERS = ("Traceback (most recent call last)", "FATAL:",
+                      "sysbench prepare exited with code",
+                      "reported success but no benchmark tables",
+                      " ERROR ")
+
+
+def _task_outcome_from_log(cfg: Config, job_id: int,
+                           prev_state: str) -> tuple[str, str]:
+    """Terminal (state, error) for an orphaned task job (no run dir) from its
+    job log. Success markers win; an explicit error marks failed; if neither
+    is present the outcome is unconfirmable, so fail with a clear note rather
+    than claim a success we can't verify."""
+    if prev_state == "canceling":
+        return "canceled", "stopped (worker restart)"
+    log_path = cfg.data_dir / "jobs" / f"job_{job_id}.out"
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "failed", "interrupted (worker restart); job log unavailable"
+    tail = text[-8000:]
+    if any(m in tail for m in _TASK_OK_MARKERS):
+        return "done", ""
+    if any(m in tail for m in _TASK_FAIL_MARKERS):
+        return "failed", "task failed (converged after worker restart) — see the job log"
+    return "failed", ("could not confirm completion after a worker restart — "
+                      "re-run to be sure (a finished dataset load is idempotent)")
+
+
 def _reattach_orphan(cfg: Config, job_id: int, pid: int,
                      pid_start: str = "", poll_s: float = 5.0) -> None:
     """Adopted child from before a worker restart: poll the pid (we cannot
@@ -421,12 +462,19 @@ def _reattach_orphan(cfg: Config, job_id: int, pid: int,
                 status = manifest.get("status", "")
             except (OSError, ValueError):
                 status = ""
-        state = "done" if status in ("complete", "partial") else             ("canceled" if job["state"] == "canceling" else "failed")
+            state = ("done" if status in ("complete", "partial")
+                     else "canceled" if job["state"] == "canceling"
+                     else "failed")
+            err = ("" if state == "done" else
+                   f"run ended with status '{status or 'unknown'}' "
+                   "(converged after worker restart)")
+        else:
+            # Task job (prepare/preflight/doctor): no run dir/manifest — read
+            # the terminal outcome from the job log's tail markers instead of
+            # blindly failing a load that actually completed.
+            state, err = _task_outcome_from_log(cfg, job_id, job["state"])
         queries.update_job(conn, job_id, state=state, pid=None,
-                           finished_utc=utc_now_iso(),
-                           error="" if state == "done" else
-                           f"run ended with status '{status or 'unknown'}' "
-                           "(converged after worker restart)")
+                           finished_utc=utc_now_iso(), error=err)
         index.reconcile(conn, cfg.results_dir)
         try:   # the adopted job's decrypted kubeconfig copy dies with it
             (cfg.data_dir / "kubeconfigs" / f".job_{job_id}.kubeconfig").unlink()

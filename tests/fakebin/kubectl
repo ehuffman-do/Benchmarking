@@ -250,6 +250,15 @@ def pod_json(st, name, kind):
                 "reason": "OOMKilled", "exitCode": 137,
                 "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                             time.gmtime(now() - 120))}}
+        # A deliberate SIGKILL (failover/crash test): exit 137 but reason is
+        # NOT OOMKilled — the health/monitor OOM checks must ignore it.
+        if (os.environ.get("FAKE_KUBE_SIGKILL") and kind == "instance"
+                and c["name"] == "database"):
+            cs["restartCount"] = 1
+            cs["lastState"] = {"terminated": {
+                "reason": "Error", "exitCode": 137,
+                "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime(now() - 30))}}
         statuses.append(cs)
     limits = ({"memory": os.environ["FAKE_KUBE_MEM_LIMIT"]}
               if os.environ.get("FAKE_KUBE_MEM_LIMIT") else {})
@@ -584,10 +593,14 @@ def run_sql(st, sql):
     if "pg_database_size" in s:
         return "13100000000"
     if "clock_timestamp" in s:
-        # probe-style query answered inside the pod (not via pgbouncer)
+        # probe-style query: report the CURRENT leader's IP so a promotion
+        # shows up as an address flip (the election signal, distinct from TL).
         from datetime import datetime, timezone
         ts = datetime.now(timezone.utc).isoformat()
-        return f"{ts}|f|10.244.0.20"
+        leader_inst = next((i for i in st["instances"]
+                            if i["name"] == st["leader"]), None)
+        addr = leader_inst["ip"] if leader_inst else "10.244.0.20"
+        return f"{ts}|f|{addr}"
     return ""
 
 
@@ -745,11 +758,38 @@ def handle_exec(st, pod, argv):
             save(st)
             out(f"INFO: {btype} backup label = {label}")
             return 0
+    # In-cluster helper probe: `sh -c 'PGPASSWORD="$(cat)" psql "$1" ... -c "$2"
+    # -c "$3"' probe <conninfo> <write_sql> <select_sql>` with the password on
+    # stdin (never in argv). Rewrite to the conninfo + trailing SQL so the
+    # normal psql branch handles it.
+    if (argv[0] == "sh" and len(argv) >= 7 and "-c" in argv[:2]
+            and "psql" in argv[2]):
+        conninfo = argv[4]
+        sql = argv[-1]                      # the SELECT (clock_timestamp) tick
+        argv = ["psql", conninfo, "-c", sql]
+        joined = " ".join(argv)
     if argv[0] == "psql" or "psql" in joined.split():
         sql = ""
         for i, a in enumerate(argv):
             if a == "-c" and i + 1 < len(argv):
                 sql = argv[i + 1]
+        # In-cluster helper probe: connects to a service (host=<cr>-ha /
+        # <cr>-pgbouncer) rather than exec'ing on the leader. It sees an
+        # outage whenever the cluster has no writable primary — a restart
+        # window, a pending election, or a rolling restart.
+        via_service = "host=" in joined and (f"{st['cluster']}-ha" in joined
+                                             or f"{st['cluster']}-pgbouncer" in joined)
+        if via_service:
+            maybe_elect(st)
+            st = load()
+            down = (rolling(st)
+                    or (st.get("killed_at") and now() < st["killed_at"] + RESTART_S)
+                    or (st.get("elect_at") and now() < st["elect_at"])
+                    or not pod_alive(st, st["leader"]))
+            if down:
+                sys.stderr.write("psql: error: connection to server failed: "
+                                 "Connection refused\n")
+                return 2
         if st["killed_at"] and now() < st["killed_at"] + RESTART_S \
                 and pod == st["leader"]:
             sys.stderr.write("psql: error: connection to server failed: "
@@ -1293,9 +1333,20 @@ def main():
             return 1
         return handle_exec(st, pod, args[dash + 1:])
     if cmd == "top":
-        out("NAME CPU(cores) MEMORY(bytes)")
+        mem = os.environ.get("FAKE_KUBE_TOP_MEM", "2048Mi")
+        if "--containers" in args:
+            # POD CONTAINER CPU MEM (per-container view)
+            if "--no-headers" not in args:
+                out("POD NAME CPU(cores) MEMORY(bytes)")
+            for i in st["instances"]:
+                cpu = "890m" if i["name"] == st["leader"] else "120m"
+                out(f"{i['name']} database {cpu} {mem}")
+                out(f"{i['name']} pgbackrest 5m 64Mi")
+            return 0
+        if "--no-headers" not in args:
+            out("NAME CPU(cores) MEMORY(bytes)")
         for i in st["instances"]:
-            out(f"{i['name']} {'890m' if i['name'] == st['leader'] else '120m'} 2048Mi")
+            out(f"{i['name']} {'890m' if i['name'] == st['leader'] else '120m'} {mem}")
         return 0
     sys.stderr.write(f"fake kubectl: unhandled: {' '.join(args[:4])}\n")
     return 1

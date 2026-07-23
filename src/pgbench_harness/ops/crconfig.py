@@ -267,13 +267,20 @@ def await_cluster_ready(kube: Kube, cr_name: str, names: list[str],
             if bad:
                 detail = f"member(s) not healthy: {', '.join(bad)}"
             else:
-                still = [n for n, r in (catalog_rows(kube, leader, names)
-                                        or {}).items()
-                         if r.get("pending_restart")] if names else []
-                if still:
-                    detail = f"still pending restart: {', '.join(still)}"
+                rows = catalog_rows(kube, leader, names) if names else {}
+                if rows is None:
+                    # The catalog query FAILED (leader psql transiently
+                    # unreachable while it comes up) — that is missing data,
+                    # not proof of convergence. Keep polling; never read a
+                    # failed query as "no pending restarts".
+                    detail = "leader not yet queryable (pg_settings unavailable)"
                 else:
-                    return True, leader
+                    still = [n for n, r in rows.items()
+                             if r.get("pending_restart")]
+                    if still:
+                        detail = f"still pending restart: {', '.join(still)}"
+                    else:
+                        return True, leader
         except KubeError as exc:
             detail = str(exc)[:200]
         if time.monotonic() >= deadline:
@@ -724,11 +731,18 @@ _MANAGED_PATHS = {
 }
 
 
-def snapshot_diff_summary(snapshot: dict[str, Any], live: dict[str, Any]
-                          ) -> dict[str, Any]:
+def snapshot_diff_summary(snapshot: Any, live: Any) -> dict[str, Any]:
     """Per-managed-section [old_from_live, new_from_snapshot] changes that a
     revert would apply, plus a one-line human summary. 'old' is the CURRENT
-    live value (what the revert changes away from), 'new' is the snapshot's."""
+    live value (what the revert changes away from), 'new' is the snapshot's.
+
+    A CR document that is valid JSON but not an object (a stray/corrupt
+    cr_snapshot.json holding a list or scalar) is treated as empty rather than
+    raising — the snapshot browser must degrade, never 500 on one odd run."""
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    if not isinstance(live, dict):
+        live = {}
     sections: dict[str, dict[str, list]] = {}
     total = 0
     for name, path in _MANAGED_PATHS.items():
@@ -896,6 +910,17 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
             # Old values from the source run's diff; keys that didn't exist
             # before revert to removal (None in a merge patch).
             proposed = {k: old for k, (old, _new) in changed.items()}
+            # A key the original apply REMOVED is not in `changed` — its prior
+            # value lives in diff.json's `current`. Restore it too, or the
+            # rollback would silently leave that GUC deleted.
+            try:
+                d = json.loads((src_dir / "diff.json").read_text(encoding="utf-8"))
+                cur = d.get("current") or {}
+                for k in (d.get("removed") or []):
+                    if k in cur and k not in proposed:
+                        proposed[k] = cur[k]
+            except (OSError, ValueError):
+                pass
             action = src_action
             run.event("rollback", f"rolling back {len(proposed)} parameter(s)",
                       f"from run {params.get('rollback_of')}")

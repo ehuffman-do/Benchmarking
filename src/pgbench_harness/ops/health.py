@@ -306,8 +306,11 @@ def evaluate_kube(kube: Kube, cr_name: str, instances: list[str],
         # allocation failure below, which keeps the container running).
         for c in cs:
             term = ((c.get("lastState") or {}).get("terminated") or {})
-            if (str(term.get("reason") or "") == "OOMKilled"
-                    or int(term.get("exitCode") or 0) == 137):
+            # OOM kills ALWAYS set reason=OOMKilled. Keying on exitCode 137
+            # alone (128+SIGKILL) misfires on every deliberate crash-test kill
+            # (pgkill/pod-delete/sysrq) and a plain operator `kubectl delete`,
+            # producing phantom OOM crits during failover scenarios.
+            if str(term.get("reason") or "") == "OOMKilled":
                 oom_events += 1
                 out.add(f"oom_{name}_{c.get('name')}", "crit",
                         f"Container OOM-killed: {name}/{c.get('name')}",
@@ -356,9 +359,13 @@ def evaluate_kube(kube: Kube, cr_name: str, instances: list[str],
             continue
         if not res.ok:
             continue
+        # Anchor on PostgreSQL error-level lines so an app query string or a
+        # log message merely CONTAINING "out of memory" doesn't trip a crit —
+        # the real signatures are FATAL/ERROR/PANIC lines.
         hits = [ln.strip()[:240] for ln in res.stdout.splitlines()
                 if ("Cannot allocate memory" in ln
-                    or "out of memory" in ln.lower())]
+                    or ("out of memory" in ln.lower()
+                        and any(lvl in ln for lvl in ("FATAL", "ERROR", "PANIC"))))]
         if hits:
             out.add(f"alloc_{pod}", "crit",
                     f"Memory allocation failure on {pod}",
@@ -374,7 +381,11 @@ def evaluate_kube(kube: Kube, cr_name: str, instances: list[str],
     # be absent; degrade silently). Also feeds the leak-trend history.
     out.check()
     try:
-        res = kube.run(["top", "pods", "--no-headers"], timeout_s=20)
+        # Per-CONTAINER working set: compare the database container's own usage
+        # to its own limit. `top pods` (pod total) over-reports pressure for a
+        # multi-container instance pod (database + pgbackrest + pmm sidecars).
+        res = kube.run(["top", "pods", "--containers", "--no-headers"],
+                       timeout_s=20)
         rows = res.stdout.splitlines() if res.ok else []
     except KubeError:
         rows = []
@@ -382,16 +393,20 @@ def evaluate_kube(kube: Kube, cr_name: str, instances: list[str],
     ws_max = 0.0
     for ln in rows:
         parts = ln.split()
-        if len(parts) < 3 or (cr_name and not parts[0].startswith(cr_name)):
+        # `--containers` columns: POD CONTAINER CPU MEM
+        if len(parts) < 4 or (cr_name and not parts[0].startswith(cr_name)):
             continue
-        ws = _mem_to_bytes(parts[2])
+        pod, container = parts[0], parts[1]
+        if container != "database":
+            continue
+        ws = _mem_to_bytes(parts[3])
         if not ws:
             continue
         ws_max = max(ws_max, ws)
-        lim = mem_limits.get(parts[0])
+        lim = mem_limits.get(pod)
         if lim and ws / lim * 100 >= th["mem_pct_warn"]:
-            out.add(f"mem_{parts[0]}", "warn",
-                    f"Memory pressure on {parts[0]}",
+            out.add(f"mem_{pod}", "warn",
+                    f"Memory pressure on {pod}",
                     f"{ws / 1024 ** 2:.0f} MiB of {lim / 1024 ** 2:.0f} MiB "
                     f"limit ({ws / lim * 100:.0f}%)",
                     "The working set is close to the container limit — the "

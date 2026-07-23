@@ -548,18 +548,24 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         tgt = queries.get_target(conn, target_id)
         if tgt is None:
             raise HTTPException(404, "target not found")
-        # A queued/running job resolves this row (and its password ref) at
-        # exec time — deleting underneath it would fail the job confusingly.
-        active = conn.execute(
-            "SELECT count(*) FROM jobs WHERE target_id=? AND state IN "
-            "('queued','running','canceling')", (target_id,)).fetchone()[0]
-        if active:
-            raise HTTPException(409, f"target has {active} queued/running "
-                                     "job(s) — stop or wait for them first")
+        # Delete always succeeds: jobs.target_id references targets(id) with
+        # foreign_keys=ON, so delete_target detaches every job (any state)
+        # first — a running job keeps its already-resolved password in the
+        # child's env, it only loses the saved-target convenience link. A
+        # QUEUED job that would launch against this target is canceled so it
+        # can't start against a target (and secret) that no longer exists.
+        # (An earlier 'block while a job is active' guard wedged delete on
+        # ORPHANED jobs left 'running' by a worker restart — the exact state
+        # the user hit — so deletion no longer blocks on job state at all.)
+        canceled = conn.execute(
+            "UPDATE jobs SET state='canceled', finished_utc=?, "
+            "error='target deleted' WHERE target_id=? AND state='queued'",
+            (utc_now_iso(), target_id)).rowcount
         queries.delete_target(conn, target_id)
         store.delete(tgt["password_ref"])
-        queries.audit(conn, user["username"], "target_delete", target=tgt["name"])
-        return JSONResponse({"deleted": True})
+        queries.audit(conn, user["username"], "target_delete", target=tgt["name"],
+                      detail=(f"canceled {canceled} queued job(s)" if canceled else ""))
+        return JSONResponse({"deleted": True, "canceled_queued": canceled})
 
     @app.post("/api/targets/{target_id}")
     def api_update_target(target_id: int, request: Request, payload: dict,

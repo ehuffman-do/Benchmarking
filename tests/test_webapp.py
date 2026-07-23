@@ -854,22 +854,51 @@ def test_targets_crud_rbac_and_no_password_exposed(web):
 def test_target_delete_with_job_history_is_not_a_500(web):
     """J1 regression: jobs.target_id references targets(id) with FKs ON —
     deleting a target that ever ran a job used to die with an IntegrityError
-    the API surfaced as a 500. History detaches; the target deletes cleanly."""
+    the API surfaced as a 500. Delete now ALWAYS succeeds: it detaches every
+    job (any state) and cancels queued ones, so an ORPHANED job left 'running'
+    by a worker restart can never wedge the delete (the exact reported bug)."""
     client, cfg = web
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
     _make_target(client)
     tid = client.get("/api/targets", auth=("op", "oppw")).json()[0]["id"]
     r = client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "target_id": tid},
                     auth=("op", "oppw"))
     assert r.status_code == 200
-    # while the job is queued/running the delete is refused with a clear 409
+    # Simulate an ORPHANED job: worker restarted, job stuck 'running' with a
+    # dead pid — the state that made the target undeletable.
+    conn = connect(cfg.db_path)
+    jid = queries.list_jobs(conn)[0]["id"]
+    queries.update_job(conn, jid, state="running", pid=999999999)
+    conn.close()
     r = client.delete(f"/api/targets/{tid}", auth=("op", "oppw"))
-    assert r.status_code == 409 and "job" in r.json()["detail"]
-    _run_worker_once(cfg)
-    # finished job history must not block the delete (nor 500 it)
+    assert r.status_code == 200, r.text            # NOT 409, NOT 500
+    assert all(t["id"] != tid for t in client.get("/api/targets", auth=("op", "oppw")).json())
+    # the job row survives with its target link detached (no dangling FK)
+    conn = connect(cfg.db_path)
+    job = queries.get_job(conn, jid)
+    assert job["target_id"] is None
+    conn.close()
+
+
+def test_target_delete_cancels_queued_jobs(web):
+    """A queued job that would launch against a now-deleted target (and its
+    erased password secret) is canceled, not left to fail cryptically."""
+    client, cfg = web
+    from pgbench_webapp import queries
+    from pgbench_webapp.db import connect
+    _make_target(client)
+    tid = client.get("/api/targets", auth=("op", "oppw")).json()[0]["id"]
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "target_id": tid},
+                auth=("op", "oppw"))
+    conn = connect(cfg.db_path)
+    jid = queries.list_jobs(conn)[0]["id"]         # still 'queued'
+    conn.close()
     r = client.delete(f"/api/targets/{tid}", auth=("op", "oppw"))
-    assert r.status_code == 200, r.text
-    runs = client.get("/api/runs", auth=("viewer", "vpw")).json()
-    assert runs                                     # the run history survives
+    assert r.status_code == 200 and r.json()["canceled_queued"] >= 1
+    conn = connect(cfg.db_path)
+    assert queries.get_job(conn, jid)["state"] == "canceled"
+    conn.close()
 
 
 def test_target_backed_run_reuses_password_and_surfaces_host(web):

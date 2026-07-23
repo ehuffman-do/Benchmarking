@@ -65,6 +65,19 @@ function docUrl(p: PgParam, pgVersion: string): string {
   return `https://www.postgresql.org/docs/${major}/${page}.html#GUC-${p.name.toUpperCase().replace(/_/g, "-")}`;
 }
 
+// Proven tuning bundles — folded in from the retired raw-JSON editor. These
+// stage into the NORMAL validated flow (each value checked against the live
+// catalog), never a blind apply, so a bundle can't smuggle a bad value past
+// the parameter map's validation the way the old JSON textarea could.
+const PATRONI_BUNDLE: Record<string, string> = {
+  max_wal_size: "49152", min_wal_size: "2048", archive_timeout: "300",
+  wal_keep_size: "2048", checkpoint_timeout: "900",
+  checkpoint_completion_target: "0.9",
+};
+const PGBACKREST_BUNDLE: Record<string, string> = {
+  "process-max": "4", "archive-async": "y", "spool-path": "/pgdata",
+};
+
 const QUICK_FILTERS = [
   ["all", "All"],
   ["modified", "Non-default"],
@@ -220,6 +233,24 @@ export function KubeParams({ me }: { me: Me }) {
     });
   }
 
+  // Stage a whole bundle at once — each value validated against the live
+  // catalog before it lands in the staged set (skipped with a note if the
+  // parameter isn't in this server's catalog or the value is out of range).
+  function stageBundle(bundle: Record<string, string>) {
+    if (!cat) return;
+    const next: Record<string, string> = {};
+    const skipped: string[] = [];
+    for (const [name, v] of Object.entries(bundle)) {
+      const p = cat.params.find((x) => x.name === name);
+      if (!p) { skipped.push(`${name} (not in catalog)`); continue; }
+      const bad = validate(p, v);
+      if (bad) { skipped.push(`${name} (${bad})`); continue; }
+      next[name] = v;
+    }
+    setStaged((s) => ({ ...s, ...next }));
+    setErr(skipped.length ? `staged ${Object.keys(next).length}; skipped: ${skipped.join(", ")}` : null);
+  }
+
   async function apply(dryRun: boolean) {
     setErr(null);
     try {
@@ -313,6 +344,23 @@ export function KubeParams({ me }: { me: Me }) {
                       staged={stagedBk} setStaged={setStagedBk}
                       confirm={confirm} setConfirm={setConfirm}
                       confirmName={kt.cr_name || kt.name} onApply={applyBk} />
+      )}
+
+      {tab === "pg" && isAdmin && (
+        <div className="card" style={{ marginBottom: 12 }}>
+          <div className="card-head"><h2>Bundles</h2>
+            <span className="subtle" style={{ fontSize: 12 }}>
+              one click stages a proven set into the validated flow below</span>
+            <div className="spacer" />
+            <button className="btn-sm" onClick={() => stageBundle(PATRONI_BUNDLE)}>
+              Stage WAL/checkpoint tuning bundle</button>
+          </div>
+          <p className="subtle" style={{ margin: 0, fontSize: 12 }}>
+            Each value is validated against this server&apos;s live catalog before it
+            stages — a bundle can never bypass the map&apos;s type/range checks. Review the
+            staged set and dry-run before applying.
+          </p>
+        </div>
       )}
 
       {tab === "pg" && stagedNames.length > 0 && (
@@ -490,6 +538,16 @@ function SidecarPanel({ kind, options, crKind, isAdmin, live, staged, setStaged,
         <p className="subtle" style={{ margin: "0 0 8px" }}>
           Current values come from the last parameter snapshot — hit <em>Refresh
           snapshot</em> after an apply to see them update.</p>
+      )}
+      {kind === "pgbackrest" && isAdmin && (
+        <div style={{ margin: "0 0 10px" }}>
+          <button className="btn-sm" onClick={() =>
+            setStaged((s) => ({ ...s, ...PGBACKREST_BUNDLE }))}>
+            Stage async-archiving bundle</button>
+          <span className="subtle" style={{ fontSize: 12, marginLeft: 8 }}>
+            process-max=4, archive-async=y, spool-path=/pgdata (review the
+            spool-path trade-off before applying)</span>
+        </div>
       )}
       {stagedNames.length > 0 && (
         <div className="card" style={{ marginBottom: 12 }}>
