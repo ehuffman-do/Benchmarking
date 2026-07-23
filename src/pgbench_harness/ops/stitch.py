@@ -159,8 +159,40 @@ def scan_pgbouncer_logs(raw_dir: Path) -> dict[str, Any]:
     return {"first_crash_ms": first_crash, "last_retry_ms": last_retry}
 
 
-_PATRONI_PROMOTE = re.compile(r"promoted self to leader|"
-                              r"i am .* the leader with the lock", re.IGNORECASE)
+_PATRONI_PROMOTE = re.compile(
+    r"promoted self to leader|i am .* the leader with the lock|"
+    r"acquired session lock as the leader|"
+    r"cleared rewind state|selected new timeline|"
+    r"database system is ready to accept connections", re.IGNORECASE)
+
+# Crash-validity: a valid C1/C2 crash means PostgreSQL received NO shutdown
+# signal. These lines prove a GRACEFUL shutdown happened instead — their
+# presence in the kill window invalidates the run as a crash test
+# (DBAAS-8917: DO power-off delivers ACPI; the guest shuts down cleanly).
+_GRACEFUL_SHUTDOWN = re.compile(
+    r"received fast shutdown request|received smart shutdown request|"
+    r"shutdown immediate|aborting any active transactions|"
+    r"database system is shut down", re.IGNORECASE)
+
+
+def scan_crash_validity(raw_dir: Path, fire_ms: Optional[int],
+                        window_ms: int = 90_000) -> dict[str, Any]:
+    """Grep captured PG logs for graceful-shutdown markers in the kill window.
+
+    A hit on a crash case (pod-delete / node-loss) means the kill was NOT a
+    crash — PostgreSQL was signalled and checkpointed. Returns the first such
+    marker (if any) so the verdict can stamp the run INVALID-AS-CRASH."""
+    lo = (fire_ms - 5_000) if fire_ms is not None else None
+    hi = (fire_ms + window_ms) if fire_ms is not None else None
+    for path in sorted(raw_dir.glob("patroni_*.log")):
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not _GRACEFUL_SHUTDOWN.search(line):
+                continue
+            ts = _line_ts_ms(line)
+            if lo is None or (ts is not None and lo <= ts <= hi):
+                return {"graceful": True, "marker_ms": ts,
+                        "line": line.strip()[:200]}
+    return {"graceful": False, "marker_ms": None, "line": ""}
 
 
 def scan_patroni_logs(raw_dir: Path, fire_ms: int) -> Optional[int]:
@@ -208,6 +240,31 @@ def stitch(run_dir: Path) -> Stitched:
     samples = parse_patroni_samples(raw / "patroni_samples.jsonl")
     artifacts = parse_probe_artifacts(raw / "probe_artifacts.log")
     s.probe_artifacts = artifacts
+
+    # ── effective-kill (T0') auto-detection ──
+    # The fire marker records T0 = when the instruction was ISSUED. For an
+    # out-of-band kill (node panic, droplet action) the old primary keeps
+    # serving writes for tens of seconds; anchoring downtime on T0 would
+    # charge that delivery delay to the outage. The TRUE kill instant is the
+    # last successful write to the old primary — re-baseline on it when the
+    # delay is material (>2s). (DBAAS-8917: +42s power-off, +24s sysrq.)
+    t0_issued = fire_ms
+    effective_ms: Optional[int] = None
+    if fire_ms is not None and ticks:
+        first_fail_any = min((t.local_ms for t in ticks
+                              if not t.ok and t.local_ms >= fire_ms), default=None)
+        anchor = first_fail_any if first_fail_any is not None else fire_ms
+        last_ok = max((t.local_ms for t in ticks
+                       if t.ok and t.local_ms < anchor), default=None)
+        if last_ok is not None:
+            effective_ms = last_ok
+    kill_delay_ms = (effective_ms - t0_issued) \
+        if (effective_ms is not None and t0_issued is not None) else None
+    rebased = kill_delay_ms is not None and kill_delay_ms > 2000
+    if rebased:
+        fire_ms = effective_ms
+    s.fire = {**fire, "t0_issued_ms": t0_issued, "effective_kill_ms": effective_ms,
+              "kill_delay_ms": kill_delay_ms, "rebased_on_effective_kill": rebased}
 
     # Clock skew: median (db - local) across OK ticks.
     skews = [t.db_ms - t.local_ms for t in ticks
@@ -290,11 +347,23 @@ def stitch(run_dir: Path) -> Stitched:
             s.probe["first_ok_after_ms"] - promote_ms
 
     # ── classification: LEADER NAME decides; TL corroborates ──
+    # Three-way (stitch-case-c parity): a DIFFERENT member promoted is a true
+    # election; the SAME leader returning with a TL bump is an in-place
+    # re-promotion, explicitly NOT a failover; same leader, same TL is a plain
+    # restart. The flip boolean alone can't tell the second from the third.
+    tl_bumped = (tl_before is not None and tl_after is not None
+                 and tl_after > tl_before)
     if leader_before and leader_after:
         flip = leader_after != leader_before
+        if flip:
+            kind = "election"
+        elif tl_bumped:
+            kind = "restart-in-place-repromote"
+        else:
+            kind = "restart-in-place"
         s.classification = {
             "flip": flip,
-            "kind": "election" if flip else "restart-in-place",
+            "kind": kind,
             "basis": "patroni leader name before vs after (authoritative); "
                      "probe IP is deliberately ignored — pod restarts change the "
                      "IP without a failover",
@@ -306,6 +375,15 @@ def stitch(run_dir: Path) -> Stitched:
     else:
         s.classification = {"flip": None, "kind": "unknown",
                             "basis": "insufficient patroni data"}
+
+    # ── crash-validity (C1/C2 only): did PostgreSQL get a graceful shutdown? ──
+    case = str(fire.get("scenario") or "")
+    if case in ("pod-delete", "node-loss"):
+        cv = scan_crash_validity(raw, fire_ms)
+        s.classification["crash_valid"] = not cv["graceful"]
+        if cv["graceful"]:
+            s.classification["invalid_as_crash"] = True
+            s.classification["graceful_marker"] = cv["line"]
 
     # ── T7 / full HA recovery: must follow an OBSERVED dip ──
     dip_ms = None
@@ -392,14 +470,30 @@ def render_timeline_txt(s: Stitched) -> str:
                  f"target={s.fire.get('target_pod', '?')}")
     lines.append(f"FIRE (UTC) : {s.fire.get('ts_utc', '?')}")
     cls = s.classification
+    _KINDLABEL = {
+        "election": "YES — real election (a different member promoted)",
+        "restart-in-place-repromote": "NO — restart in place (SAME leader "
+                                      "re-promoted with a TL bump; not a failover)",
+        "restart-in-place": "NO — restart in place",
+        "unknown": "unknown",
+    }
     lines.append(f"FLIP?      : "
-                 + ("YES — real election" if cls.get("flip")
-                    else "NO — restart in place" if cls.get("flip") is False
-                    else "unknown")
+                 + _KINDLABEL.get(cls.get("kind", "unknown"), cls.get("kind", "?"))
                  + f"   (leader {s.patroni.get('leader_before', '?')} -> "
                    f"{s.patroni.get('leader_after', '?')}; "
                    f"TL {s.patroni.get('tl_before', '?')} -> "
                    f"{s.patroni.get('tl_after', '?')})")
+    if cls.get("invalid_as_crash"):
+        lines.append("!! INVALID AS CRASH — PostgreSQL received a GRACEFUL "
+                     "shutdown in the kill window; this run does NOT measure a "
+                     "crash. " + (cls.get("graceful_marker", "")[:80]))
+    elif cls.get("crash_valid") is True:
+        lines.append("CRASH OK   : no graceful-shutdown markers in the kill "
+                     "window — valid crash semantics")
+    if s.fire.get("rebased_on_effective_kill"):
+        lines.append(f"KILL DELAY : old primary served writes until "
+                     f"+{s.fire['kill_delay_ms'] / 1000:.1f}s after the "
+                     "instruction (out-of-band kill); offsets measured from T0'")
     dt = s.probe.get("client_downtime_ms")
     lines.append(f"DOWNTIME   : "
                  + (f"{dt / 1000:.1f}s client write downtime" if dt is not None

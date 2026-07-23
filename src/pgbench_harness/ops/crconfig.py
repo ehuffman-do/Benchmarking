@@ -712,6 +712,126 @@ def _schedules_action(kube: Kube, run: OpsRun, spec: OpsSpec,
     return EXIT_OK
 
 
+# The CR sections a snapshot revert is allowed to touch — the same managed
+# paths every apply already goes through. Everything else in the CR (status,
+# resources, images, operator-owned plumbing) is shown in the diff but never
+# patched by a revert: reverting an image or a replica count blindly would be
+# far more dangerous than the config drift a revert is meant to undo.
+_MANAGED_PATHS = {
+    "patroni_params": PATRONI_PARAMS_PATH,
+    "pgbackrest_global": PGBACKREST_GLOBAL_PATH,
+    "pgbouncer_global": PGBOUNCER_GLOBAL_PATH,
+}
+
+
+def snapshot_diff_summary(snapshot: dict[str, Any], live: dict[str, Any]
+                          ) -> dict[str, Any]:
+    """Per-managed-section [old_from_live, new_from_snapshot] changes that a
+    revert would apply, plus a one-line human summary. 'old' is the CURRENT
+    live value (what the revert changes away from), 'new' is the snapshot's."""
+    sections: dict[str, dict[str, list]] = {}
+    total = 0
+    for name, path in _MANAGED_PATHS.items():
+        snap_vals = _dig(snapshot, path)
+        live_vals = _dig(live, path)
+        keys = set(snap_vals) | set(live_vals)
+        changes: dict[str, list] = {}
+        for k in sorted(keys):
+            sv = snap_vals.get(k)
+            lv = live_vals.get(k)
+            if str(sv) != str(lv):
+                changes[k] = [None if lv is None else str(lv),
+                              None if sv is None else str(sv)]
+        if changes:
+            sections[name] = changes
+            total += len(changes)
+    if not total:
+        summary = "identical to live"
+    else:
+        parts = [f"{name.replace('_', ' ')} ({len(ch)})"
+                 for name, ch in sections.items()]
+        summary = f"differs in {total} field(s): " + ", ".join(parts)
+    return {"sections": sections, "total": total, "summary": summary}
+
+
+def _revert_snapshot(kube: Kube, run: OpsRun, spec: OpsSpec,
+                     cr: dict[str, Any], results_dir: Path,
+                     params: dict[str, Any]) -> int:
+    """Revert the managed CR sections to a prior snapshot's values.
+
+    Same principle as rollback: a revert is a NEW targeted merge patch built
+    from the diff (snapshot vs live), never a blind apply of the whole
+    snapshot document. Confirm + dry-run + verify envelope applies; the
+    revert itself already snapshotted the current CR above, so it is undoable."""
+    t = spec.target
+    src_id = str(params.get("snapshot_of") or "")
+    src_dir = results_dir / "ops" / src_id
+    snap_path = src_dir / "cr_snapshot.json"
+    if not snap_path.exists():
+        run.finalize("failed", error=f"snapshot cr_snapshot.json not found for "
+                     f"run '{src_id}'")
+        return EXIT_FAILED
+    try:
+        snapshot = json.loads(snap_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        run.finalize("failed", error=f"snapshot unreadable: {str(exc)[:200]}")
+        return EXIT_FAILED
+
+    diff = snapshot_diff_summary(snapshot, cr)
+    atomic_write_text(run.run_dir / "revert_diff.json", json.dumps(diff, indent=2))
+    if not diff["total"]:
+        run.event("revert", "nothing to revert",
+                  "the managed CR sections already match the snapshot")
+        run.finalize("complete", headline={"action": "revert_snapshot",
+                                           "changed": {}, "applied": False,
+                                           "outcome": "no change needed"})
+        return EXIT_OK
+
+    # Build one merge patch across every managed section that differs.
+    patch: dict[str, Any] = {}
+    combined_changes: dict[str, list] = {}
+    for name, changes in diff["sections"].items():
+        path = _MANAGED_PATHS[name]
+        leaf = {k: (new if new is not None else None)
+                for k, (_old, new) in changes.items()}
+        _deep_merge(patch, _nest(path, leaf))
+        for k, v in changes.items():
+            combined_changes[f"{name}.{k}"] = v
+    atomic_write_text(run.run_dir / "patch.json", json.dumps(patch, indent=2))
+    run.headline_update(action="revert_snapshot", changed=combined_changes,
+                        snapshot_of=src_id, applied=False,
+                        outcome="planned")
+
+    if params.get("dry_run"):
+        run.event("dry-run", "no changes applied",
+                  f"{diff['total']} field(s) would revert")
+        run.finalize("complete", headline={"action": "revert_snapshot",
+                                           "dry_run": True,
+                                           "changed": combined_changes,
+                                           "diff": diff})
+        return EXIT_OK
+
+    kube.run(["patch", t.cr_kind, t.cr_name, "--type", "merge",
+              "-p", json.dumps(patch)], check=True)
+    run.headline_update(applied=True, outcome="applied, unverified")
+    run.event("revert", f"reverted {diff['total']} field(s) to snapshot {src_id}",
+              diff["summary"])
+    run.finalize("complete", headline={"action": "revert_snapshot",
+                                       "changed": combined_changes,
+                                       "applied": True,
+                                       "snapshot_of": src_id,
+                                       "outcome": "applied (revert)"})
+    return EXIT_OK
+
+
+def _deep_merge(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+
+
 def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
     t = spec.target
     params = spec.params
@@ -725,10 +845,27 @@ def run_cr_apply(spec: OpsSpec, results_dir: Path) -> int:
     try:
         cr = _snapshot_cr(kube, run, t.cr_kind, t.cr_name)
 
+        if action == "snapshot":
+            # Manual "snapshot now" — the CR is already captured above; record
+            # a one-line summary of the managed sections so the browser can
+            # list it without re-reading the whole document.
+            managed = {
+                "patroni_params": len(_dig(cr, PATRONI_PARAMS_PATH)),
+                "pgbackrest_global": len(_dig(cr, PGBACKREST_GLOBAL_PATH)),
+                "pgbouncer_global": len(_dig(cr, PGBOUNCER_GLOBAL_PATH)),
+            }
+            run.event("snapshot", "manual CR snapshot captured",
+                      ", ".join(f"{k}={v}" for k, v in managed.items()))
+            run.finalize("complete", headline={"action": "snapshot",
+                                               "managed_counts": managed})
+            return EXIT_OK
+
         if action in ("pause_schedules", "restore_schedules"):
             return _schedules_action(kube, run, spec, cr, action)
         if action == "patroni_dcs":
             return _patroni_dcs_action(kube, run, spec, cr, params)
+        if action == "revert_snapshot":
+            return _revert_snapshot(kube, run, spec, cr, results_dir, params)
 
         # Resolve what we're changing.
         if action == "rollback":

@@ -1031,6 +1031,64 @@ def test_cr_apply_rollback_restores_previous_values(opsweb):
     assert params["max_wal_size"] == "4096"
 
 
+def test_cr_snapshot_browser_and_revert(opsweb):
+    """N: manual snapshot -> apply a change -> the snapshot browser lists both
+    with a diff-vs-live summary -> revert restores the snapshot's values via a
+    targeted patch (managed sections only)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    # 1) manual snapshot of the pristine CR
+    r = client.post(f"/api/kube-targets/{tid}/cr-snapshot", json={},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    snap = _last_ops_run(client, "cr-apply")
+    assert snap["headline"]["action"] == "snapshot"
+    # 2) change a managed param, then snapshot again so "current" reflects it
+    #    (snapshots are captured pre-patch, so the freshest captured state is
+    #    the newest snapshot)
+    _apply_cr(client, cfg, tid, {"action": "patroni_params",
+                                 "parameters": {"max_wal_size": "8192"},
+                                 "verify_timeout_s": 10})
+    _drain_queue(cfg)
+    client.post(f"/api/kube-targets/{tid}/cr-snapshot", json={}, auth=("op", "oppw"))
+    _drain_queue(cfg)
+    # 3) the browser lists snapshots with a diff summary vs the latest snapshot
+    snaps = client.get(f"/api/kube-targets/{tid}/cr-snapshots",
+                       auth=("viewer", "vpw")).json()["snapshots"]
+    assert any(s["op_run_id"] == snap["op_run_id"] for s in snaps)
+    the_snap = next(s for s in snaps if s["op_run_id"] == snap["op_run_id"])
+    assert the_snap["diff_total"] >= 1 and "max_wal_size" not in the_snap  # summary only
+    diff = client.get(f"/api/ops/runs/{snap['op_run_id']}/cr-snapshot-diff",
+                      auth=("viewer", "vpw")).json()
+    assert diff["sections"]["patroni_params"]["max_wal_size"][1] == "4096"
+    # 4) dry-run revert changes nothing
+    r = client.post(f"/api/kube-targets/{tid}/cr-revert",
+                    json={"params": {"snapshot_of": snap["op_run_id"],
+                                     "dry_run": True}}, auth=("admin", "apw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    st = json.loads(_fake_state_file(cfg).read_text())
+    assert st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]["max_wal_size"] == "8192"
+    # 5) real revert restores 4096 (needs the typed confirmation)
+    r = client.post(f"/api/kube-targets/{tid}/cr-revert",
+                    json={"confirm": "cluster1",
+                          "params": {"snapshot_of": snap["op_run_id"]}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "cr-apply")
+    assert run["status"] == "complete", run
+    assert run["headline"]["action"] == "revert_snapshot"
+    st = json.loads(_fake_state_file(cfg).read_text())
+    assert st["cr"]["spec"]["patroni"]["dynamicConfiguration"]["postgresql"]["parameters"]["max_wal_size"] == "4096"
+    # revert without confirmation is refused
+    r = client.post(f"/api/kube-targets/{tid}/cr-revert",
+                    json={"params": {"snapshot_of": snap["op_run_id"]}},
+                    auth=("admin", "apw"))
+    assert r.status_code == 400
+
+
 def test_schedules_pause_and_restore_with_nag(opsweb):
     client, cfg = opsweb
     tid = _ready_target(client, cfg)
@@ -1332,6 +1390,22 @@ def test_health_oom_and_alloc_findings(opsweb, monkeypatch):
     assert doc["metrics"]["oom_events"] >= 1
 
 
+def test_kube_target_delete_with_health_history_is_not_a_500(opsweb):
+    """J1 twin: health_history carries a NOT NULL FK to kube_targets — a
+    target with recorded health checks used to be undeletable (500)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    client.post(f"/api/kube-targets/{tid}/health", auth=("op", "oppw"))
+    _drain_queue(cfg)
+    hist = client.get(f"/api/kube-targets/{tid}/health-history",
+                      auth=("viewer", "vpw")).json()["history"]
+    assert hist                                    # history exists pre-delete
+    r = client.delete(f"/api/kube-targets/{tid}", auth=("admin", "apw"))
+    assert r.status_code == 200, r.text
+    assert client.get(f"/api/kube-targets/{tid}",
+                      auth=("viewer", "vpw")).status_code == 404
+
+
 def test_logs_op_follows_selected_containers(opsweb):
     """H: the Logs tab backend — a worker op follows the selected containers
     into raw/ capture files (the web tier never runs kubectl)."""
@@ -1529,6 +1603,55 @@ def test_backup_from_replica_records_source(opsweb):
     assert "--backup-standby=y" in patches
 
 
+@pytest.mark.parametrize("source,path,btype,suffix", [
+    ("leader", "direct", "full", "F"),
+    ("leader", "direct", "diff", "D"),
+    ("leader", "direct", "incr", "I"),
+    ("leader", "operator", "full", "F"),
+    ("leader", "operator", "incr", "I"),
+    ("replica", "operator", "full", "F"),
+    ("replica", "operator", "incr", "I"),
+])
+def test_backup_matrix_cell(opsweb, source, path, btype, suffix):
+    """L: every source × path × type cell reaches a verified 'complete' with the
+    right label suffix and source role (one named case per matrix cell)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    r = _fire_backup(client, tid, {"type": btype, "path": path, "source": source,
+                                   "timeout_s": 30, "sample_interval_s": 0.2,
+                                   "settle_s": 0.3})
+    assert r.status_code == 200, r.text
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "backup")
+    assert run["status"] == "complete", run
+    h = run["headline"]
+    assert h["type"] == btype and h["label"].endswith(suffix)
+    assert h["source_role"] == source
+    # completion verified against pgbackrest info (a fresh set is present)
+    assert (cfg.results_dir / "ops" / run["op_run_id"] / "raw" /
+            "pgbackrest_info_after.json").exists()
+
+
+def test_schedules_round_trip_preserves_cron_exactly(opsweb):
+    """L: snapshot -> pause -> restore must reproduce the CR's cron specs
+    byte-for-byte (a schedule silently dropped is a missed backup)."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    before = json.loads(_fake_state_file(cfg).read_text())
+    orig = before["cr"]["spec"]["backups"]["pgbackrest"]["repos"][0]["schedules"]
+    r = client.post(f"/api/kube-targets/{tid}/schedules/pause",
+                    json={"confirm": "cluster1"}, auth=("admin", "apw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    r = client.post(f"/api/kube-targets/{tid}/schedules/restore",
+                    json={"confirm": "cluster1"}, auth=("admin", "apw"))
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    after = json.loads(_fake_state_file(cfg).read_text())
+    restored = after["cr"]["spec"]["backups"]["pgbackrest"]["repos"][0]["schedules"]
+    assert restored == orig                        # exact round-trip
+
+
 def test_backup_requires_confirmation_and_mutex(opsweb):
     client, cfg = opsweb
     tid = _ready_target(client, cfg)
@@ -1637,6 +1760,25 @@ def test_scenario_case_c1_pod_delete_election(opsweb, monkeypatch):
     assert h["flip"] is True and h["kind"] == "election"
     assert h["tl_after"] == h["tl_before"] + 1
     assert h["downtime_ms"] >= 1000
+
+
+def test_scenario_case_c2_node_loss_via_sysrq(opsweb, monkeypatch):
+    """M1: node-loss fires a sysrq kernel panic from a privileged node-pinned
+    pod (never cordon+delete, which signals PG). The leader's node dies, a
+    replica is elected."""
+    client, cfg = opsweb
+    monkeypatch.setenv("FAKE_KUBE_ELECT_S", "2")
+    monkeypatch.setenv("FAKE_KUBE_RECREATE_S", "3")
+    tid = _ready_target(client, cfg)
+    r = _fire_scenario(client, tid, "node-loss", extra={"settle_s": 8})
+    assert r.status_code == 200
+    _drain_queue(cfg)
+    run = _last_ops_run(client, "scenario")
+    assert run["status"] == "complete", run
+    events = (cfg.results_dir / "ops" / run["op_run_id"] / "events.jsonl").read_text()
+    assert "sysrq kernel panic" in events          # not cordon+delete
+    h = run["headline"]
+    assert h["flip"] is True and h["kind"] == "election"
 
 
 def test_scenario_refuses_to_fire_during_backup(opsweb, monkeypatch):
@@ -1879,6 +2021,46 @@ def test_invalid_ops_params_rejected_at_api(opsweb):
         r = client.post(f"/api/kube-targets/{tid}/{path}", json=body,
                         auth=("admin", "apw"))
         assert r.status_code == 400, f"{path} {body} -> {r.status_code}"
+
+
+def test_ops_routes_never_500_on_malformed_input(opsweb):
+    """J: every ops mutation route must map bad input to a typed 4xx — never a
+    500. A 500 leaks internals and means an unhandled path; this sweeps the
+    mutation surface (including the routes added for logs / snapshots / revert)
+    with garbage payloads and asserts none of them crash."""
+    client, cfg = opsweb
+    tid = _ready_target(client, cfg)
+    garbage = [
+        {"params": "notadict"},
+        {"params": {"sources": "notalist"}},
+        {"params": {"tail": "lots"}},
+        {"params": {"since": "yesterday"}},
+        {"params": {"snapshot_of": "../../etc/passwd"}},
+        {"params": {"action": "revert_snapshot"}},        # missing snapshot_of
+        {"params": {"checks": "notalist"}},
+        {"params": {"watch_s": "forever"}},
+        {"params": {"replicas": "many"}},
+        {"confirm": "cluster1", "params": {"operation": "explode"}},
+    ]
+    routes = ["logs", "cr-snapshot", "cr-revert", "diag", "operate", "monitor",
+              "cr-apply", "backup", "scenario", "health"]
+    for route in routes:
+        for body in garbage:
+            r = client.post(f"/api/kube-targets/{tid}/{route}", json=body,
+                            auth=("admin", "apw"))
+            assert r.status_code != 500, f"{route} {body} -> 500: {r.text[:200]}"
+            assert r.status_code in (200, 400, 403, 404, 409), \
+                f"{route} {body} -> unexpected {r.status_code}"
+    # unknown target id is a clean 404 everywhere, not a 500
+    for route in routes:
+        r = client.post(f"/api/kube-targets/999999/{route}",
+                        json={"params": {}}, auth=("admin", "apw"))
+        assert r.status_code in (400, 404), f"{route} missing target -> {r.status_code}"
+    # bad snapshot-diff / compare ids -> 4xx, not 500
+    assert client.get("/api/ops/runs/..%2F..%2Fetc/cr-snapshot-diff",
+                      auth=("viewer", "vpw")).status_code in (400, 404)
+    assert client.get("/api/ops/compare?runs=only-one",
+                      auth=("viewer", "vpw")).status_code == 400
 
 
 def test_worker_loop_monitor_does_not_block_benchmarks(opsweb, monkeypatch):

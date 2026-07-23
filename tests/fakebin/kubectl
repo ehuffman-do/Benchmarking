@@ -1249,6 +1249,27 @@ def main():
             save(st)
             out(f'node "{node}" deleted')
             return 0
+    if cmd == "run":
+        # A privileged crash pod pinned to a node (the sysrq node-loss fire).
+        # Parse --overrides for the target nodeName and simulate node loss:
+        # every pod on that node vanishes and an election starts.
+        node = ""
+        for a in args:
+            if a.startswith("--overrides="):
+                try:
+                    ov = json.loads(a.split("=", 1)[1])
+                    node = ((ov.get("spec") or {}).get("nodeName") or "")
+                except ValueError:
+                    node = ""
+        if node:
+            st["lost_nodes"].append(node)
+            leader_inst = next((i for i in st["instances"]
+                                if i["name"] == st["leader"]), None)
+            if leader_inst and leader_inst["node"] == node:
+                st["elect_at"] = now() + ELECT_S
+            save(st)
+        out(f"pod/{args[1]} created")
+        return 0
     if cmd in ("cordon", "drain"):
         out(f"node/{args[1]} cordoned")
         return 0

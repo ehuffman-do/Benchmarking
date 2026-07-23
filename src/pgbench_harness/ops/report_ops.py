@@ -162,6 +162,9 @@ def comparison_payload(run_dir: Path) -> dict[str, Any]:
         "downtime_ms": h.get("downtime_ms"),
         "detection_ms": h.get("detection_ms"),
         "flip": h.get("flip"), "classification": h.get("kind", ""),
+        "crash_valid": h.get("crash_valid"),
+        "invalid_as_crash": h.get("invalid_as_crash", False),
+        "kill_delay_ms": h.get("kill_delay_ms"),
         "tl_change": (f"{h.get('tl_before')} → {h.get('tl_after')}"
                       if h.get("tl_before") is not None else ""),
         "new_primary": (h.get("leader_after")

@@ -428,6 +428,49 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
                               payload.get("label") or "", user["username"], mutex)
         return JSONResponse({"job_id": job_id})
 
+    @app.post("/api/kube-targets/{target_id}/cr-snapshot")
+    def ops_cr_snapshot_now(target_id: int, request: Request, payload: dict,
+                            conn: sqlite3.Connection = Depends(get_conn),
+                            user: sqlite3.Row = Depends(require("operator"))) -> JSONResponse:
+        """Manual 'snapshot now, before I do something' — read-only capture of
+        the current CR, so operator role and no confirmation."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        job_id = _enqueue_ops(conn, kt, "cr-apply", {"action": "snapshot"},
+                              payload.get("label") or f"cr-snapshot-{kt['name']}",
+                              user["username"])
+        return JSONResponse({"job_id": job_id})
+
+    @app.post("/api/kube-targets/{target_id}/cr-revert")
+    def ops_cr_revert(target_id: int, request: Request, payload: dict,
+                      conn: sqlite3.Connection = Depends(get_conn),
+                      user: sqlite3.Row = Depends(require("admin"))) -> JSONResponse:
+        """Revert the managed CR sections to a prior snapshot (targeted patch
+        from the diff). Destructive: typed confirmation + mutex; dry-run needs
+        neither."""
+        _csrf(request, payload)
+        kt = _kt_or_404(conn, target_id)
+        if not kt["cr_name"]:
+            raise HTTPException(400, "target has no CR name — run discover first")
+        params = _params(payload)
+        src = str(params.get("snapshot_of") or "").strip()
+        if not src:
+            raise HTTPException(400, "snapshot_of (the op run id to revert to) "
+                                     "is required")
+        _safe_segment(src)                      # 400 on traversal shapes
+        params["action"] = "revert_snapshot"
+        dry_run = bool(params.get("dry_run"))
+        mutex: tuple[str, ...] = ()
+        if not dry_run:
+            _require_confirm(kt, payload)
+            mutex = DESTRUCTIVE_KINDS
+        job_id = _enqueue_ops(conn, kt, "cr-apply", params,
+                              payload.get("label") or f"cr-revert-{kt['name']}",
+                              user["username"], mutex)
+        return JSONResponse({"job_id": job_id})
+
     @app.post("/api/kube-targets/{target_id}/backup")
     def ops_backup(target_id: int, request: Request, payload: dict,
                    conn: sqlite3.Connection = Depends(get_conn),
@@ -574,6 +617,99 @@ def register(app: FastAPI, cfg: Config, store: SecretStore) -> None:
                               payload.get("label") or f"pmm-disable-{kt['name']}",
                               user["username"], DESTRUCTIVE_KINDS)
         return JSONResponse({"job_id": job_id})
+
+    @app.get("/api/kube-targets/{target_id}/cr-snapshots")
+    def ops_cr_snapshots(target_id: int,
+                         conn: sqlite3.Connection = Depends(get_conn),
+                         user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        """Every CR snapshot across this target's op runs, newest first, each
+        with a one-line diff summary vs the FRESHEST captured CR state (the
+        newest snapshot). Snapshots are captured pre-patch, so 'snapshot now'
+        after a change gives an up-to-date baseline; the diff is informational,
+        the revert restores the selected snapshot's managed sections regardless.
+
+        Every cr-apply/pmm/schedules/operate op already writes cr_snapshot.json
+        before patching — this surfaces them as a browsable, revertable list."""
+        kt = _kt_or_404(conn, target_id)
+        from pgbench_harness.ops.crconfig import snapshot_diff_summary
+        # The live CR: prefer the freshest snapshot from the newest op run, or
+        # the cached params overlay. (A dedicated live fetch is a worker job;
+        # the newest snapshot is the cheapest honest "current" we have here.)
+        ops_dir = cfg.results_dir / "ops"
+        rows: list[dict[str, Any]] = []
+        if ops_dir.exists():
+            for d in ops_dir.iterdir():
+                snap = d / "cr_snapshot.json"
+                if not snap.is_file():
+                    continue
+                meta = read_meta(d)
+                if meta is None or (meta.get("target") or {}).get("name") != kt["name"]:
+                    continue
+                rows.append({"dir": d, "meta": meta})
+        rows.sort(key=lambda r: r["meta"].get("created_utc", ""), reverse=True)
+        live: dict[str, Any] = {}
+        if rows:
+            try:
+                live = json.loads((rows[0]["dir"] / "cr_snapshot.json")
+                                  .read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                live = {}
+        out = []
+        prev_summary = None
+        for r in rows:
+            try:
+                snap = json.loads((r["dir"] / "cr_snapshot.json")
+                                  .read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            diff = snapshot_diff_summary(snap, live)
+            # Dedupe identical consecutive snapshots in the list view.
+            if diff["summary"] == prev_summary == "identical to live":
+                continue
+            prev_summary = diff["summary"]
+            m = r["meta"]
+            out.append({
+                "op_run_id": m.get("op_run_id", r["dir"].name),
+                "op": m.get("op", ""),
+                "action": (m.get("headline") or {}).get("action", ""),
+                "created_utc": m.get("created_utc", ""),
+                "status": m.get("status", ""),
+                "diff_summary": diff["summary"],
+                "diff_total": diff["total"],
+            })
+        return JSONResponse({"snapshots": out})
+
+    @app.get("/api/ops/runs/{op_run_id}/cr-snapshot-diff")
+    def ops_cr_snapshot_diff(op_run_id: str,
+                             conn: sqlite3.Connection = Depends(get_conn),
+                             user: sqlite3.Row = Depends(require("viewer"))) -> JSONResponse:
+        """Full section-grouped diff of one snapshot vs the newest snapshot
+        for its target (the revert preview)."""
+        run_dir = _op_run_dir(op_run_id)
+        snap_p = run_dir / "cr_snapshot.json"
+        if not snap_p.is_file():
+            raise HTTPException(404, "this op run has no CR snapshot")
+        meta = read_meta(run_dir) or {}
+        tname = (meta.get("target") or {}).get("name", "")
+        from pgbench_harness.ops.crconfig import snapshot_diff_summary
+        ops_dir = cfg.results_dir / "ops"
+        newest = None
+        for d in ops_dir.iterdir() if ops_dir.exists() else []:
+            if not (d / "cr_snapshot.json").is_file():
+                continue
+            m = read_meta(d)
+            if m is None or (m.get("target") or {}).get("name") != tname:
+                continue
+            key = m.get("created_utc", "")
+            if newest is None or key > newest[0]:
+                newest = (key, d)
+        try:
+            snap = json.loads(snap_p.read_text(encoding="utf-8"))
+            live = json.loads((newest[1] / "cr_snapshot.json").read_text(
+                encoding="utf-8")) if newest else {}
+        except (OSError, ValueError):
+            raise HTTPException(500, "snapshot unreadable")
+        return JSONResponse(snapshot_diff_summary(snap, live))
 
     @app.get("/api/kube-targets/{target_id}/health-history")
     def ops_health_history(target_id: int,

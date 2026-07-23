@@ -102,6 +102,13 @@ def get_target_by_name(conn: sqlite3.Connection, name: str) -> Optional[sqlite3.
 
 
 def delete_target(conn: sqlite3.Connection, target_id: int) -> None:
+    """Delete a saved target, detaching its (finished) job history first.
+
+    jobs.target_id references targets(id) and foreign_keys=ON — without the
+    detach, deleting any target that ever ran a job died with an
+    IntegrityError the API surfaced as a 500. Job rows and run dirs remain;
+    they just lose the saved-target link (the run artifacts are the record)."""
+    conn.execute("UPDATE jobs SET target_id=NULL WHERE target_id=?", (target_id,))
     conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
 
 
@@ -319,6 +326,9 @@ def update_kube_target(conn: sqlite3.Connection, target_id: int, **fields: Any) 
 def delete_kube_target(conn: sqlite3.Connection, target_id: int) -> None:
     conn.execute("UPDATE jobs SET kube_target_id=NULL WHERE kube_target_id=?", (target_id,))
     conn.execute("UPDATE ops_runs SET kube_target_id=NULL WHERE kube_target_id=?", (target_id,))
+    # health_history has a NOT NULL FK — it is a bounded trend cache, not an
+    # archive (the ops run logs remain the record), so it goes with the target.
+    conn.execute("DELETE FROM health_history WHERE kube_target_id=?", (target_id,))
     conn.execute("DELETE FROM kube_targets WHERE id=?", (target_id,))
 
 
