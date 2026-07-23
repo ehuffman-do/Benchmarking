@@ -548,6 +548,14 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
         tgt = queries.get_target(conn, target_id)
         if tgt is None:
             raise HTTPException(404, "target not found")
+        # A queued/running job resolves this row (and its password ref) at
+        # exec time — deleting underneath it would fail the job confusingly.
+        active = conn.execute(
+            "SELECT count(*) FROM jobs WHERE target_id=? AND state IN "
+            "('queued','running','canceling')", (target_id,)).fetchone()[0]
+        if active:
+            raise HTTPException(409, f"target has {active} queued/running "
+                                     "job(s) — stop or wait for them first")
         queries.delete_target(conn, target_id)
         store.delete(tgt["password_ref"])
         queries.audit(conn, user["username"], "target_delete", target=tgt["name"])

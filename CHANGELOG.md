@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — failover lab, CR snapshot revert, target-delete fix
+
+- **Target delete no longer 500s** (J1): `jobs.target_id` / `health_history`
+  foreign keys made a target that had ever run a job or health check
+  undeletable (IntegrityError → 500). Delete now detaches finished job
+  history and refuses with a 409 while a job is still active.
+- **Case C2 node-loss is a real crash** (M1): fires a sysrq kernel panic
+  from a privileged, node-pinned pod instead of cordon+delete — DO
+  power-off (ACPI) and cordon/drain all let PostgreSQL checkpoint
+  cleanly and invalidate the run as node loss (DBAAS-8917).
+- **Stitcher parity with the Aries field scripts** (M4): effective-kill
+  (T0′) auto-detection so an out-of-band kill's delivery delay isn't
+  charged to downtime; three-way transition classification (election vs
+  in-place re-promotion vs plain restart); and a crash-validity check
+  that stamps a run INVALID-AS-CRASH when a graceful-shutdown marker
+  appears in the kill window.
+- **CR snapshot browser + one-click revert** (N): every config op already
+  snapshots the CR before patching — these are now a browsable list per
+  target (diff summary vs the freshest capture), with a manual "snapshot
+  now" and a guarded revert that rebuilds a targeted patch over the
+  managed sections only (never a blind whole-document apply), with the
+  full confirm/dry-run/verify envelope. The revert snapshots first, so
+  it is itself undoable.
+- **Backup matrix + API bug-bash tests** (L/J): an explicit
+  source × path × type backup grid, a schedules pause/restore
+  byte-for-byte round-trip, and a sweep asserting no ops mutation route
+  returns a 500 on malformed input.
+
 ## Unreleased — cr-apply correctness, guardrails, OOM detection, log viewer
 
 Fixes distilled from the huge_pages incident (2026-07-23, cluster

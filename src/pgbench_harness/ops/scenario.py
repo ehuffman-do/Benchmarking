@@ -45,11 +45,30 @@ PROBE_SELECT_SQL = ("SELECT clock_timestamp() || '|' || pg_is_in_recovery() || '
                     "|| coalesce(inet_server_addr()::text, '-')")
 
 CASES = {
-    "switchover": "graceful switchover (patronictl switchover --force)",
-    "pgkill": "postgres crash: kill -9 the postmaster on the leader",
-    "pod-delete": "force-delete the leader pod (--grace-period=0)",
-    "node-loss": "EXPERIMENTAL: cordon + delete the leader's node",
+    "switchover": "Case A — graceful switchover (patronictl switchover --force)",
+    "pgkill": "Case B — postgres crash: kill -9 the postmaster on the leader",
+    "pod-delete": "Case C1 — force-delete the leader pod (--grace-period=0)",
+    "node-loss": "Case C2 — hard node loss: sysrq kernel panic on the leader's "
+                 "node (privileged node-pinned pod)",
 }
+
+# Field lesson (DBAAS-8917): DO power-off delivers ACPI -> systemd/kubelet run
+# a GRACEFUL shutdown (PostgreSQL gets SIGTERM + a shutdown checkpoint), and
+# cordon+delete-node likewise signals PG — neither is node LOSS. The only
+# valid method is an instant kernel panic so PG never receives a signal.
+_SYSRQ_CMD = "echo 1 > /proc/sys/kernel/sysrq; echo c > /proc/sysrq-trigger"
+
+
+def _sysrq_panic_overrides(node: str) -> dict[str, Any]:
+    return {"spec": {
+        "nodeName": node, "hostPID": True, "restartPolicy": "Never",
+        "tolerations": [{"operator": "Exists"}],
+        "containers": [{
+            "name": "crash", "image": "busybox",
+            "securityContext": {"privileged": True},
+            "command": ["/bin/sh", "-c", _SYSRQ_CMD],
+        }],
+    }}
 
 
 def _now_iso_ms() -> str:
@@ -292,11 +311,21 @@ def _fire(kube: Kube, run: OpsRun, spec: OpsSpec, case: str, leader: str,
         kube.run(["delete", "pod", leader, "--grace-period=0", "--force"],
                  timeout_s=60, check=True)
     elif case == "node-loss":
-        run.event("warning", "node-loss is EXPERIMENTAL",
-                  "least-characterized path; validate against a disposable cluster")
-        kube.run(["cordon", leader_node], namespaced=False, timeout_s=60)
-        kube.run(["delete", "node", leader_node], namespaced=False,
-                 timeout_s=120, check=True)
+        if not leader_node:
+            raise KubeError("node-loss: leader node unknown")
+        # TRUE node loss = kernel panic, delivered from a privileged pod
+        # pinned to the node. Power-off / cordon+delete / drain all deliver a
+        # graceful path (PG gets SIGTERM + a clean shutdown checkpoint) and
+        # invalidate the run as a crash — the stitcher's crash-validity check
+        # will stamp such a run INVALID-AS-CRASH.
+        pod_name = f"crash-node-{run.op_run_id[-6:]}"
+        run.event("fire", "sysrq kernel panic on the leader's node",
+                  f"node {leader_node} via privileged pod {pod_name} "
+                  "(no signal reaches PostgreSQL — the pod itself dies with "
+                  "the node, which is expected)")
+        kube.run(["run", pod_name, "--image=busybox", "--restart=Never",
+                  f"--overrides={json.dumps(_sysrq_panic_overrides(leader_node))}"],
+                 timeout_s=30, check=True)
     else:
         raise KubeError(f"unknown scenario case '{case}'")
 
@@ -454,6 +483,9 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
                 "downtime_ms": stitched.probe.get("client_downtime_ms"),
                 "detection_ms": stitched.probe.get("detection_ms"),
                 "flip": cls.get("flip"), "kind": cls.get("kind"),
+                "crash_valid": cls.get("crash_valid"),
+                "invalid_as_crash": cls.get("invalid_as_crash", False),
+                "kill_delay_ms": stitched.fire.get("kill_delay_ms"),
                 "leader_before": stitched.patroni.get("leader_before"),
                 "leader_after": stitched.patroni.get("leader_after"),
                 "tl_before": stitched.patroni.get("tl_before"),
@@ -461,6 +493,10 @@ def run_scenario(spec: OpsSpec, results_dir: Path) -> int:
                 "backoff_tail_ms": stitched.pgbouncer.get("backoff_tail_ms"),
                 "full_ha_recovery_s": stitched.recovery.get("full_ha_recovery_s"),
             })
+            if cls.get("invalid_as_crash"):
+                run.event("warning", "INVALID AS CRASH",
+                          "PostgreSQL received a graceful shutdown in the kill "
+                          "window — this run does not measure crash semantics")
             run.event("stitch", "timeline stitched",
                       f"downtime {headline['downtime_ms']} ms, "
                       f"flip={headline['flip']} ({headline['kind']})")

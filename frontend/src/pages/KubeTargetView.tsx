@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
-import type { HealthDoc, HealthFinding, Job, KubeTarget, Me, OpsRun, Run, Topology } from "../types";
+import type { CrSnapshot, HealthDoc, HealthFinding, Job, KubeTarget, Me, OpsRun, Run, Topology } from "../types";
 import { openJobStream, CheckEvent } from "../lib/sse";
 import { CheckList, relTime } from "./ClusterOps";
 import { Crumbs } from "../components/Crumbs";
@@ -67,7 +67,7 @@ const CASES = [
   ["switchover", "Case A — graceful switchover (patronictl --force). Ref: ~4.6s, TL+1"],
   ["pgkill", "Case B — kill -9 the postmaster. Ref: restart in place, ~12–16s, no TL change"],
   ["pod-delete", "Case C1 — force-delete the leader pod. Ref: 22–31s write downtime at low load"],
-  ["node-loss", "Case C2 — cordon + delete the leader's node (EXPERIMENTAL)"],
+  ["node-loss", "Case C2 — hard node loss via sysrq kernel panic (privileged node-pinned pod; true crash, no signal to PG)"],
 ] as const;
 
 export function KubeTargetView({ me }: { me: Me }) {
@@ -108,6 +108,7 @@ export function KubeTargetView({ me }: { me: Me }) {
   // pg_stat_statements is the default query source: pg_stat_monitor has a
   // known memory-growth issue under sustained load (field report 2026-07).
   const [pmmSource, setPmmSource] = useState<"pgstatmonitor" | "pgstatements">("pgstatements");
+  const [snapshots, setSnapshots] = useState<CrSnapshot[]>([]);
 
   const load = useCallback(() => {
     api.get<KubeTarget>(`/api/kube-targets/${targetId}`).then(setKt).catch((e) => setErr(e.message));
@@ -124,6 +125,8 @@ export function KubeTargetView({ me }: { me: Me }) {
       setBenchRuns(rs.filter((r) => r.status && !["complete", "partial", "failed", "canceled"].includes(r.status)))
     ).catch(() => undefined);
     api.get<Job[]>("/api/jobs").then(setJobs).catch(() => undefined);
+    api.get<{ snapshots: CrSnapshot[] }>(`/api/kube-targets/${targetId}/cr-snapshots`)
+      .then((r) => setSnapshots(r.snapshots)).catch(() => undefined);
   }, [targetId]);
   useEffect(load, [load]);
 
@@ -525,6 +528,45 @@ export function KubeTargetView({ me }: { me: Me }) {
                 stanza lock or another destructive op is active on this target.</p>
             </div>
           </div>
+        </div>
+      )}
+
+      {canOp && (
+        <div className="card" style={{ marginTop: 16 }}>
+          <div className="card-head"><h2>CR snapshots</h2>
+            <span className="subtle" style={{ fontSize: 12 }}>
+              every apply/PMM/schedules op snapshots the CR before patching</span>
+            <div className="spacer" />
+            <button onClick={() => launch("cr-snapshot", {}, false)}>Snapshot now</button>
+          </div>
+          {snapshots.length === 0 ? (
+            <p className="empty">No CR snapshots yet — they appear here after the first
+              config op (or click “Snapshot now”).</p>
+          ) : (
+            <table>
+              <thead><tr><th>Taken by</th><th>When</th><th>Diff vs latest</th><th /></tr></thead>
+              <tbody>
+                {snapshots.map((s) => (
+                  <tr key={s.op_run_id}>
+                    <td><Link className="mono" to={`/ops/runs/${s.op_run_id}`}>
+                      {s.action || s.op}</Link></td>
+                    <td className="mono">{relTime(s.created_utc)}</td>
+                    <td className="subtle" style={{ fontSize: 12 }}>{s.diff_summary}</td>
+                    <td>{isAdmin && s.diff_total > 0 && (
+                      <button className="btn-sm" onClick={() => {
+                        if (!confirm) { setErr("type the cluster name in the Operations box to revert"); return; }
+                        if (!window.confirm(`Revert the managed CR sections to this snapshot (${s.diff_total} field(s))? A snapshot of the current CR is taken first, so this is undoable.`)) return;
+                        launch("cr-revert", { confirm, params: { snapshot_of: s.op_run_id } });
+                      }}>Revert…</button>)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {isAdmin && <p className="subtle" style={{ margin: "8px 0 0", fontSize: 12 }}>
+            Revert builds a targeted patch from the diff (managed sections only:
+            Patroni parameters, pgBackRest/pgBouncer globals) — never a blind apply of
+            the whole document. Type the cluster name in the Operations box first.</p>}
         </div>
       )}
 

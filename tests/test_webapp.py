@@ -851,6 +851,27 @@ def test_targets_crud_rbac_and_no_password_exposed(web):
     assert all(t["id"] != tid for t in client.get("/api/targets", auth=("op", "oppw")).json())
 
 
+def test_target_delete_with_job_history_is_not_a_500(web):
+    """J1 regression: jobs.target_id references targets(id) with FKs ON —
+    deleting a target that ever ran a job used to die with an IntegrityError
+    the API surfaced as a 500. History detaches; the target deletes cleanly."""
+    client, cfg = web
+    _make_target(client)
+    tid = client.get("/api/targets", auth=("op", "oppw")).json()[0]["id"]
+    r = client.post("/api/runs", json={"spec_yaml": _spec_yaml(), "target_id": tid},
+                    auth=("op", "oppw"))
+    assert r.status_code == 200
+    # while the job is queued/running the delete is refused with a clear 409
+    r = client.delete(f"/api/targets/{tid}", auth=("op", "oppw"))
+    assert r.status_code == 409 and "job" in r.json()["detail"]
+    _run_worker_once(cfg)
+    # finished job history must not block the delete (nor 500 it)
+    r = client.delete(f"/api/targets/{tid}", auth=("op", "oppw"))
+    assert r.status_code == 200, r.text
+    runs = client.get("/api/runs", auth=("viewer", "vpw")).json()
+    assert runs                                     # the run history survives
+
+
 def test_target_backed_run_reuses_password_and_surfaces_host(web):
     client, cfg = web
     _make_target(client)

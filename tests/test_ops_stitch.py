@@ -270,3 +270,72 @@ def test_no_outage_reports_zero_not_none(tmp_path):
     s = stitch(run)
     assert s.probe["client_downtime_ms"] == 0
     assert s.probe["fail_count"] == 0
+
+
+def test_in_place_repromote_is_not_a_failover(tmp_path):
+    """M4: SAME leader returns with a TL bump — an in-place re-promotion, not
+    a failover. The flip boolean alone can't tell this from a plain restart."""
+    fire = BASE_MS + 100000
+    run = tmp_path / "r"
+    write_fixture(run, scenario="pgkill",
+                  leader_before="pod-a", leader_after="pod-a",
+                  tl_before=5, tl_after=6,              # same leader, TL bumped
+                  fire_ms=fire, fail_from_ms=fire + 600,
+                  ok_again_ms=fire + 12000)
+    s = stitch(run)
+    assert s.classification["flip"] is False
+    assert s.classification["kind"] == "restart-in-place-repromote"
+
+
+def test_effective_kill_rebaseline_on_out_of_band_delay(tmp_path):
+    """M4: an out-of-band kill keeps serving writes for tens of seconds after
+    T0; downtime must be measured from the last good write (T0'), not T0."""
+    fire = BASE_MS + 100000
+    run = tmp_path / "r"
+    # writes keep succeeding until +30s (the kill lands late), then fail 8s
+    write_fixture(run, scenario="node-loss",
+                  leader_before="pod-a", leader_after="pod-b",
+                  tl_before=5, tl_after=6,
+                  fire_ms=fire, fail_from_ms=fire + 30000,
+                  ok_again_ms=fire + 38000)
+    s = stitch(run)
+    assert s.fire["rebased_on_effective_kill"] is True
+    assert s.fire["kill_delay_ms"] >= 29000
+    # downtime is the 8s outage, NOT 38s (which anchoring on T0 would give)
+    assert 7000 <= s.probe["client_downtime_ms"] <= 9000
+
+
+def test_crash_validity_flags_graceful_shutdown(tmp_path):
+    """M4: a graceful-shutdown marker in the kill window on a crash case
+    stamps the run INVALID-AS-CRASH (the check that caught DO power-off)."""
+    fire = BASE_MS + 100000
+    run = tmp_path / "r"
+    write_fixture(run, scenario="node-loss",
+                  leader_before="pod-a", leader_after="pod-b",
+                  tl_before=5, tl_after=6,
+                  fire_ms=fire, fail_from_ms=fire + 2000,
+                  ok_again_ms=fire + 10000)
+    (run / "raw" / "patroni_pod-a.log").write_text(
+        f"{iso(fire + 500)} LOG: received fast shutdown request\n"
+        f"{iso(fire + 800)} LOG: database system is shut down\n")
+    s = stitch(run)
+    assert s.classification["invalid_as_crash"] is True
+    assert s.classification["crash_valid"] is False
+    from pgbench_harness.ops.stitch import render_timeline_txt
+    assert "INVALID AS CRASH" in render_timeline_txt(s)
+
+
+def test_crash_validity_ok_when_no_graceful_marker(tmp_path):
+    """A real crash (no graceful markers) is crash_valid = True."""
+    fire = BASE_MS + 100000
+    run = tmp_path / "r"
+    write_fixture(run, scenario="pod-delete",
+                  leader_before="pod-a", leader_after="pod-b",
+                  tl_before=5, tl_after=6,
+                  fire_ms=fire, fail_from_ms=fire + 500,
+                  ok_again_ms=fire + 9000)
+    (run / "raw" / "patroni_pod-a.log").write_text(
+        f"{iso(fire + 300)} FATAL: terminating connection due to crash\n")
+    s = stitch(run)
+    assert s.classification["crash_valid"] is True
+    assert s.classification.get("invalid_as_crash", False) is False

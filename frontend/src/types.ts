@@ -192,6 +192,16 @@ export interface PodInfo {
   containers?: string[];
 }
 
+export interface CrSnapshot {
+  op_run_id: string;
+  op: string;
+  action: string;
+  created_utc: string;
+  status: string;
+  diff_summary: string;
+  diff_total: number;
+}
+
 export interface OpsRun {
   op_run_id: string;
   kind: string;
