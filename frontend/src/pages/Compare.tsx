@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import type { Run } from "../types";
@@ -10,6 +10,7 @@ export function Compare() {
   const [viewing, setViewing] = useState<string[] | null>(null);
   const [q, setQ] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -46,15 +47,24 @@ export function Compare() {
           + ([...selModes][0] !== "soak" ? " (sweeps align approximately)" : "");
 
   if (viewing) {
+    const q = viewing.map(encodeURIComponent).join(",");
+    // Print the REPORT inside the iframe, not the console chrome around it — so
+    // "Save as PDF" captures the whole comparison, every section, not one screen.
+    const printReport = () => {
+      const w = iframeRef.current?.contentWindow;
+      if (w) { w.focus(); w.print(); } else { window.print(); }
+    };
     return (
       <>
         <div className="toolbar no-print">
           <h1>Comparison</h1><div className="spacer" />
           <button onClick={() => setViewing(null)}>← Back to selection</button>
-          <button onClick={() => window.print()}>Print / PDF</button>
+          <a className="btn" href={`/compare/download?runs=${q}`}>⬇ Download report (.html)</a>
+          <a className="btn" href={`/compare/view?runs=${q}`} target="_blank" rel="noreferrer">Open in new tab ↗</a>
+          <button onClick={printReport}>Print / PDF</button>
         </div>
         <div className="report-frame">
-          <iframe title="comparison" src={`/compare/view?runs=${viewing.map(encodeURIComponent).join(",")}`} />
+          <iframe ref={iframeRef} title="comparison" src={`/compare/view?runs=${q}`} />
         </div>
       </>
     );
@@ -71,6 +81,10 @@ export function Compare() {
           onClick={() => navigate(`/compare/live?runs=${[...sel].map(encodeURIComponent).join(",")}`)}>
           ▶ Live compare
         </button>
+        <a className={`btn ${sel.size < 2 || mixed ? "disabled" : ""}`}
+           href={sel.size >= 2 && !mixed ? `/compare/download?runs=${[...sel].map(encodeURIComponent).join(",")}` : undefined}
+           title="Download the full comparison as one shareable .html file"
+           aria-disabled={sel.size < 2 || mixed}>⬇ Download</a>
         <button className="primary" disabled={sel.size < 2 || mixed} onClick={() => setViewing([...sel])}>
           Compare selected
         </button>

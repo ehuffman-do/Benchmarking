@@ -194,6 +194,38 @@ def test_compare_same_type_only(web):
     assert r.status_code == 400 and "Internal Server Error" not in r.text
 
 
+def test_compare_download_is_a_self_contained_shareable_file(web):
+    """The whole comparison downloads as ONE self-contained .html attachment
+    (inlined CSS + embedded charts) named from the runs' labels — the artifact a
+    user hands to their manager, not a single printed screen."""
+    client, cfg = web
+
+    def _make(label):
+        spec = _spec_yaml("sweep").replace("label: web-test", f"label: {label}")
+        client.post("/api/runs", json={"spec_yaml": spec, "password": WEB_PW},
+                    auth=("op", "oppw"))
+        return _run_worker_once(cfg)[2]["run_id"]
+    a, b = _make("standard"), _make("advanced")
+
+    r = client.get(f"/compare/download?runs={a},{b}", auth=("viewer", "vpw"))
+    assert r.status_code == 200
+    cd = r.headers.get("content-disposition", "")
+    assert "attachment" in cd and cd.endswith('.html"')
+    assert "standard" in cd and "advanced" in cd            # manager-friendly name
+    body = r.text
+    assert body.lstrip().lower().startswith("<!doctype html")  # a complete document
+    assert "<style>" in body                                 # CSS inlined, not linked
+    assert 'src="data:image' in body                         # charts embedded, not external
+    assert "<link" not in body and "<script src=" not in body  # no external assets
+
+    # cross-type still refuses cleanly through the download path too
+    client.post("/api/runs", json={"spec_yaml": _spec_yaml("soak"), "password": WEB_PW},
+                auth=("op", "oppw"))
+    soak = _run_worker_once(cfg)[2]["run_id"]
+    r = client.get(f"/compare/download?runs={a},{soak}", auth=("viewer", "vpw"))
+    assert r.status_code == 400 and "same type" in r.text.lower()
+
+
 def test_resume_reuses_saved_target(web):
     """Resume must reuse the original run's saved target (it used to enqueue with
     target=None, so resumed sweeps failed with no credentials)."""

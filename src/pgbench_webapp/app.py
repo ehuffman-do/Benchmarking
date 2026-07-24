@@ -12,6 +12,7 @@ import difflib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -793,8 +794,10 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
     def compare_to_console() -> Response:
         return RedirectResponse("/ui/compare", status_code=307)
 
-    @app.get("/compare/view", response_class=HTMLResponse)
-    def compare_view(runs: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
+    def _render_compare(runs: str) -> Path:
+        """Generate the self-contained comparison report for the given run ids and
+        return the on-disk HTML path (CSS inlined, charts embedded as data URIs —
+        the file stands alone, so it can be served inline or downloaded as-is)."""
         ids = [_safe_segment(r) for r in runs.split(",") if r]
         dirs = [cfg.results_dir / r for r in ids]
         for d in dirs:
@@ -802,13 +805,43 @@ def _register_routes(app: FastAPI, cfg: Config, store: SecretStore,
                 raise HTTPException(404, f"run not found: {d.name}")
         out = cfg.data_dir / "tmp"
         out.mkdir(parents=True, exist_ok=True)
+        return harness_api.compare(dirs, out / f"compare-{'-'.join(ids)[:80]}.html")
+
+    def _compare_filename(runs: str) -> str:
+        """A manager-friendly download name from the runs' labels, e.g.
+        comparison-standard-vs-advanced.html."""
+        parts = []
+        for r in runs.split(","):
+            if not r:
+                continue
+            lbl = str(_manifest(cfg.results_dir / _safe_segment(r)).get("label") or r)
+            slug = re.sub(r"[^A-Za-z0-9._-]+", "-", lbl).strip("-").lower() or "run"
+            parts.append(slug[:40])
+        base = "-vs-".join(parts) if parts else "comparison"
+        return f"comparison-{base}.html"[:120]
+
+    @app.get("/compare/view", response_class=HTMLResponse)
+    def compare_view(runs: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
         try:
-            path = harness_api.compare(dirs, out / f"compare-{'-'.join(ids)[:80]}.html")
+            path = _render_compare(runs)
         except harness_api.HarnessError as exc:
             # e.g. mixed run types, or a run with no parsed summary — show the
             # reason in the iframe instead of an opaque 500.
             return HTMLResponse(_compare_error_html(exc), status_code=400)
         return HTMLResponse(path.read_text(encoding="utf-8"))
+
+    @app.get("/compare/download")
+    def compare_download(runs: str, user: sqlite3.Row = Depends(require("viewer"))) -> Response:
+        """The full comparison as one self-contained .html file to save and share —
+        the whole report, not just whatever fit on the printed screen."""
+        try:
+            path = _render_compare(runs)
+        except harness_api.HarnessError as exc:
+            return HTMLResponse(_compare_error_html(exc), status_code=400)
+        return Response(
+            path.read_text(encoding="utf-8"), media_type="text/html",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{_compare_filename(runs)}"'})
 
     # ── admin: users / audit (legacy paths redirect into the console) ──
     @app.get("/admin/users")

@@ -289,6 +289,7 @@ button.danger:hover, .btn.danger:hover { background: #c0392b; color: #fff; }
 button.ghost { background: transparent; border-color: transparent; color: var(--ink-dim); padding: 6px 9px; }
 button.ghost:hover { background: var(--surface-3); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
+a.btn.disabled, a.btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
 
 input, select, textarea {
   width: 100%; font: inherit; padding: 8px 10px; border-radius: var(--radius-sm);
