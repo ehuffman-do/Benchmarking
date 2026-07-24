@@ -52,15 +52,11 @@ TOKEN_ENV = "PGB_PMM_TOKEN"
 
 PAIRINGS = {"pgstatmonitor": "pg_stat_monitor", "pgstatements": "pg_stat_statements"}
 
-# The Percona operator's spec.pmm.querySource CRD enum spells pg_stat_statements
-# as "pgstatstatements" (doubled "stat"), then translates it to the pmm-agent's
-# own --query-source value ("pgstatements") + QAN agent name. So ONLY the CR
-# field needs the operator spelling; everything downstream (prerun script,
-# qan_postgresql_<src>_agent) uses the agent value. pg_stat_monitor is spelled
-# the same on both sides. Writing the agent value straight into the CR made the
-# operator reject the patch ("Unsupported value: pgstatements").
-_CR_QUERY_SOURCE = {"pgstatmonitor": "pgstatmonitor",
-                    "pgstatements": "pgstatstatements"}
+# The PGO CRD's spec.pmm.querySource enum ("pgstatstatements") differs from
+# pmm-admin's --query-source vocabulary ("pgstatements"), which is what the
+# QAN agent names and prerun checks below use. Translate only at the CR patch.
+CR_QUERY_SOURCE = {"pgstatmonitor": "pgstatmonitor",
+                   "pgstatements": "pgstatstatements"}
 
 
 def _cfg(params: dict[str, Any]) -> dict[str, Any]:
@@ -733,7 +729,7 @@ def run_pmm_enable(spec: OpsSpec, results_dir: Path) -> int:
             patch: dict[str, Any] = {"spec": {
                 "pmm": {"enabled": True, "image": cfg["client_image"],
                         "imagePullPolicy": "IfNotPresent",
-                        "querySource": _CR_QUERY_SOURCE.get(
+                        "querySource": CR_QUERY_SOURCE.get(
                             cfg["query_source"], cfg["query_source"]),
                         "secret": secret_name, "serverHost": cfg["server_host"]},
                 "patroni": {"dynamicConfiguration": {"postgresql": {"parameters": {

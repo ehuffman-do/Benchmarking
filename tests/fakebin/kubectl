@@ -210,7 +210,10 @@ def pmm_client_container(st):
     """The sidecar the operator injects, with the env the verifier inspects
     (PMM3 markers: --query-source in the prerun, non-/pmm2/ config path)."""
     pmm = st["cr"]["spec"].get("pmm") or {}
-    qs = agent_query_source(pmm.get("querySource", "pgstatmonitor"))
+    # like the real operator: CRD enum "pgstatstatements" renders as
+    # pmm-admin's --query-source=pgstatements
+    qs = pmm.get("querySource", "pgstatmonitor")
+    qs = {"pgstatstatements": "pgstatements"}.get(qs, qs)
     return {"name": "pmm-client", "image": pmm.get("image", ""),
             "envFrom": [{"secretRef": {"name": pmm.get("secret", "")}}],
             "env": [
@@ -899,7 +902,8 @@ def handle_pmm_logs(st, pod):
     """pmm-client sidecar logs: the QAN agent line appears once the pod has
     rolled AND the paired extension exists (FAKE_KUBE_NO_QAN suppresses it)."""
     pmm = st["cr"]["spec"].get("pmm") or {}
-    qs = agent_query_source(pmm.get("querySource", "pgstatmonitor"))
+    qs = pmm.get("querySource", "pgstatmonitor")
+    qs = {"pgstatstatements": "pgstatements"}.get(qs, qs)  # operator vocabulary
     ext = {"pgstatmonitor": "pg_stat_monitor",
            "pgstatements": "pg_stat_statements"}.get(qs, "pg_stat_monitor")
     ts = time.strftime("%Y-%m-%dT%H:%M:%S") + ",000Z"
